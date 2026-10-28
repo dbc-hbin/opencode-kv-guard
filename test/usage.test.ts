@@ -1,8 +1,47 @@
 import { describe, expect, test } from "bun:test"
 import type { ChatBody } from "../src/compaction"
 import { observeResponse, UsageTracker, type ObserveResponseOptions, type UsageReport } from "../src/usage"
+import { createGLMChunkAdapter, parseGLMOptions } from "../src/glm"
 
 const encoder = new TextEncoder()
+
+test("response replay records transformed fragments only after a complete successful stream", async () => {
+  const values = [
+    { choices: [{ index: 0, delta: { role: "assistant", reasoning_text: "Think " }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { reasoning_text: "carefully", tool_calls: [{ index: 0, id: "call", type: "function", function: { name: "read", arguments: '{"file' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: 'Path":"a"}' } }] }, finish_reason: "tool_calls" }] },
+  ]
+  for (const done of [false, true]) {
+    const recorded: unknown[] = []
+    const source = values.map((value) => event(value)).join("") + (done ? "data: [DONE]\n\n" : "")
+    const response = observeResponse(stream([encoder.encode(source)]), {
+      body: body(), lane, tracker: new UsageTracker(),
+      transform: createGLMChunkAdapter("fixture", parseGLMOptions({ models: ["fixture"] })),
+      onAssistant: (assistant) => { recorded.push(assistant) },
+    })
+    expect(recorded).toEqual([])
+    await response.text()
+    expect(recorded).toEqual(done ? [{
+      role: "assistant", content: "", reasoning_content: "Think carefully",
+      tool_calls: [{ id: "call", type: "function", function: { name: "read", arguments: '{"filePath":"a"}' } }],
+    }] : [])
+  }
+})
+
+test("truncated, opaque and multi-choice completions cannot become replay records", async () => {
+  for (const choices of [
+    [{ index: 0, message: { role: "assistant", content: "partial", reasoning_content: "reason" }, finish_reason: "length" }],
+    [{ index: 0, message: { role: "assistant", content: "ok", signature: "opaque" }, finish_reason: "stop" }],
+    [0, 1].map((index) => ({ index, message: { role: "assistant", content: "ok" }, finish_reason: "stop" })),
+  ]) {
+    const recorded: unknown[] = []
+    const response = observeResponse(Response.json({ choices }), {
+      body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { recorded.push(assistant) },
+    })
+    await response.text()
+    expect(recorded).toEqual([])
+  }
+})
 const lane = JSON.stringify(["provider", "tenant-a", "session", "build"])
 const fallback = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value)) / 4)
 type Final = { choices: { index: number; message: { role: string; content: string }; finish_reason: string }[]; usage: Record<string, unknown> }

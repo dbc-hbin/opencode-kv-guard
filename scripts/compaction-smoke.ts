@@ -141,6 +141,16 @@ try {
     assert.equal(new Set(requestIDs).size, turns, "native opencode-prefixed providers must send a changing per-turn request ID")
     assert.ok(requestIDs.every(Boolean))
     assert.ok(summaries > 0, "preflight compaction must perform real summary requests")
+    const handoffs = requests.filter((request) => request.stream === false && Array.isArray(request.tools) && request.tools.length > 0)
+    assert.ok(handoffs.length > 0, "a fitting summary must reuse the ordinary request head instead of a separate summary system")
+    for (const handoff of handoffs) {
+      const index = requests.indexOf(handoff)
+      const previous = requests.slice(0, index).findLast((request) => request.stream !== false)
+      assert.ok(previous)
+      assert.deepEqual(handoff.tools, previous.tools, "handoff must retain the exact tool catalog")
+      assert.deepEqual(handoff.messages.slice(0, previous.messages.length), previous.messages, "handoff must extend the previously dispatched prefix")
+      assert.equal(handoff.tool_choice, "auto")
+    }
     assert.notEqual(restartAfter, undefined, "checkpoint restore must be exercised in a fresh process")
     const compacted = main.filter((request) => JSON.stringify(request.messages).includes(marker))
     const reuses = main.filter((request, index) => index > 0 && JSON.stringify(request.messages).includes(marker) && summaryCountAtMain[index] === summaryCountAtMain[index - 1]).length
@@ -150,7 +160,7 @@ try {
     for (let index = 0; index < main.length; index++) {
       assert.ok(JSON.stringify(main[index]!.messages).includes(`USER_TURN_${index}: retain the current instruction.`), "current instruction must not be summarized away")
     }
-    return { version: "1.19.4", mainRequests: normal, summaryRequests: summaries, usageTriggeredEarlyCompaction: true, perTurnRequestIDsPreserved: new Set(requestIDs).size, restartAfterTurn: restartAfter, checkpointReusedAcrossProcess: true, requestsWithSummary: compacted.length, requestsReusingSummaryWithoutNewInference: reuses, wireMessageChars: lengths, originalUserTurnsPreserved: turns }
+    return { version: "1.19.4", mainRequests: normal, summaryRequests: summaries, prefixSharingHandoffs: handoffs.length, usageTriggeredEarlyCompaction: true, perTurnRequestIDsPreserved: new Set(requestIDs).size, restartAfterTurn: restartAfter, checkpointReusedAcrossProcess: true, requestsWithSummary: compacted.length, requestsReusingSummaryWithoutNewInference: reuses, wireMessageChars: lengths, originalUserTurnsPreserved: turns }
   })(), deadline.promise])
   console.log(JSON.stringify(result, null, 2))
 } finally {

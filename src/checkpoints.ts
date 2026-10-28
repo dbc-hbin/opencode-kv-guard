@@ -5,8 +5,9 @@ import { chmod, lstat, mkdir, open } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { isCompactionSnapshot, type CompactionSnapshot } from "./compaction"
 import { isEnvironmentsSnapshot, isModeRemindersSnapshot, type EnvironmentsSnapshot, type ModeRemindersSnapshot } from "./prefix"
+import { isSessionHeadsSnapshot, isPrefixGuardSnapshot, type SessionHeadsSnapshot, type PrefixGuardSnapshot } from "./heads"
 
-export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot }
+export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot; heads?: SessionHeadsSnapshot; prefixGuard?: PrefixGuardSnapshot }
 export type CheckpointLoad = { revision: string | null; snapshot: CheckpointSnapshot | null; reason?: "malformed" | "version" | "deleted" }
 type Row = { revision: string; version: number; payload: string | null; deleted: number }
 const version = 1
@@ -15,7 +16,10 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 export function isCheckpointSnapshot(value: unknown, session: string): value is CheckpointSnapshot {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const bundle = value as Record<string, unknown>
-  return Object.keys(bundle).every((key) => key === "modes" || key === "environments" || key === "compaction") && isModeRemindersSnapshot(bundle.modes, session) && isEnvironmentsSnapshot(bundle.environments) && isCompactionSnapshot(bundle.compaction)
+  return Object.keys(bundle).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key))
+    && isModeRemindersSnapshot(bundle.modes, session) && isEnvironmentsSnapshot(bundle.environments) && isCompactionSnapshot(bundle.compaction)
+    && (bundle.heads === undefined || isSessionHeadsSnapshot(bundle.heads, session))
+    && (bundle.prefixGuard === undefined || isPrefixGuardSnapshot(bundle.prefixGuard, session))
 }
 
 export class CheckpointConflictError extends Error {

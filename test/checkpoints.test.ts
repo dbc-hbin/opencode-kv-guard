@@ -16,6 +16,119 @@ const providers = new Set(["proxy"])
 const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const empty = (): CheckpointSnapshot => ({ modes: { messages: [] }, environments: { lanes: [] }, compaction: { lanes: [] } })
 
+test("completed response replay survives immediate disposal and restart without reviving edited content", async () => {
+  const stateDirectory = await root()
+  const captured: ChatBody[] = []
+  const start = async () => {
+    const hooks = await plugin({ directory: "/fixture", worktree: "/fixture" } as PluginInput, {
+      providers: ["proxy"], stateDirectory, crossProcess: false, compaction: false,
+    })
+    const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
+      baseURL: "http://replay.test/v1",
+      fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        captured.push(JSON.parse(String(init?.body)) as ChatBody)
+        return Response.json({ choices: [{ index: 0, message: { role: "assistant", content: "Answer", reasoning_content: "Recorded reasoning" }, finish_reason: "stop" }] })
+      },
+    } } } }
+    await hooks.config!(config)
+    return { hooks, fetch: config.provider.proxy.options.fetch }
+  }
+  const request = async (runtime: Awaited<ReturnType<typeof start>>, extra: WireMessage[] = []) => {
+    const response = await runtime.fetch("http://replay.test/v1/chat/completions", {
+      method: "POST", headers: { "x-opencode-session-id": "replay", "x-opencode-kv-guard-agent": "build" },
+      body: JSON.stringify({ model: "fixture", messages: [{ role: "system", content: "Policy" }, { role: "user", content: "Task" }, ...extra] }),
+    })
+    await response.text()
+  }
+  const first = await start()
+  await request(first)
+  await first.hooks.dispose!()
+  const restarted = await start()
+  await request(restarted, [{ role: "assistant", content: "Answer" }, { role: "user", content: "Next" }])
+  expect(captured[1]!.messages[2]!.reasoning_content).toBe("Recorded reasoning")
+  await request(restarted, [{ role: "assistant", content: "Edited answer" }, { role: "user", content: "Next" }])
+  expect(captured[2]!.messages[2]!.reasoning_content).toBeUndefined()
+  await restarted.hooks.dispose!()
+})
+
+test.each(["summary", "reasoning", "replay-pressure", "restored-pressure"])("reasoning replay survives reconstruction of a frozen %s checkpoint", async (stage) => {
+  const captured: ChatBody[] = []
+  let summaries = 0
+  const hooks = await plugin({} as PluginInput, {
+    providers: ["proxy"], persistence: false, crossProcess: false, compaction: { bytesPerToken: 1 }, prefixHandoff: false,
+  })
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
+    baseURL: "http://compacted-replay.test/v1",
+    fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as ChatBody
+      if (body.stream === false) { summaries++; return success() }
+      captured.push(body)
+      return Response.json({ choices: [{ index: 0, message: { role: "assistant", content: "Answer", reasoning_content: stage === "restored-pressure" && captured.length === 1 ? "r".repeat(4000) : "Recent reasoning" }, finish_reason: "stop" }] })
+    },
+  } } } }
+  await hooks.config!(config)
+  const send = async (messages: WireMessage[], id: string) => {
+    const current = user(id, String(messages.at(-1)!.content))
+    const transformed = { messages: [current] }
+    await hooks["experimental.chat.messages.transform"]!({}, transformed)
+    const text = transformed.messages[0]!.parts[0]!
+    if (text.type !== "text") throw new Error("Expected user text")
+    const outgoing = [...messages.slice(0, -1), { role: "user", content: text.text }]
+    const response = await config.provider.proxy.options.fetch("http://compacted-replay.test/v1/chat/completions", {
+      method: "POST", headers: {
+        "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build",
+        "x-opencode-kv-guard-user": id, "x-opencode-kv-guard-limits": JSON.stringify({ context: 5000, output: 500 }),
+      },
+      body: JSON.stringify({ model: "fixture", messages: outgoing, max_tokens: 500, stream: true }),
+    })
+    await response.text()
+  }
+  const original = stage === "summary" ? history().messages : stage === "replay-pressure" ? [...history().messages.slice(0, 5), { role: "user", content: "Current" }] : [
+    { role: "system", content: "Policy" }, { role: "user", content: "Earlier" },
+    { role: "assistant", content: "Earlier answer", reasoning_content: "r".repeat(6000) },
+    { role: "user", content: "Current" },
+  ]
+  await send(original, "one")
+  if (stage === "reasoning" || stage === "restored-pressure") expect(captured[0]!.messages[2]!.reasoning_content).toBeUndefined()
+  if (stage === "summary") expect(summaries).toBeGreaterThan(0)
+  const count = summaries
+  const second = [...original, { role: "assistant", content: "Answer" }, { role: "user", content: stage === "replay-pressure" ? "n".repeat(1800) : "Next" }]
+  await send(second, "two")
+  if (stage === "replay-pressure") expect(summaries).toBeGreaterThan(count)
+  else expect(summaries).toBe(count)
+  if (stage === "summary" || stage === "reasoning") expect(captured[1]!.messages.findLast((message) => message.role === "assistant")?.reasoning_content).toBe("Recent reasoning")
+  if (stage === "reasoning") expect(captured[1]!.messages[2]!.reasoning_content).toBeUndefined()
+  if (stage.endsWith("pressure")) {
+    const before = summaries
+    await send([...second, { role: "assistant", content: "Answer" }, { role: "user", content: "Third" }], "three")
+    expect(summaries).toBe(before)
+    expect(captured[2]!.messages.findLast((message) => message.role === "assistant")?.reasoning_content).toBe("Recent reasoning")
+  }
+  await hooks.dispose!()
+})
+
+test("auxiliary providers cannot change the eligibility of an executing tool output", async () => {
+  const data = await root()
+  const previous = process.env.XDG_DATA_HOME
+  process.env.XDG_DATA_HOME = data
+  let hooks: Hooks
+  try { hooks = await plugin({} as PluginInput, { providers: ["proxy"], persistence: false, crossProcess: false, compaction: false }) }
+  finally { if (previous === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = previous }
+  await hooks.config!({ provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://output-scope.test/v1" } } } })
+  const header = async (agent: string, providerID: string) => {
+    await hooks["chat.headers"]!({ sessionID: "session", agent, model: { providerID, limit: {} }, message: { id: "user" } } as Parameters<NonNullable<Hooks["chat.headers"]>>[0], { headers: {} })
+  }
+  for (const selected of [true, false]) {
+    await header("build", selected ? "proxy" : "other")
+    await header("title", selected ? "other" : "proxy")
+    await hooks["tool.execute.before"]?.({ tool: "bash", sessionID: "session", callID: "call" }, { args: {} })
+    const output = { title: "fixture", output: "\u001b[31mred\u001b[0m", metadata: {} }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "session", callID: "call", args: {} }, output)
+    expect(output.output).toBe(selected ? "red" : "\u001b[31mred\u001b[0m")
+  }
+  await hooks.dispose!()
+})
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })

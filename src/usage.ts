@@ -27,6 +27,7 @@ export type ObserveResponseOptions = {
   signal?: AbortSignal
   label?: string
   transform?: (value: unknown) => unknown
+  onAssistant?: (assistant: WireMessage) => void
   onReport?: (report: UsageReport) => void | Promise<void>
 }
 
@@ -181,6 +182,48 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
   let invalid = false
   let reported = false
   let stopped = false
+  let replayable = true
+  let finishReason: unknown
+  const assistant: WireMessage = { role: "assistant", content: "" }
+  const calls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>()
+  const collect = (value: unknown) => {
+    if (!options.onAssistant || !record(value) || !Array.isArray(value.choices)) return
+    for (const choice of value.choices) {
+      if (!record(choice) || choice.index !== undefined && choice.index !== 0 || value.choices.length > 1) { replayable = false; continue }
+      if (choice.finish_reason != null) finishReason = choice.finish_reason
+      const part = choice.message ?? choice.delta
+      if (!record(part)) continue
+      if (Object.keys(part).some((key) => !["role", "content", "reasoning", "reasoning_content", "tool_calls"].includes(key))) replayable = false
+      if (part.role !== undefined && part.role !== "assistant") replayable = false
+      for (const key of ["content", "reasoning_content"]) {
+        const text = key === "reasoning_content" ? part.reasoning_content ?? part.reasoning : part[key]
+        if (text == null) continue
+        if (typeof text !== "string") { replayable = false; continue }
+        assistant[key] = choice.message ? text : String(assistant[key] ?? "") + text
+      }
+      if (part.reasoning != null && part.reasoning_content != null && part.reasoning !== part.reasoning_content) replayable = false
+      if (part.tool_calls == null) continue
+      if (!Array.isArray(part.tool_calls)) { replayable = false; continue }
+      for (let offset = 0; offset < part.tool_calls.length; offset++) {
+        const call = part.tool_calls[offset]
+        if (!record(call) || !record(call.function)) { replayable = false; continue }
+        if (Object.keys(call).some((key) => !["index", "id", "type", "function"].includes(key)) || Object.keys(call.function).some((key) => !["name", "arguments"].includes(key))) replayable = false
+        const index = choice.message ? offset : call.index
+        if (!count(index)) { replayable = false; continue }
+        const target = calls.get(index) ?? { id: "", type: "function", function: { name: "", arguments: "" } }
+        if (call.type !== undefined && call.type !== "function") replayable = false
+        for (const key of ["id", "type"]) if (call[key] !== undefined) {
+          if (typeof call[key] !== "string") replayable = false
+          else if (key === "id") target.id += call[key]
+        }
+        for (const key of ["name", "arguments"] as const) if (call.function[key] !== undefined) {
+          if (typeof call.function[key] !== "string") replayable = false
+          else target.function[key] += call.function[key]
+        }
+        calls.set(index, target)
+      }
+    }
+  }
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
   const encoder = new TextEncoder()
   const inspect = (value: unknown) => {
@@ -203,9 +246,11 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
     }
   }
   const normalize = (value: unknown) => {
-    if (!transform) return undefined
+    if (!transform) { collect(value); return undefined }
     const before = JSON.stringify(value)
-    const after = JSON.stringify(transform(value))
+    const transformed = transform(value)
+    collect(transformed)
+    const after = JSON.stringify(transformed)
     if (after === undefined) throw new TypeError("Response transform must return a JSON value")
     return before === after || isDeepStrictEqual(JSON.parse(before), JSON.parse(after)) ? undefined : after
   }
@@ -253,6 +298,13 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
       status: response.status, format, outcome, headerMs,
       ...(firstOutputMs === undefined ? {} : { firstOutputMs }), endMs: Math.max(0, performance.now() - request.startedAt),
       ...counts, anchorRecorded,
+    }
+    if (outcome === "complete" && replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
+      const ordered = [...calls].sort(([a], [b]) => a - b)
+      if (ordered.every(([index, call], offset) => index === offset && call.id && call.function.name)) {
+        if (ordered.length) assistant.tool_calls = ordered.map(([, call]) => call)
+        options.onAssistant?.(assistant)
+      }
     }
     // Diagnostics must not delay EOF/cancellation, propagate a rejection into
     // the response, or extend the admission gate's generation lifetime.

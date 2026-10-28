@@ -11,6 +11,9 @@ import { CheckpointStore, type CheckpointSnapshot } from "./checkpoints"
 import { UsageTracker, observeResponse } from "./usage"
 import { parseGLMOptions, normalizeGLMRequest, createGLMChunkAdapter } from "./glm"
 import { compactSkillCatalog } from "./skills"
+import { compactToolDescriptions } from "./tools"
+import { ToolOutputShrinker } from "./output"
+import { SessionHeads, PrefixGuard } from "./heads"
 
 const agentHeader = "x-opencode-kv-guard-agent"
 const limitsHeader = "x-opencode-kv-guard-limits"
@@ -19,7 +22,7 @@ const systemSuffixHeader = "x-opencode-kv-guard-system-suffix"
 const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 
 const plugin: Plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills"]
+  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs"]
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key)) throw new Error(`KV guard: unknown option ${key}`)
   }
@@ -36,7 +39,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
     throw new Error("KV guard: maxOutputTokens must be a positive integer")
   }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills"]) {
+  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff"]) {
     if (options[key] !== undefined && typeof options[key] !== "boolean") throw new Error(`KV guard: ${key} must be boolean`)
   }
   if (options.stateDirectory !== undefined && (typeof options.stateDirectory !== "string" || !isAbsolute(options.stateDirectory))) {
@@ -44,14 +47,20 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   }
   const stateDirectory = options.stateDirectory ?? join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode-kv-guard")
   const glm = parseGLMOptions(options.glm)
+  const outputShrinker = options.shrinkToolOutputs === false ? undefined : new ToolOutputShrinker(options.shrinkToolOutputs)
+  const outputSessions = new Set<string>()
+  const outputCalls = new Map<string, Set<string>>()
 
   const environments = new Environments()
   const reminders = new ModeReminders()
   const audit = new PrefixAudit()
+  const heads = new SessionHeads()
+  const prefixGuard = new PrefixGuard()
   const compaction = new RollingCompaction(options.compaction)
   const userTurns = new UserTurns()
   const usage = new UsageTracker()
   const sessionLanes = new Map<string, Set<string>>()
+  const parentHeadLanes = new Map<string, Map<string, string>>()
   const stateTails = new Map<string, Promise<void>>()
   const pendingDeletions = new Map<string, Promise<void>>()
   const deletionFailures: unknown[] = []
@@ -61,26 +70,26 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   const log = async (message: string, extra: Record<string, unknown>) => {
     if (options.diagnostics === true) await client.app.log({ body: { service: "kv-guard", level: "info", message, extra } })
   }
-  const checkpoint = async <T>(session: string, action: () => T | Promise<T>): Promise<T> => {
+  const checkpoint = async <T>(session: string, action: () => T | Promise<T>, completedResponse = false): Promise<T> => {
     const prior = stateTails.get(session) ?? Promise.resolve()
     const pending = prior.then(async () => {
-      disposed.signal.throwIfAborted()
+      if (!completedResponse) disposed.signal.throwIfAborted()
       if (deleted.has(session)) throw new Error("KV guard: session was deleted")
       const loaded = store ? await store.load(session) : undefined
       if (loaded?.reason === "deleted") throw new Error("KV guard: session checkpoint was deleted")
       const empty: CheckpointSnapshot = { modes: { messages: [] }, environments: { lanes: [] }, compaction: { lanes: [] } }
       if (loaded) {
         const snapshot = loaded.snapshot ?? empty
-        if (!await compaction.restore(session, snapshot.compaction) || !reminders.restore(session, snapshot.modes) || !environments.restore(session, snapshot.environments)) {
+        if (!await compaction.restore(session, snapshot.compaction) || !reminders.restore(session, snapshot.modes) || !environments.restore(session, snapshot.environments) || !heads.restore(session, snapshot.heads ?? { version: 1, session, lanes: [] }) || !prefixGuard.restore(session, snapshot.prefixGuard ?? { version: 1, session, lanes: [] })) {
           throw new Error("KV guard: checkpoint cannot be restored during concurrent state changes")
         }
         if (loaded.reason) await log("Checkpoint cache miss", { reason: loaded.reason })
       }
       const result = await action()
-      disposed.signal.throwIfAborted()
+      if (!completedResponse) disposed.signal.throwIfAborted()
       if (deleted.has(session)) throw new Error("KV guard: session was deleted during preparation")
       if (store && loaded) {
-        const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session) }
+        const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) }
         if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty)) await store.save(session, snapshot, loaded.revision)
       }
       return result
@@ -133,9 +142,11 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         join(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]),
         JSON.stringify({
           version: 1, providers: [...providers].sort(), compaction: options.compaction,
-          compactPrompt: options.compactPrompt !== false, compactSkills: options.compactSkills !== false,
+          compactPrompt: options.compactPrompt !== false, compactSkills: options.compactSkills !== false, compactTools: options.compactTools !== false,
           stabilizeEnvironment: options.stabilizeEnvironment !== false, retainModeReminders: options.retainModeReminders !== false,
           canonicalToolSchemas: options.canonicalToolSchemas !== false, glm: options.glm,
+          sessionHeads: options.sessionHeads !== false, prefixGuard: options.prefixGuard !== false,
+          prefixHandoff: options.prefixHandoff !== false, shrinkToolOutputs: options.shrinkToolOutputs,
         }),
       )
       for (const target of targets) {
@@ -165,6 +176,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           // Endpoint and credential identity isolate restored state and usage
           // even when provider aliases or session affinity headers are shared.
           const lane = hash(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]))
+          const headScope = hash(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]))
+          const headLane = hash(JSON.stringify([headScope, agent]))
           if (session) {
             const lanes = sessionLanes.get(session) ?? new Set<string>()
             lanes.add(lane)
@@ -207,6 +220,11 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               delete body.max_tokens
             } else body.max_tokens = Math.min(typeof body.max_tokens === "number" ? body.max_tokens : maxOutputTokens, maxOutputTokens)
           }
+          if (options.compactTools !== false && Array.isArray(body.tools)) {
+            const compacted = compactToolDescriptions(body.tools)
+            body.tools = compacted.tools
+            if (compacted.report) await log("Tool description compression", { ...compacted.report })
+          }
           if (options.canonicalToolSchemas !== false && body.tools) body.tools = canonical(body.tools)
           if (options.compactSkills !== false && encodedSystemSuffix) {
             const suffix: unknown = JSON.parse(encodedSystemSuffix)
@@ -215,6 +233,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             body = compacted.body
             if (compacted.report) await log("Skill catalog compression", { ...compacted.report })
           }
+          let replayReceipt: string | undefined
           const send = async (outgoing: ChatBody, label: "main" | "summary") => {
             const requestLane = label === "summary" ? `${lane}:summary` : lane
             const ticket = usage.begin(outgoing, requestLane)
@@ -232,11 +251,32 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             return observeResponse(response, {
               body: outgoing, lane: requestLane, tracker: usage, request: ticket, signal, label,
               transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
+              onAssistant: session && agent && label === "main" && options.prefixGuard !== false ? (assistant) => {
+                // Enqueue synchronously before EOF so the next request cannot
+                // restore an older checkpoint over this completed response.
+                void checkpoint(session, () => prefixGuard.record(outgoing, assistant, { session, lane, outcome: "success", finishReason: assistant.tool_calls ? "tool_calls" : "stop", receipt: replayReceipt }), true)
+                  .catch(() => log("Response replay checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}))
+              } : undefined,
               onReport: (report) => log("Request usage and lifecycle", { ...report, admissionWaitMs, upstreamHeaderMs: Math.max(0, report.headerMs - admissionWaitMs) }),
             })
           }
           const prepare = async () => {
             if (session && agent && options.stabilizeEnvironment !== false) environments.apply(body.messages, session, lane)
+            if (session && agent && options.sessionHeads !== false) {
+              const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined
+              const prepared = heads.apply(body, { session, lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined })
+              body = prepared.body
+              await log("Session head contract", { ...prepared.report })
+              if (!["title", "summary", "compaction"].includes(agent)) {
+                const lanes = parentHeadLanes.get(session) ?? new Map<string, string>()
+                lanes.set(headScope, headLane)
+                parentHeadLanes.set(session, lanes)
+              }
+            }
+            if (session && agent && options.prefixGuard !== false && (!encodedLimits || options.compaction === false)) {
+              const guarded = prefixGuard.apply(body, { session, lane, currentUser, observe: false })
+              body = guarded.body
+            }
             if (session && agent && encodedLimits) {
               const allowSummary = !["title", "summary", "compaction"].includes(agent)
               if (allowSummary && options.compaction !== false && !currentUser) {
@@ -252,13 +292,20 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
                 session, lane, contextWindow: limits.context,
                 inputLimit: "input" in limits && typeof limits.input === "number" && limits.input > 0 ? limits.input : undefined,
                 outputLimit: output, signal,
-                allowSummary, currentUser,
+                allowSummary, currentUser, prefixHandoff: options.prefixHandoff !== false,
+                restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
                 completeSummary: (summary) => send(summary, "summary"),
               })
               if ("response" in prepared) return prepared.response
               body = prepared.body
               if (prepared.report) await log("Preflight budget (usage-anchored when available; otherwise estimated)", prepared.report)
+            }
+            if (session && agent && options.prefixGuard !== false) {
+              const guarded = prefixGuard.apply(body, { session, lane, currentUser, replay: false })
+              body = guarded.body
+              replayReceipt = guarded.report.receipt
+              await log("Prefix guard comparison", { ...guarded.report })
             }
           }
           const failed = session && agent ? await checkpoint(session, prepare) : await prepare()
@@ -278,12 +325,29 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       output.maxOutputTokens = Math.min(output.maxOutputTokens ?? maxOutputTokens, maxOutputTokens)
     },
     async "chat.headers"(input, output) {
+      if (!["title", "summary", "compaction"].includes(input.agent)) {
+        if (activeProviders.has(input.model.providerID)) outputSessions.add(input.sessionID)
+        else outputSessions.delete(input.sessionID)
+      }
       if (!activeProviders.has(input.model.providerID)) return
       output.headers[agentHeader] = input.agent
       output.headers[limitsHeader] = JSON.stringify(input.model.limit)
       const system = input.message.system ?? ""
       output.headers[systemSuffixHeader] = JSON.stringify({ length: system.length, hash: hash(system) })
       if (options.compaction !== false) output.headers[userHeader] = input.message.id
+    },
+    async "tool.execute.before"(input) {
+      if (!outputShrinker || !outputSessions.has(input.sessionID)) return
+      const calls = outputCalls.get(input.sessionID) ?? new Set<string>()
+      calls.add(input.callID)
+      outputCalls.set(input.sessionID, calls)
+    },
+    async "tool.execute.after"(input, output) {
+      const calls = outputCalls.get(input.sessionID)
+      const selected = calls?.delete(input.callID)
+      if (!calls?.size) outputCalls.delete(input.sessionID)
+      if (!outputShrinker || !selected) return
+      Object.assign(output, await outputShrinker.apply(input.tool, output))
     },
     async "experimental.chat.system.transform"(input, output) {
       if (!activeProviders.has(input.model.providerID)) return
@@ -306,6 +370,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       const pending = pendingDeletions.get(session)
       if (pending) return pending
       deleted.add(session)
+      outputSessions.delete(session)
+      outputCalls.delete(session)
       compaction.delete(session)
       // OpenCode fires event hooks without awaiting them. Own this work until
       // the tombstone commits, including when plugin disposal follows deletion.
@@ -317,12 +383,15 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         environments.delete(session)
         reminders.delete(session)
         audit.delete(session)
+        heads.delete(session)
+        prefixGuard.delete(session)
         compaction.delete(session)
         for (const lane of sessionLanes.get(session) ?? []) {
           usage.delete(lane)
           usage.delete(`${lane}:summary`)
         }
         sessionLanes.delete(session)
+        parentHeadLanes.delete(session)
       })().catch(async (error) => {
         deletionFailures.push(error)
         await client.app.log({ body: { service: "kv-guard", level: "error", message: "Checkpoint deletion failed; durable cleanup is incomplete", extra: { operation: "delete", state: "failed" } } }).catch(() => {})
@@ -337,9 +406,14 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       environments.clear()
       reminders.clear()
       audit.clear()
+      heads.clear()
+      prefixGuard.clear()
       compaction.clear()
       usage.clear()
       sessionLanes.clear()
+      parentHeadLanes.clear()
+      outputSessions.clear()
+      outputCalls.clear()
       if (deletionFailures.length) throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion")
     },
   }

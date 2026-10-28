@@ -1,8 +1,8 @@
 // @bun
 // src/index.ts
-import { createHash as createHash8 } from "crypto";
-import { homedir } from "os";
-import { isAbsolute, join as join3 } from "path";
+import { createHash as createHash10 } from "crypto";
+import { homedir as homedir2 } from "os";
+import { isAbsolute as isAbsolute2, join as join4 } from "path";
 
 // src/transport.ts
 class Gate {
@@ -688,9 +688,26 @@ function isCompactionSnapshot(value) {
       return false;
     keys.add(lane.key);
     const state = lane.state;
-    if (Object.keys(state).some((key) => !["summary", "archived", "covered", "fingerprint", "signature"].includes(key)) || typeof state.summary !== "string" || !state.summary.trim() || !Array.isArray(state.archived) || !state.archived.length || !Number.isSafeInteger(state.covered) || state.covered < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature))
+    if (Object.keys(state).some((key) => !["summary", "archived", "covered", "fingerprint", "signature", "reductions"].includes(key)) || typeof state.summary !== "string" || !Array.isArray(state.archived) || !Number.isSafeInteger(state.covered) || state.covered < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature))
       return false;
-    return state.archived.every((index, offset, indices) => Number.isSafeInteger(index) && index >= 0 && index < state.covered && (offset === 0 || index > indices[offset - 1])) && state.archived.at(-1) === state.covered - 1;
+    if (state.archived.length ? !state.summary.trim() : state.summary !== "")
+      return false;
+    if (!state.archived.every((index, offset, indices) => Number.isSafeInteger(index) && index >= 0 && index < state.covered && (offset === 0 || index > indices[offset - 1])))
+      return false;
+    if (state.reductions === undefined)
+      return state.archived.at(-1) === state.covered - 1;
+    if (!Array.isArray(state.reductions) || !state.reductions.length)
+      return false;
+    const readIndices = new Set(state.reductions.filter((reduction) => record2(reduction) && reduction.kind === "read").map((reduction) => reduction.index));
+    let previous = -1;
+    return state.reductions.every((reduction) => {
+      if (!record2(reduction) || !Number.isSafeInteger(reduction.index) || reduction.index <= previous || reduction.index >= state.covered)
+        return false;
+      previous = reduction.index;
+      if (reduction.kind === "reasoning")
+        return Object.keys(reduction).every((key) => key === "index" || key === "kind");
+      return reduction.kind === "read" && Object.keys(reduction).every((key) => ["index", "kind", "proof"].includes(key)) && Number.isSafeInteger(reduction.proof) && reduction.proof > previous && reduction.proof < state.covered && !readIndices.has(reduction.proof);
+    });
   });
 }
 function options(input) {
@@ -779,6 +796,62 @@ function groups(messages) {
   }
   return result;
 }
+function completeRead(content) {
+  if (typeof content !== "string")
+    return false;
+  const match = /^<path>([^\n]+)<\/path>\n<type>file<\/type>\n<content>\n\n([\s\S]*)\n\n\(End of file - total (\d+) lines\)\n<\/content>$/.exec(content);
+  if (!match || content.includes("... (line truncated to 2000 chars)"))
+    return false;
+  const count = Number(match[3]);
+  if (!Number.isSafeInteger(count))
+    return false;
+  const lines = match[2] ? match[2].split(`
+`) : [];
+  return lines.length === count && lines.every((line, index) => line.startsWith(`${index + 1}: `));
+}
+function readResults(messages, units) {
+  const result = new Map;
+  for (const group of units) {
+    const calls = messages[group.start].tool_calls;
+    if (!group.plain || !Array.isArray(calls))
+      continue;
+    for (let index = group.start + 1;index < group.end; index++) {
+      const message = messages[index];
+      const call = calls.find((call) => record2(call) && call.id === message.tool_call_id);
+      if (!record2(call) || !record2(call.function) || call.function.name !== "read" || typeof call.function.arguments !== "string" || !completeRead(message.content))
+        continue;
+      let args;
+      try {
+        args = JSON.parse(call.function.arguments);
+      } catch {
+        continue;
+      }
+      if (!record2(args) || typeof args.filePath !== "string" || !args.filePath.startsWith("/") || Object.keys(args).some((key) => !["filePath", "offset", "limit"].includes(key)) || args.offset !== undefined && args.offset !== 1 || args.limit !== undefined && (!Number.isSafeInteger(args.limit) || args.limit < 1))
+        continue;
+      if (!message.content.startsWith(`<path>${args.filePath}</path>
+`))
+        continue;
+      result.set(index, { key: call.function.arguments, content: message.content, end: group.end });
+    }
+  }
+  return result;
+}
+function reduced(body, reductions) {
+  if (!reductions.length)
+    return body;
+  const messages = [...body.messages];
+  for (const reduction of reductions) {
+    const message = { ...messages[reduction.index] };
+    if (reduction.kind === "reasoning") {
+      delete message.reasoning;
+      delete message.reasoning_content;
+    } else {
+      message.content = `[Read result superseded by the identical complete result in tool call ${body.messages[reduction.proof].tool_call_id}.]`;
+    }
+    messages[reduction.index] = message;
+  }
+  return { ...body, messages };
+}
 function rewritten(body, archived, summary) {
   const messages = [];
   let inserted = false;
@@ -852,12 +925,31 @@ class RollingCompaction {
     const trigger = Math.floor(budget * config.triggerRatio);
     const target = Math.floor(trigger * config.targetRatio);
     const before = estimate(body);
-    const report = (after, compacted, reused, summaryRequests = 0, coveredMessages = 0) => ({ estimatedBefore: before, estimatedAfter: after, budget, trigger, target, compacted, reused, summaryRequests, coveredMessages });
+    let reductions = [];
+    let prefixHandoff = false;
+    const report = (after, compacted, reused, summaryRequests = 0, coveredMessages = 0) => ({
+      estimatedBefore: before,
+      estimatedAfter: after,
+      budget,
+      trigger,
+      target,
+      compacted,
+      reused,
+      summaryRequests,
+      coveredMessages,
+      reducedReasoning: reductions.filter((reduction) => reduction.kind === "reasoning").length,
+      supersededReads: reductions.filter((reduction) => reduction.kind === "read").length,
+      prefixHandoff
+    });
     if (context.allowSummary === false) {
       if (before > budget)
         throw new Error(`Summary-disabled request estimates ${before} input tokens, exceeding budget ${budget}; native/manual compaction must fit without recursive summarization`);
       return { body, report: report(before, false, false) };
     }
+    const source = body;
+    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message));
+    if (context.currentUser && lastUser < 0)
+      throw new Error("Cannot compact without the exact current user instruction object in the outgoing history");
     const signature = hash(JSON.stringify({
       model: body.model,
       tools: body.tools,
@@ -871,19 +963,78 @@ class RollingCompaction {
       messages: body.messages.flatMap((message, index) => instruction(message) ? [{ index, message }] : [])
     }));
     let state = lane.state;
-    if (state && (state.signature !== signature || body.messages.length < state.covered || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint)) {
+    let units;
+    let reads;
+    if (state?.reductions) {
+      units = groups(body.messages);
+      reads = readResults(body.messages, units);
+    }
+    if (state && (state.signature !== signature || body.messages.length < state.covered || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint || state.archived.includes(lastUser) || state.reductions?.some((reduction) => {
+      if (reduction.index >= lastUser)
+        return true;
+      const message = body.messages[reduction.index];
+      if (reduction.kind === "reasoning")
+        return !message || message.role !== "assistant" || !plain(message);
+      const earlier = reads?.get(reduction.index);
+      const later = reads?.get(reduction.proof);
+      return !earlier || !later || earlier.key !== later.key || earlier.content !== later.content || state.archived.includes(reduction.proof) && !state.archived.includes(reduction.index);
+    }))) {
       lane.state = undefined;
       state = undefined;
     }
+    reductions = [...state?.reductions ?? []];
     const archived = new Set(state?.archived ?? []);
-    const current = state ? rewritten(body, archived, state.summary) : body;
+    body = reduced(source, reductions);
+    const effectiveBody = state?.summary ? rewritten(body, archived, state.summary) : body;
+    const current = context.restoreReasoning?.(effectiveBody) ?? effectiveBody;
     const currentSize = estimate(current);
     if (currentSize <= trigger)
       return { body: current, report: report(currentSize, false, !!state, 0, archived.size) };
-    const units = groups(body.messages);
-    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message));
+    let workingSource = source;
+    if (current !== effectiveBody) {
+      const restored = new Map(effectiveBody.messages.flatMap((message, index) => current.messages[index] !== message ? [[message, current.messages[index]]] : []));
+      workingSource = { ...source, messages: source.messages.map((message) => restored.get(message) ?? message) };
+    }
+    units ??= groups(source.messages);
     if (lastUser < 0)
       throw new Error(`Cannot compact ${currentSize} estimated input tokens without a current user instruction`);
+    const existingReductions = new Set(reductions.map((reduction) => reduction.index));
+    for (let index = 0;index < lastUser; index++) {
+      const message = workingSource.messages[index];
+      if (!archived.has(index) && !existingReductions.has(index) && message.role === "assistant" && plain(message) && ["reasoning", "reasoning_content"].some((key) => typeof message[key] === "string" && message[key])) {
+        reductions.push({ index, kind: "reasoning" });
+      }
+    }
+    body = reduced(workingSource, reductions);
+    const effective = () => state?.summary ? rewritten(body, new Set(state.archived), state.summary) : body;
+    if (estimate(effective()) > target) {
+      reads ??= readResults(source.messages, units);
+      const latest = new Map;
+      const proofs = new Set(reductions.flatMap((reduction) => reduction.kind === "read" ? [reduction.proof] : []));
+      for (const [index, read] of [...reads].reverse()) {
+        if (archived.has(index) || existingReductions.has(index))
+          continue;
+        const key = JSON.stringify([read.key, read.content]);
+        const proof = latest.get(key);
+        if (proof !== undefined && index < lastUser && !proofs.has(index))
+          reductions.push({ index, kind: "read", proof });
+        else if (proof === undefined)
+          latest.set(key, index);
+      }
+      body = reduced(workingSource, reductions);
+    }
+    reductions.sort((a, b) => a.index - b.index);
+    const checkpoint = (summary, indices) => {
+      const covered = Math.max(indices.at(-1) ?? -1, ...reductions.flatMap((reduction) => reduction.kind === "read" ? [reduction.index, reduction.proof, lastUser] : [reduction.index, lastUser])) + 1;
+      return { summary, archived: indices, covered, fingerprint: hash(JSON.stringify(source.messages.slice(0, covered))), signature, ...reductions.length ? { reductions } : {} };
+    };
+    const reducedCurrent = effective();
+    const reducedSize = estimate(reducedCurrent);
+    if (reductions.length > (state?.reductions?.length ?? 0) && reducedSize <= target) {
+      active();
+      lane.state = checkpoint(state?.summary ?? "", [...archived].sort((a, b) => a - b));
+      return { body: reducedCurrent, report: report(reducedSize, true, !!state, 0, archived.size) };
+    }
     const users = body.messages.flatMap((message, index) => index <= lastUser && message.role === "user" && !isGeneratedEnvironment(message) ? [index] : []);
     const recent = users[Math.max(0, users.length - config.keepRecentTurns)];
     const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]));
@@ -963,11 +1114,61 @@ class RollingCompaction {
       stream: false,
       ...body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }
     });
+    let handoff;
+    const constrained = [
+      "functions",
+      "function_call",
+      "structured_outputs",
+      "guided_json",
+      "guided_regex",
+      "guided_choice",
+      "guided_grammar",
+      "guided_decoding_backend",
+      "guided_whitespace_pattern",
+      "modalities",
+      "audio"
+    ].some((key) => body[key] !== undefined) || body.tool_choice !== undefined && body.tool_choice !== "auto" || body.response_format !== undefined && (!record2(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type"));
+    if (context.prefixHandoff && !constrained) {
+      const positions = [];
+      const previous = new Set(state?.archived ?? []);
+      const additions = new Set(newlyArchived);
+      let position = 0;
+      let inserted = false;
+      for (let index = 0;index < source.messages.length; index++) {
+        if (previous.has(index)) {
+          if (!inserted) {
+            positions.push(position++);
+            inserted = true;
+          }
+        } else {
+          if (additions.has(index))
+            positions.push(position);
+          position++;
+        }
+      }
+      const candidate = {
+        ...summaryBase,
+        ...current.tools !== undefined ? { tools: current.tools } : {},
+        ...current.response_format !== undefined ? { response_format: current.response_format } : {},
+        messages: [...current.messages, {
+          role: "user",
+          content: `${summaryPolicy}
+Produce the historical checkpoint using only the messages at these zero-based positions in the preceding conversation: ${JSON.stringify(positions)}. Include and merge the previous historical summary at those positions, if present. Other messages remain verbatim for continuation and must not be incorporated into this checkpoint. This is a summary handoff; do not execute the prior request or call tools.`
+        }],
+        tool_choice: "auto",
+        stream: false,
+        ...body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }
+      };
+      if (Math.max(estimate(candidate), currentSize + Math.max(0, fallback(candidate) - fallback(current))) <= summaryBudget)
+        handoff = candidate;
+    }
     while (offset < transcript.length) {
       active();
       let low = 0;
       let high = transcript.length - offset;
-      while (low < high) {
+      if (handoff)
+        low = high;
+      while (!handoff && low < high) {
         const length = Math.ceil((low + high) / 2);
         if (estimate(request(transcript.slice(offset, offset + length))) <= summaryBudget)
           low = length;
@@ -978,7 +1179,7 @@ class RollingCompaction {
         low--;
       if (!low)
         throw new Error(`Compaction summarizer has no room for the next transcript fragment within input budget ${summaryBudget}; reduce fixed overhead or summaryOutputTokens`);
-      const summaryBody = request(transcript.slice(offset, offset + low));
+      const summaryBody = handoff ?? request(transcript.slice(offset, offset + low));
       const response = await context.completeSummary(summaryBody);
       try {
         active();
@@ -1021,6 +1222,7 @@ class RollingCompaction {
         throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`);
       offset += low;
       calls++;
+      prefixHandoff = !!handoff;
     }
     const result = rewritten(body, archived, summary);
     const after = estimate(result);
@@ -1028,8 +1230,7 @@ class RollingCompaction {
       throw new Error(`Compaction still estimates ${after} input tokens after folding, above recovery budget ${target}; no summary state was committed`);
     active();
     const indices = [...archived].sort((a, b) => a - b);
-    const covered = indices.at(-1) + 1;
-    lane.state = { summary, archived: indices, covered, fingerprint: hash(JSON.stringify(body.messages.slice(0, covered))), signature };
+    lane.state = checkpoint(summary, indices);
     return { body: result, report: report(after, true, !!state, calls, indices.length) };
   }
   snapshot(session) {
@@ -1065,17 +1266,382 @@ class RollingCompaction {
 
 // src/checkpoints.ts
 import { Database as Database2 } from "bun:sqlite";
-import { createHash as createHash5, randomUUID as randomUUID3 } from "crypto";
+import { createHash as createHash6, randomUUID as randomUUID4 } from "crypto";
 import { constants, watch as watch2 } from "fs";
 import { chmod, lstat, mkdir, open } from "fs/promises";
 import { join as join2, resolve as resolve2 } from "path";
+
+// src/heads.ts
+import { createHash as createHash5, randomUUID as randomUUID3 } from "crypto";
+var object = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var hash2 = (value) => createHash5("sha256").update(JSON.stringify(canonical(value))).digest("hex");
+var sha2562 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+var instruction2 = (message) => message.role === "system" || message.role === "developer";
+var exactKeys = (value, keys) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+var equal = (a, b) => hash2(a) === hash2(b);
+var key = (session, lane, model) => hash2([session, lane, model ?? null]);
+function json(value, depth = 0) {
+  if (depth > 100)
+    return false;
+  if (value === null || typeof value === "string" || typeof value === "boolean")
+    return true;
+  if (typeof value === "number")
+    return Number.isFinite(value);
+  if (Array.isArray(value))
+    return value.every((item) => json(item, depth + 1));
+  return object(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null) && Object.values(value).every((item) => json(item, depth + 1));
+}
+function tools(value) {
+  if (value === undefined)
+    return null;
+  if (!Array.isArray(value))
+    return false;
+  const names = new Set;
+  for (const tool of value) {
+    if (!object(tool) || !json(tool) || tool.type !== "function" || !object(tool.function) || typeof tool.function.name !== "string" || !tool.function.name || names.has(tool.function.name))
+      return false;
+    names.add(tool.function.name);
+  }
+  return canonical([...value].sort((a, b) => {
+    const left = a.function.name;
+    const right = b.function.name;
+    return left < right ? -1 : left > right ? 1 : 0;
+  }));
+}
+function chain(messages) {
+  let previous = hash2([]);
+  return messages.map((message) => previous = hash2([previous, message]));
+}
+function isSessionHeadsSnapshot(value, session) {
+  if (!object(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes))
+    return false;
+  const lanes = new Set;
+  const systems = (items) => Array.isArray(items) && items.every((item) => object(item) && typeof item.role === "string" && instruction2(item) && json(item));
+  return value.lanes.every((lane) => {
+    if (!object(lane) || !exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(sha2562) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices))
+      return false;
+    const id = key(session, lane.lane, lane.model);
+    if (lanes.has(id))
+      return false;
+    lanes.add(id);
+    const normalized = tools(lane.tools === null ? undefined : lane.tools);
+    if (normalized === false || JSON.stringify(normalized) !== JSON.stringify(lane.tools))
+      return false;
+    let anchor = -1;
+    return lane.notices.every((notice) => {
+      if (!object(notice) || !exactKeys(notice, ["anchor", "system"]) || !sha2562(notice.anchor) || !systems(notice.system) || !notice.system.length)
+        return false;
+      const index = lane.chain.indexOf(notice.anchor);
+      if (index < anchor || index < 0)
+        return false;
+      anchor = index;
+      return true;
+    });
+  });
+}
+function toolReset(previous, next) {
+  if (equal(previous, next))
+    return;
+  if (previous === null || next === null)
+    return "tools-availability-changed";
+  const before = new Set(previous.map((item) => item.function.name));
+  const after = new Set(next.map((item) => item.function.name));
+  const added = [...after].some((name) => !before.has(name));
+  const removed = [...before].some((name) => !after.has(name));
+  return added && removed ? "tools-replaced" : removed ? "tools-removed" : added ? "tools-added" : "tools-schema-changed";
+}
+
+class SessionHeads {
+  lanes = new Map;
+  apply(body, context) {
+    const id = key(context.session, context.lane, body.model);
+    const normalizedTools = tools(body.tools);
+    if (normalizedTools === false) {
+      this.lanes.delete(id);
+      return { body, report: { status: "unsupported", reason: "unsupported-tools", notices: 0 } };
+    }
+    let count = 0;
+    while (count < body.messages.length && instruction2(body.messages[count]))
+      count++;
+    const system = body.messages.slice(0, count);
+    const conversation = body.messages.slice(count);
+    const anchors = chain(conversation);
+    const previous = this.lanes.get(id)?.state;
+    let state;
+    const report = { status: previous ? "stable" : "initialized", notices: 0 };
+    const fresh = () => ({ lane: context.lane, model: body.model, system: structuredClone(system), tools: structuredClone(normalizedTools), chain: anchors, notices: [] });
+    if (!previous) {
+      state = fresh();
+      if (context.parentSession) {
+        const parent = this.lanes.get(key(context.parentSession, context.parentLane ?? context.lane, body.model))?.state;
+        if (!parent)
+          report.parent = "missing";
+        else if (!equal([...parent.system, ...parent.notices.flatMap((notice) => notice.system)], system) || !equal(parent.tools, normalizedTools) || parent.notices.length && (!anchors.length || conversation.some(instruction2)))
+          report.parent = "incompatible";
+        else {
+          state.system = structuredClone(parent.system);
+          state.tools = structuredClone(parent.tools);
+          if (parent.notices.length)
+            state.notices = [{ anchor: anchors.at(-1), system: structuredClone(system.slice(parent.system.length)) }];
+          report.parent = "shared";
+        }
+      }
+    } else {
+      const effective = [...previous.system, ...previous.notices.flatMap((notice) => notice.system)];
+      let shared = 0;
+      while (shared < previous.chain.length && previous.chain[shared] === anchors[shared])
+        shared++;
+      let reason = toolReset(previous.tools, normalizedTools);
+      if (!reason && shared < previous.chain.length)
+        reason = shared === anchors.length ? "history-reverted" : "history-edited";
+      const compatible = system.length >= effective.length && effective.every((message, index) => equal(message, system[index]));
+      if (!reason && !compatible)
+        reason = "system-contract-changed";
+      if (!reason && (previous.notices.length || system.length > effective.length) && conversation.some(instruction2))
+        reason = "system-contract-changed";
+      if (!reason && system.length > effective.length && !anchors.length)
+        reason = "unanchored-system-addition";
+      if (reason) {
+        state = fresh();
+        report.status = "reset";
+        report.reason = reason;
+      } else {
+        state = structuredClone(previous);
+        state.chain = anchors;
+        if (system.length > effective.length) {
+          state.notices.push({ anchor: anchors.at(-1), system: structuredClone(system.slice(effective.length)) });
+          report.status = "appended";
+        }
+      }
+    }
+    this.lanes.set(id, { session: context.session, state });
+    report.notices = state.notices.reduce((total, notice) => total + notice.system.length, 0);
+    const messages = [...structuredClone(state.system)];
+    for (let index = 0;index < conversation.length; index++) {
+      messages.push(conversation[index]);
+      for (const notice of state.notices)
+        if (notice.anchor === anchors[index])
+          messages.push(...structuredClone(notice.system));
+    }
+    const result = { ...body, messages };
+    if (state.tools !== null)
+      result.tools = structuredClone(state.tools);
+    return { body: result, report };
+  }
+  snapshot(session) {
+    return { version: 1, session, lanes: [...this.lanes.values()].filter((entry) => entry.session === session).map((entry) => structuredClone(entry.state)) };
+  }
+  restore(session, value) {
+    if (!isSessionHeadsSnapshot(value, session))
+      return false;
+    this.delete(session);
+    for (const state of value.lanes)
+      this.lanes.set(key(session, state.lane, state.model), { session, state: structuredClone(state) });
+    return true;
+  }
+  delete(session) {
+    for (const [id, lane] of this.lanes)
+      if (lane.session === session)
+        this.lanes.delete(id);
+  }
+  clear() {
+    this.lanes.clear();
+  }
+}
+function messageHashes(message) {
+  return { hash: hash2(message), role: message.role, fields: Object.fromEntries(Object.entries(message).filter(([, value]) => value !== undefined).map(([field, value]) => [field, hash2(value)])) };
+}
+function structure(body) {
+  return {
+    fields: Object.fromEntries(Object.entries(body).filter(([field, value]) => field !== "messages" && value !== undefined).map(([field, value]) => [field, hash2(value)])),
+    messages: body.messages.map(messageHashes)
+  };
+}
+function structuralChain(messages) {
+  let previous = hash2([]);
+  return messages.map((message) => previous = hash2([previous, message.hash]));
+}
+function bound(request, fields, anchors) {
+  return request.fields === fields && anchors.length >= request.length && request.chain === (request.length ? anchors[request.length - 1] : hash2([]));
+}
+function plainAssistant(value) {
+  if (!object(value) || !json(value) || value.role !== "assistant" || Object.keys(value).some((field) => !["role", "content", "tool_calls", "name", "reasoning_content", "reasoning"].includes(field)))
+    return false;
+  if (value.content !== undefined && value.content !== null && typeof value.content !== "string")
+    return false;
+  if (value.name !== undefined && typeof value.name !== "string")
+    return false;
+  if (["reasoning_content", "reasoning"].some((field) => value[field] !== undefined && typeof value[field] !== "string"))
+    return false;
+  if (value.tool_calls !== undefined) {
+    const ids = new Set;
+    if (!Array.isArray(value.tool_calls) || !value.tool_calls.every((call) => {
+      if (!object(call) || !exactKeys(call, ["id", "type", "function"]) || call.type !== "function" || typeof call.id !== "string" || !call.id || ids.has(call.id) || !object(call.function) || !exactKeys(call.function, ["name", "arguments"]) || typeof call.function.name !== "string" || !call.function.name || typeof call.function.arguments !== "string")
+        return false;
+      ids.add(call.id);
+      return true;
+    }))
+      return false;
+  }
+  return (typeof value.content === "string" && value.content.length > 0 || Array.isArray(value.tool_calls) && value.tool_calls.length > 0) && ["reasoning_content", "reasoning"].some((field) => typeof value[field] === "string" && value[field].length > 0);
+}
+function isRequestHashes(value) {
+  const fields = (items) => object(items) && Object.keys(items).every((field) => field.length > 0) && Object.values(items).every(sha2562);
+  return object(value) && exactKeys(value, ["fields", "messages"]) && fields(value.fields) && Object.hasOwn(value.fields, "model") && !Object.hasOwn(value.fields, "messages") && Array.isArray(value.messages) && value.messages.every((message) => object(message) && exactKeys(message, ["hash", "role", "fields"]) && sha2562(message.hash) && typeof message.role === "string" && !!message.role && fields(message.fields) && message.fields.role === hash2(message.role));
+}
+function isPrefixGuardSnapshot(value, session) {
+  if (!object(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes))
+    return false;
+  const lanes = new Set;
+  return value.lanes.every((lane) => {
+    if (!object(lane) || !exactKeys(lane, ["lane", "receipt", "previous", "records"]) || typeof lane.lane !== "string" || !lane.lane || lanes.has(lane.lane) || typeof lane.receipt !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(lane.receipt) || !isRequestHashes(lane.previous) || !Array.isArray(lane.records))
+      return false;
+    lanes.add(lane.lane);
+    const previous = lane.previous;
+    const fields = hash2(previous.fields);
+    const anchors = structuralChain(previous.messages);
+    const records = new Set;
+    return lane.records.every((entry) => {
+      if (!object(entry) || !exactKeys(entry, ["request", "assistant"]) || !object(entry.request) || !exactKeys(entry.request, ["fields", "length", "chain"]) || !sha2562(entry.request.fields) || !sha2562(entry.request.chain) || !Number.isSafeInteger(entry.request.length) || entry.request.length < 0 || !plainAssistant(entry.assistant))
+        return false;
+      const request = entry.request;
+      if (!bound(request, fields, anchors))
+        return false;
+      const assistant = previous.messages[request.length];
+      if (assistant && assistant.hash !== hash2(entry.assistant))
+        return false;
+      const id = hash2(entry);
+      if (records.has(id))
+        return false;
+      records.add(id);
+      return true;
+    });
+  });
+}
+function differences(previous, next) {
+  const result = [];
+  for (const field of [...new Set([...Object.keys(previous.fields), ...Object.keys(next.fields)])].sort()) {
+    if (previous.fields[field] === next.fields[field])
+      continue;
+    result.push({ kind: !Object.hasOwn(previous.fields, field) ? "request-field-added" : !Object.hasOwn(next.fields, field) ? "request-field-removed" : "request-field-changed", field, classification: field === "model" ? "model" : field === "tools" || field === "tool_choice" ? "tools" : "other" });
+  }
+  for (let index = 0;index < Math.min(previous.messages.length, next.messages.length); index++) {
+    const before = previous.messages[index];
+    const after = next.messages[index];
+    if (before.hash === after.hash)
+      continue;
+    for (const field of [...new Set([...Object.keys(before.fields), ...Object.keys(after.fields)])].sort()) {
+      if (before.fields[field] === after.fields[field])
+        continue;
+      const classification = field === "role" ? "role" : before.role === "system" || after.role === "system" ? "system" : before.role === "developer" || after.role === "developer" ? "developer" : field === "content" ? "content" : field === "tool_calls" || field === "tool_call_id" ? "tool-calls" : ["reasoning", "reasoning_content"].includes(field) ? "reasoning" : "other";
+      result.push({ kind: !Object.hasOwn(before.fields, field) ? "message-field-added" : !Object.hasOwn(after.fields, field) ? "message-field-removed" : "message-field-changed", index, field, classification });
+    }
+  }
+  if (next.messages.length > previous.messages.length)
+    result.push({ kind: "messages-appended", index: previous.messages.length, count: next.messages.length - previous.messages.length });
+  if (next.messages.length < previous.messages.length)
+    result.push({ kind: "history-truncated", index: next.messages.length, count: previous.messages.length - next.messages.length });
+  return result;
+}
+
+class PrefixGuard {
+  lanes = new Map;
+  apply(body, context) {
+    const id = key(context.session, context.lane);
+    const prior = this.lanes.get(id)?.state;
+    const report = { receipt: randomUUID3(), firstRequest: !prior, sharedMessages: 0, previousMessages: prior?.previous.messages.length ?? 0, currentMessages: body.messages.length, divergences: [], replayed: [] };
+    let result = body;
+    const current = structure(body);
+    const fields = hash2(current.fields);
+    const anchors = [];
+    const available = new Map;
+    for (const entry of prior?.records ?? [])
+      available.set(entry.request.length, [...available.get(entry.request.length) ?? [], entry]);
+    for (let index = 0;index < body.messages.length; index++) {
+      const message = result.messages[index];
+      const candidates = [];
+      if (context.replay !== false && message.role === "assistant" && message !== context.currentUser) {
+        for (const entry of available.get(index) ?? []) {
+          if (!bound(entry.request, fields, anchors))
+            continue;
+          const candidate = { ...message };
+          for (const field of ["reasoning_content", "reasoning"]) {
+            if (!Object.hasOwn(message, field) && typeof entry.assistant[field] === "string" && entry.assistant[field].length > 0)
+              candidate[field] = entry.assistant[field];
+          }
+          if (!equal(candidate, message) && equal(candidate, entry.assistant) && !candidates.some((item) => equal(item, candidate)))
+            candidates.push(candidate);
+        }
+      }
+      if (candidates.length === 1) {
+        const candidate = candidates[0];
+        if (result === body)
+          result = { ...body, messages: [...body.messages] };
+        result.messages[index] = candidate;
+        report.replayed.push({ index, fields: ["reasoning_content", "reasoning"].filter((field) => !Object.hasOwn(message, field) && Object.hasOwn(candidate, field)) });
+        current.messages[index] = messageHashes(candidate);
+      }
+      anchors.push(hash2([anchors.at(-1) ?? hash2([]), current.messages[index].hash]));
+    }
+    let records = prior?.records ?? [];
+    if (prior) {
+      report.divergences = differences(prior.previous, current);
+      while (report.sharedMessages < prior.previous.messages.length && prior.previous.messages[report.sharedMessages]?.hash === current.messages[report.sharedMessages]?.hash)
+        report.sharedMessages++;
+      if (!equal(prior.previous.fields, current.fields))
+        records = [];
+      else if (report.sharedMessages < prior.previous.messages.length)
+        records = records.filter((entry) => entry.request.length < report.sharedMessages);
+      records = records.filter((entry) => bound(entry.request, fields, anchors) && (!current.messages[entry.request.length] || current.messages[entry.request.length].hash === hash2(entry.assistant)));
+    }
+    if (context.observe !== false)
+      this.lanes.set(id, { session: context.session, state: { lane: context.lane, receipt: report.receipt, previous: current, records } });
+    return { body: result, report };
+  }
+  record(body, assistant, context) {
+    if (context.outcome !== "success" || !["stop", "tool_calls"].includes(context.finishReason) || !plainAssistant(assistant) || context.finishReason === "tool_calls" && (!Array.isArray(assistant.tool_calls) || !assistant.tool_calls.length))
+      return false;
+    const id = key(context.session, context.lane);
+    const request = structure(body);
+    const prior = this.lanes.get(id)?.state;
+    if (!prior || context.receipt !== prior.receipt || !equal(prior.previous, request))
+      return false;
+    const state = prior;
+    const entry = { request: { fields: hash2(request.fields), length: request.messages.length, chain: structuralChain(request.messages).at(-1) ?? hash2([]) }, assistant: structuredClone(assistant) };
+    if (!state.records.some((item) => equal(item, entry)))
+      state.records.push(entry);
+    this.lanes.set(id, { session: context.session, state });
+    return true;
+  }
+  snapshot(session) {
+    return { version: 1, session, lanes: [...this.lanes.values()].filter((entry) => entry.session === session).map((entry) => structuredClone(entry.state)) };
+  }
+  restore(session, value) {
+    if (!isPrefixGuardSnapshot(value, session))
+      return false;
+    this.delete(session);
+    for (const state of value.lanes)
+      this.lanes.set(key(session, state.lane), { session, state: structuredClone(state) });
+    return true;
+  }
+  delete(session) {
+    for (const [id, lane] of this.lanes)
+      if (lane.session === session)
+        this.lanes.delete(id);
+  }
+  clear() {
+    this.lanes.clear();
+  }
+}
+
+// src/checkpoints.ts
 var version = 1;
-var hash2 = (value) => createHash5("sha256").update(value).digest("hex");
+var hash3 = (value) => createHash6("sha256").update(value).digest("hex");
 function isCheckpointSnapshot(value, session) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return false;
   const bundle = value;
-  return Object.keys(bundle).every((key) => key === "modes" || key === "environments" || key === "compaction") && isModeRemindersSnapshot(bundle.modes, session) && isEnvironmentsSnapshot(bundle.environments) && isCompactionSnapshot(bundle.compaction);
+  return Object.keys(bundle).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key)) && isModeRemindersSnapshot(bundle.modes, session) && isEnvironmentsSnapshot(bundle.environments) && isCompactionSnapshot(bundle.compaction) && (bundle.heads === undefined || isSessionHeadsSnapshot(bundle.heads, session)) && (bundle.prefixGuard === undefined || isPrefixGuardSnapshot(bundle.prefixGuard, session));
 }
 
 class CheckpointConflictError extends Error {
@@ -1089,7 +1655,7 @@ class CheckpointStore {
   constructor(root, project, scope) {
     if (!root || !project || !scope)
       throw new Error("Checkpoint root, project and policy scope must be nonempty");
-    this.directory = join2(resolve2(root), hash2(project), hash2(scope));
+    this.directory = join2(resolve2(root), hash3(project), hash3(scope));
   }
   async database(session) {
     if (!session)
@@ -1102,7 +1668,7 @@ class CheckpointStore {
         throw new Error("Checkpoint directory must be owned by the current user and must not be a symlink");
       await chmod(directory, 448);
     }
-    const path = join2(this.directory, `${hash2(session)}.sqlite`);
+    const path = join2(this.directory, `${hash3(session)}.sqlite`);
     const file = await open(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 384);
     try {
       const stat = await file.stat();
@@ -1163,7 +1729,7 @@ class CheckpointStore {
           throw new Error("KV guard refuses to save a deleted session checkpoint");
         if ((row?.revision ?? null) !== expectedRevision)
           throw new CheckpointConflictError;
-        const revision = randomUUID3();
+        const revision = randomUUID4();
         db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, ?, 0) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = excluded.payload, deleted = 0").run(revision, version, payload);
         return revision;
       }).immediate();
@@ -1175,7 +1741,7 @@ class CheckpointStore {
     let notified = false;
     for (;; ) {
       const changed = Promise.withResolvers();
-      const journal = `${hash2(session)}.sqlite-journal`;
+      const journal = `${hash3(session)}.sqlite-journal`;
       let watcher;
       const timer = setTimeout(changed.resolve, 250);
       try {
@@ -1189,7 +1755,7 @@ class CheckpointStore {
         const db = await this.database(session);
         try {
           db.transaction(() => {
-            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, NULL, 1) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = NULL, deleted = 1").run(randomUUID3(), version);
+            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, NULL, 1) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = NULL, deleted = 1").run(randomUUID4(), version);
           }).immediate();
           return;
         } finally {
@@ -1212,14 +1778,14 @@ class CheckpointStore {
 }
 
 // src/usage.ts
-import { createHash as createHash6 } from "crypto";
+import { createHash as createHash7 } from "crypto";
 import { isDeepStrictEqual } from "util";
 var record3 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
-var hash3 = (value) => createHash6("sha256").update(value).digest("hex");
+var hash4 = (value) => createHash7("sha256").update(value).digest("hex");
 var count = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 function fingerprint(body) {
   const { messages, ...policy } = body;
-  return { policy: hash3(JSON.stringify(policy)), messages: messages.map((message) => hash3(JSON.stringify(message))) };
+  return { policy: hash4(JSON.stringify(policy)), messages: messages.map((message) => hash4(JSON.stringify(message))) };
 }
 function prefix(anchor, candidate) {
   return anchor.policy === candidate.policy && anchor.messages.length <= candidate.messages.length && anchor.messages.every((message, index) => message === candidate.messages[index]);
@@ -1365,6 +1931,79 @@ function observeResponse(response, options) {
   let invalid = false;
   let reported = false;
   let stopped = false;
+  let replayable = true;
+  let finishReason;
+  const assistant = { role: "assistant", content: "" };
+  const calls = new Map;
+  const collect = (value) => {
+    if (!options.onAssistant || !record3(value) || !Array.isArray(value.choices))
+      return;
+    for (const choice of value.choices) {
+      if (!record3(choice) || choice.index !== undefined && choice.index !== 0 || value.choices.length > 1) {
+        replayable = false;
+        continue;
+      }
+      if (choice.finish_reason != null)
+        finishReason = choice.finish_reason;
+      const part = choice.message ?? choice.delta;
+      if (!record3(part))
+        continue;
+      if (Object.keys(part).some((key) => !["role", "content", "reasoning", "reasoning_content", "tool_calls"].includes(key)))
+        replayable = false;
+      if (part.role !== undefined && part.role !== "assistant")
+        replayable = false;
+      for (const key of ["content", "reasoning_content"]) {
+        const text = key === "reasoning_content" ? part.reasoning_content ?? part.reasoning : part[key];
+        if (text == null)
+          continue;
+        if (typeof text !== "string") {
+          replayable = false;
+          continue;
+        }
+        assistant[key] = choice.message ? text : String(assistant[key] ?? "") + text;
+      }
+      if (part.reasoning != null && part.reasoning_content != null && part.reasoning !== part.reasoning_content)
+        replayable = false;
+      if (part.tool_calls == null)
+        continue;
+      if (!Array.isArray(part.tool_calls)) {
+        replayable = false;
+        continue;
+      }
+      for (let offset = 0;offset < part.tool_calls.length; offset++) {
+        const call = part.tool_calls[offset];
+        if (!record3(call) || !record3(call.function)) {
+          replayable = false;
+          continue;
+        }
+        if (Object.keys(call).some((key) => !["index", "id", "type", "function"].includes(key)) || Object.keys(call.function).some((key) => !["name", "arguments"].includes(key)))
+          replayable = false;
+        const index = choice.message ? offset : call.index;
+        if (!count(index)) {
+          replayable = false;
+          continue;
+        }
+        const target = calls.get(index) ?? { id: "", type: "function", function: { name: "", arguments: "" } };
+        if (call.type !== undefined && call.type !== "function")
+          replayable = false;
+        for (const key of ["id", "type"])
+          if (call[key] !== undefined) {
+            if (typeof call[key] !== "string")
+              replayable = false;
+            else if (key === "id")
+              target.id += call[key];
+          }
+        for (const key of ["name", "arguments"])
+          if (call.function[key] !== undefined) {
+            if (typeof call.function[key] !== "string")
+              replayable = false;
+            else
+              target.function[key] += call.function[key];
+          }
+        calls.set(index, target);
+      }
+    }
+  };
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const encoder = new TextEncoder;
   const inspect = (value) => {
@@ -1397,10 +2036,14 @@ function observeResponse(response, options) {
     }
   };
   const normalize = (value) => {
-    if (!transform)
+    if (!transform) {
+      collect(value);
       return;
+    }
     const before = JSON.stringify(value);
-    const after = JSON.stringify(transform(value));
+    const transformed = transform(value);
+    collect(transformed);
+    const after = JSON.stringify(transformed);
     if (after === undefined)
       throw new TypeError("Response transform must return a JSON value");
     return before === after || isDeepStrictEqual(JSON.parse(before), JSON.parse(after)) ? undefined : after;
@@ -1464,7 +2107,7 @@ function observeResponse(response, options) {
     signal?.removeEventListener("abort", abort);
     const anchorRecorded = outcome === "complete" && counts.promptTokens !== undefined && (counts.cachedTokens === undefined || counts.cachedTokens <= counts.promptTokens) && tracker.record(request, prompt, lane, counts.promptTokens);
     const report = {
-      laneFingerprint: hash3(lane),
+      laneFingerprint: hash4(lane),
       ...options.label === undefined ? {} : { label: options.label },
       status: response.status,
       format,
@@ -1475,6 +2118,14 @@ function observeResponse(response, options) {
       ...counts,
       anchorRecorded
     };
+    if (outcome === "complete" && replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
+      const ordered = [...calls].sort(([a], [b]) => a - b);
+      if (ordered.every(([index, call], offset) => index === offset && call.id && call.function.name)) {
+        if (ordered.length)
+          assistant.tool_calls = ordered.map(([, call]) => call);
+        options.onAssistant?.(assistant);
+      }
+    }
     if (options.onReport)
       queueMicrotask(() => {
         try {
@@ -1761,7 +2412,7 @@ function createGLMChunkAdapter(model, options) {
 }
 
 // src/skills.ts
-import { createHash as createHash7 } from "crypto";
+import { createHash as createHash8 } from "crypto";
 var header = `Skills provide specialized instructions and workflows for specific tasks.
 Use the skill tool to load a skill when a task matches its description.`;
 var start = `${header}
@@ -1784,7 +2435,7 @@ function compactSkillCatalog(body, provenance) {
     if (!Number.isSafeInteger(suffix.length) || suffix.length < 0 || suffix.length > generated.length)
       return { body };
     const text = suffix.length ? generated.slice(-suffix.length) : "";
-    if (createHash7("sha256").update(text).digest("hex") !== suffix.hash)
+    if (createHash8("sha256").update(text).digest("hex") !== suffix.hash)
       return { body };
     if (suffix.length) {
       const delimiter = generated.length - suffix.length - 1;
@@ -1833,14 +2484,299 @@ function compactSkillCatalog(body, provenance) {
   };
 }
 
+// src/tools.ts
+import { createHash as createHash9 } from "crypto";
+var hash5 = (text) => createHash9("sha256").update(text).digest("hex");
+var fixed = {
+  read: {
+    length: 1158,
+    hash: "98ee843341c2dab2227add0019e48d4b2f0f00f9b042b853d1ee52bb34e6363d",
+    compact: `Reads a file or directory. \`filePath\` should be absolute. \`offset\` is the 1-indexed start line; \`limit\` is the maximum line count (default 2000). Call again with a larger offset for later sections.
+File lines are returned as \`<line>: <content>\` (e.g. \`1: foo\`); lines over 2000 characters are truncated. Directories list one entry per line, with a trailing \`/\` for subdirectories. Images and PDFs are returned as attachments. A missing path returns an error.
+Use Grep for specific content in large files and Glob when unsure of a path. Read independent files in parallel; prefer larger windows over tiny repeated slices.`
+  },
+  edit: {
+    length: 1369,
+    hash: "4426ccf60241fe41d01bbafc1e7450ea6538003f9fca863ab0210492a74647f8",
+    compact: `Replaces exact text in a file: \`filePath\` (absolute), \`oldString\`, \`newString\` (must differ), optional \`replaceAll\` (default false).
+- Read the file earlier in the conversation first, or the edit fails.
+- Copy text from Read output exactly as it appears after the \`<line>: \` prefix, preserving indentation; never include the prefix.
+- Fails with "oldString not found in content" if absent, or with a multiple-matches error if not unique: add surrounding lines, or set \`replaceAll\` to change every occurrence (e.g. renames).
+- Prefer editing existing files; no emojis unless requested.`
+  },
+  write: {
+    length: 623,
+    hash: "8b7197b6e3a8ec1d129eeb6b82608e4cab759bfcc60ba890ecf36322a6e45180",
+    compact: "Writes `content` to `filePath` (absolute), overwriting any existing file. An existing file must be read with Read first, or the write fails. Prefer editing existing files; create new files, including documentation/README files, only when required or requested. No emojis unless requested."
+  },
+  glob: {
+    length: 517,
+    hash: "50b2d2c41d4b8d0286ab4542c6ec882421ac4ae5c0567ad213c3668ed973ed9a",
+    compact: "Finds files by glob `pattern` (e.g. `**/*.js`, `src/**/*.ts`) and returns matching paths. Omit `path` to search the current directory. Batch independent searches in parallel; use Task for open-ended multi-round searching."
+  },
+  grep: {
+    length: 657,
+    hash: "97fa2a9929353d20d3418041aae53ffea3aaf63e9a6e2fdc8cff6db61c3f4c5e",
+    compact: "Searches file contents with regular expression `pattern` and returns file paths and line numbers of matching lines. `path` defaults to the current directory; `include` filters files (e.g. `*.js`, `*.{ts,tsx}`). To count matches, run `rg` through Bash, not `grep`. Use Task for open-ended multi-round searching."
+  },
+  webfetch: {
+    length: 750,
+    hash: "0da3ec7c3f6bc47706553c1c522dacb2042d66a4c2bf09368e43ce4a72f3b7dc",
+    compact: "Fetches a fully-formed `url` (HTTP is upgraded to HTTPS) and returns it as `format` `markdown` (default), `text` or `html`; `timeout` is in seconds (max 120). Read-only; very large content may be summarized. Prefer a more capable or targeted fetch tool when one is available."
+  },
+  todowrite: {
+    length: 2012,
+    hash: "f214ea20cd870a9837cb30dd993aefbe5abe6d9e3319b47672c529961ba0c3ad",
+    compact: `Replaces the session task list with \`todos\`; each item has \`content\`, \`status\` (\`pending\`, \`in_progress\`, \`completed\`, \`cancelled\`) and \`priority\` (\`high\`, \`medium\`, \`low\`).
+Use it for work with 3+ distinct steps, several user-listed tasks or new instructions; skip single trivial tasks and purely informational requests.
+Keep exactly one item \`in_progress\` while work remains and update status as you go. Mark \`completed\` only after the work and required verification are done; if blocked, keep it \`in_progress\` and add a blocker item. Keep items specific; preserve user-provided commands verbatim.`
+  },
+  skill: {
+    length: 399,
+    hash: "226f63ce9fd51e51431205c90ef98e53a20ba5af690fdad241eba416db49c339",
+    compact: "Loads a skill listed in the system prompt by its exact `name`, adding its instructions and resource references to the conversation. Use it when the task matches a skill's description."
+  },
+  question: {
+    length: 657,
+    hash: "c0a5776acd585b62292c16839a5486b8b69e176b2d7da0cf206c82fcbd929584",
+    compact: 'Asks the user `questions` during execution to gather preferences, clarify ambiguity or choose between options. Custom typed answers are enabled by default, so do not add "Other" options. Answers return as arrays of labels; set `multiple: true` to allow several. Put a recommended option first and end its label with "(Recommended)".'
+  },
+  apply_patch: {
+    length: 1092,
+    hash: "2e88f3a8fb30723c4fd6a084ef20716dec6b6ea66aa943dde675e81c5cb1cc4e",
+    compact: `Edits files with a patch in \`patchText\`:
+*** Begin Patch
+*** Add File: <path>     (every following line starts with +)
+*** Delete File: <path>  (nothing follows)
+*** Update File: <path>  (optionally followed by *** Move to: <new path>)
+@@ <context line>
+-old line
++new line
+*** End Patch
+Every operation needs an Add, Delete or Update header, and new lines start with \`+\` even when adding a file.`
+  },
+  lsp: {
+    length: 1303,
+    hash: "8f25f3ea038c4fc7b5c37072eb2ccfe9c7abc8fc812bde6688bccb4d04ab454a",
+    compact: "Queries the configured LSP server. `operation`: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls or outgoingCalls. All operations take `filePath`, `line` and `character` (both 1-based, as in editors). workspaceSymbol also takes `query` (empty string = all symbols); its filePath only selects the server. Fails if no server handles the file type."
+  },
+  plan_exit: {
+    length: 579,
+    hash: "00dba1a429590e46c1975bade1963eac331b5edd3610b680edd15ef124ff2c43",
+    compact: "Asks the user whether to leave planning and switch to the build agent. Call only after the plan file is complete, open questions are resolved and the user is not still planning."
+  }
+};
+var bashTemplate = { length: 4636, hash: "74600c017fe0683dc02202ba11ab718369cebb7ee2ae77d25337a387a3cf3a0d" };
+var bashLayout = /^([\s\S]*?\nBe aware: OS: )([^\n,]*)(, Shell: )([^\n]*)(\n[\s\S]*?\nUse `)([^`\n]*)(` for temporary work[\s\S]*?commands will time out after )(\d+)(ms\.\n[\s\S]*?If the output exceeds )(\d+)( lines or )(\d+)( bytes[\s\S]*)$/;
+var websearchTemplate = { length: 1031, hash: "31abe3e2b84a60582979c963414ced0aafded8182f08b0c8a19aa04f0de4748a" };
+var websearchLayout = /^([\s\S]*The current year is )(\d+)(\. You MUST[\s\S]*)$/;
+var task = { length: 2305, hash: "220dcf4ad2582dbdaf2b0bbc8b7f5fa78172b1337539ac1c8912f45f2b9e5d46" };
+var taskBackground = { length: 311, hash: "8c625cde589a304cc7373250688781ab16ddb532256c81324142d2d49bbab99d" };
+var agentListing = `
+Available agent types and the tools they have access to:
+`;
+var taskCompact = `Launches a subagent for complex multistep work. Set \`subagent_type\` to an agent listed below, \`description\` to 3-5 words, and \`prompt\` to a complete, self-contained task stating whether to write code or only research, how to verify, and exactly what to return. Pass a previous \`task_id\` to resume that subagent session; otherwise it starts with fresh context.
+Use Read/Glob/Grep directly for known paths, specific definitions or a few files. Launch independent agents in parallel and do not duplicate delegated work. The result is not shown to the user, so summarize it. Generally trust agent output; use agents proactively when their description says so.`;
+var taskBackgroundCompact = "`background: true` starts the agent asynchronously and returns immediately; use it only for independent work, as completion is notified automatically. Foreground (default) is for results needed before continuing.";
+function compact(name, description) {
+  const known = fixed[name];
+  if (known)
+    return description.length === known.length && hash5(description) === known.hash ? known.compact : undefined;
+  if (name === "bash") {
+    const match = bashLayout.exec(description);
+    if (!match)
+      return;
+    const [, head, os, afterOs, shell, afterShell, tmp, afterTmp, timeout, afterTimeout, maxLines, afterLines, maxBytes, tail] = match;
+    const template = `${head}\x00os\x00${afterOs}\x00shell\x00${afterShell}\x00tmp\x00${afterTmp}\x00timeout\x00${afterTimeout}\x00maxLines\x00${afterLines}\x00maxBytes\x00${tail}`;
+    if (template.length !== bashTemplate.length || hash5(template) !== bashTemplate.hash)
+      return;
+    return `Runs a command in a persistent ${shell} session (OS: ${os}). Use it for terminal work such as git, package managers, builds and tests; use the dedicated Read/Glob/Grep/Edit/Write tools for file operations.
+- \`command\` is required. \`workdir\` sets the directory (default: current); use it instead of \`cd <dir> && ...\`. \`timeout\` is in milliseconds (default ${timeout}).
+- Quote paths containing spaces with double quotes. Chain dependent commands with \`&&\` in one call; use \`;\` only when earlier failures do not matter; never separate commands with newlines outside quotes. Run independent commands as parallel calls.
+- \`${tmp}\` already exists and is pre-approved for temporary work outside the workspace.
+- Output over ${maxLines} lines or ${maxBytes} bytes is truncated and saved to a file; inspect it with Read offset/limit or Grep instead of head/tail.
+- Git: commit, amend, push or open PRs only when asked. Inspect status/diff/log first, stage only intended files and never commit secrets. Never change git config, skip hooks, use interactive \`-i\`, force-push, create empty commits or amend a failed commit unless asked. Use \`gh\` for GitHub and return PR URLs.`;
+  }
+  if (name === "websearch") {
+    const match = websearchLayout.exec(description);
+    if (!match)
+      return;
+    const [, head, year, tail] = match;
+    const template = `${head}\x00year\x00${tail}`;
+    if (template.length !== websearchTemplate.length || hash5(template) !== websearchTemplate.hash)
+      return;
+    return `Searches the web through the session's search provider and returns content from the most relevant sites; use it for current information beyond your knowledge cutoff. \`query\` is required; optional \`numResults\` (default 8), \`livecrawl\` (\`fallback\` or \`preferred\`), \`type\` (\`auto\`, \`fast\` or \`deep\`) and \`contextMaxCharacters\` (default 10000). The current year is ${year}; use it when searching for recent information or current events.`;
+  }
+  if (name === "task") {
+    if (hash5(description.slice(0, task.length)) !== task.hash)
+      return;
+    let rest = description.slice(task.length);
+    const background = hash5(rest.slice(0, taskBackground.length)) === taskBackground.hash;
+    if (background)
+      rest = rest.slice(taskBackground.length);
+    if (!rest.startsWith(agentListing))
+      return;
+    return taskCompact + (background ? `
+${taskBackgroundCompact}` : "") + rest;
+  }
+}
+function compactToolDescriptions(tools) {
+  let report;
+  const result = tools.map((tool) => {
+    if (typeof tool !== "object" || tool === null || !("type" in tool) || tool.type !== "function" || !("function" in tool))
+      return tool;
+    const fn = tool.function;
+    if (typeof fn !== "object" || fn === null || !("name" in fn) || !("description" in fn))
+      return tool;
+    const { name, description } = fn;
+    if (typeof name !== "string" || typeof description !== "string")
+      return tool;
+    const replacement = compact(name, description);
+    if (replacement === undefined)
+      return tool;
+    report ??= { tools: 0, originalChars: 0, replacementChars: 0 };
+    report.tools++;
+    report.originalChars += description.length;
+    report.replacementChars += replacement.length;
+    return { ...tool, function: { ...fn, description: replacement } };
+  });
+  return report ? { tools: result, report } : { tools };
+}
+
+// src/output.ts
+import { randomBytes } from "crypto";
+import { constants as constants2 } from "fs";
+import { chmod as chmod2, lstat as lstat2, mkdir as mkdir2, open as open2, unlink } from "fs/promises";
+import { homedir } from "os";
+import { basename, dirname, isAbsolute, join as join3, resolve as resolve3 } from "path";
+import { stripVTControlCharacters } from "util";
+var tools2 = { bash: true, grep: true, glob: true, webfetch: true };
+var record6 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+function options2(input) {
+  if (input === false)
+    return false;
+  if (input !== undefined && !record6(input))
+    throw new Error("shrinkToolOutputs must be false or an options object");
+  const result = { maxBytes: 16 * 1024, maxLines: 400 };
+  for (const [key, value] of Object.entries(input ?? {})) {
+    if (key !== "maxBytes" && key !== "maxLines")
+      throw new Error(`Unknown shrinkToolOutputs option: ${key}`);
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)
+      throw new Error(`shrinkToolOutputs.${key} must be a positive integer`);
+    result[key] = value;
+  }
+  return result;
+}
+function edge(text, maxBytes, tail = false) {
+  const bytes = Buffer.from(text);
+  if (bytes.length <= maxBytes)
+    return text;
+  if (tail) {
+    let start = bytes.length - maxBytes;
+    while (start < bytes.length && (bytes[start] & 192) === 128)
+      start++;
+    return bytes.subarray(start).toString("utf8");
+  }
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 192) === 128)
+    end--;
+  return bytes.subarray(0, end).toString("utf8");
+}
+function preview(text, path, limits) {
+  const marker = `[Output shortened; full output: ${JSON.stringify(path)}]`;
+  const available = limits.maxBytes - Buffer.byteLength(marker) - 2;
+  if (available < 0 || limits.maxLines < 3)
+    return;
+  const lines = text.split(`
+`);
+  const head = edge(lines.slice(0, Math.ceil((limits.maxLines - 1) / 2)).join(`
+`), Math.ceil(available / 2));
+  const tail = edge(lines.slice(-Math.floor((limits.maxLines - 1) / 2)).join(`
+`), Math.floor(available / 2), true);
+  return [head, marker, tail].filter((part) => part.length > 0).join(`
+`);
+}
+
+class ToolOutputShrinker {
+  limits;
+  directory;
+  constructor(input, dataDirectory = process.env.XDG_DATA_HOME || join3(homedir(), ".local", "share")) {
+    this.limits = options2(input);
+    if (!isAbsolute(dataDirectory))
+      throw new Error("Tool output data directory must be an absolute path");
+    this.directory = join3(resolve3(dataDirectory), "opencode", "tool-output");
+  }
+  async directories(create) {
+    for (const directory of [dirname(this.directory), this.directory]) {
+      if (create)
+        await mkdir2(directory, { recursive: true, mode: 448 });
+      const info = await lstat2(directory);
+      if (!info.isDirectory() || info.isSymbolicLink() || process.getuid && info.uid !== process.getuid())
+        throw new Error("Tool output directory must be owned by the current user and must not be a symlink");
+      await chmod2(directory, 448);
+    }
+  }
+  async nativeArtifact(path) {
+    if (typeof path !== "string" || !isAbsolute(path) || dirname(path) !== this.directory || !/^tool_[A-Za-z0-9_-]+$/.test(basename(path)))
+      return false;
+    await this.directories(false);
+    const file = await open2(path, constants2.O_RDONLY | constants2.O_NOFOLLOW | constants2.O_NONBLOCK);
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || process.getuid && info.uid !== process.getuid())
+        return false;
+      await file.chmod(384);
+      return true;
+    } finally {
+      await file.close();
+    }
+  }
+  async save(path, raw) {
+    await this.directories(true);
+    const file = await open2(path, constants2.O_WRONLY | constants2.O_CREAT | constants2.O_EXCL | constants2.O_NOFOLLOW, 384);
+    try {
+      await file.writeFile(raw, "utf8");
+      await file.close();
+    } catch (error) {
+      await file.close().catch(() => {});
+      await unlink(path).catch(() => {});
+      throw error;
+    }
+  }
+  async apply(tool, result) {
+    if (!this.limits || !Object.hasOwn(tools2, tool) || !record6(result.metadata) || result.metadata.kvGuardOutput === 1)
+      return result;
+    const text = stripVTControlCharacters(result.output);
+    const clipped = Buffer.byteLength(text) > this.limits.maxBytes || text.split(`
+`).length > this.limits.maxLines;
+    if (text === result.output && !clipped)
+      return result;
+    const metadata = result.metadata;
+    const native = metadata.truncated === true;
+    try {
+      if (native && !await this.nativeArtifact(metadata.outputPath))
+        return result;
+      const path = native ? metadata.outputPath : join3(this.directory, `tool_kvguard_${randomBytes(24).toString("hex")}`);
+      const output = clipped ? preview(text, path, this.limits) : text;
+      if (output === undefined)
+        return result;
+      if (!native)
+        await this.save(path, result.output);
+      return { ...result, output, metadata: { ...metadata, truncated: native || clipped, outputPath: path, kvGuardOutput: 1 } };
+    } catch {
+      return result;
+    }
+  }
+}
+
 // src/index.ts
 var agentHeader = "x-opencode-kv-guard-agent";
 var limitsHeader = "x-opencode-kv-guard-limits";
 var userHeader = "x-opencode-kv-guard-user";
 var systemSuffixHeader = "x-opencode-kv-guard-system-suffix";
-var hash4 = (value) => createHash8("sha256").update(value).digest("hex");
+var hash6 = (value) => createHash10("sha256").update(value).digest("hex");
 var plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills"];
+  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs"];
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key))
       throw new Error(`KV guard: unknown option ${key}`);
@@ -1858,22 +2794,28 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
     throw new Error("KV guard: maxOutputTokens must be a positive integer");
   }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills"]) {
+  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff"]) {
     if (options[key] !== undefined && typeof options[key] !== "boolean")
       throw new Error(`KV guard: ${key} must be boolean`);
   }
-  if (options.stateDirectory !== undefined && (typeof options.stateDirectory !== "string" || !isAbsolute(options.stateDirectory))) {
+  if (options.stateDirectory !== undefined && (typeof options.stateDirectory !== "string" || !isAbsolute2(options.stateDirectory))) {
     throw new Error("KV guard: stateDirectory must be an absolute path");
   }
-  const stateDirectory = options.stateDirectory ?? join3(process.env.XDG_STATE_HOME || join3(homedir(), ".local", "state"), "opencode-kv-guard");
+  const stateDirectory = options.stateDirectory ?? join4(process.env.XDG_STATE_HOME || join4(homedir2(), ".local", "state"), "opencode-kv-guard");
   const glm = parseGLMOptions(options.glm);
+  const outputShrinker = options.shrinkToolOutputs === false ? undefined : new ToolOutputShrinker(options.shrinkToolOutputs);
+  const outputSessions = new Set;
+  const outputCalls = new Map;
   const environments = new Environments;
   const reminders = new ModeReminders;
   const audit = new PrefixAudit;
+  const heads = new SessionHeads;
+  const prefixGuard = new PrefixGuard;
   const compaction = new RollingCompaction(options.compaction);
   const userTurns = new UserTurns;
   const usage = new UsageTracker;
   const sessionLanes = new Map;
+  const parentHeadLanes = new Map;
   const stateTails = new Map;
   const pendingDeletions = new Map;
   const deletionFailures = [];
@@ -1884,10 +2826,11 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
     if (options.diagnostics === true)
       await client.app.log({ body: { service: "kv-guard", level: "info", message, extra } });
   };
-  const checkpoint = async (session, action) => {
+  const checkpoint = async (session, action, completedResponse = false) => {
     const prior = stateTails.get(session) ?? Promise.resolve();
     const pending = prior.then(async () => {
-      disposed.signal.throwIfAborted();
+      if (!completedResponse)
+        disposed.signal.throwIfAborted();
       if (deleted.has(session))
         throw new Error("KV guard: session was deleted");
       const loaded = store ? await store.load(session) : undefined;
@@ -1896,18 +2839,19 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
       const empty = { modes: { messages: [] }, environments: { lanes: [] }, compaction: { lanes: [] } };
       if (loaded) {
         const snapshot = loaded.snapshot ?? empty;
-        if (!await compaction.restore(session, snapshot.compaction) || !reminders.restore(session, snapshot.modes) || !environments.restore(session, snapshot.environments)) {
+        if (!await compaction.restore(session, snapshot.compaction) || !reminders.restore(session, snapshot.modes) || !environments.restore(session, snapshot.environments) || !heads.restore(session, snapshot.heads ?? { version: 1, session, lanes: [] }) || !prefixGuard.restore(session, snapshot.prefixGuard ?? { version: 1, session, lanes: [] })) {
           throw new Error("KV guard: checkpoint cannot be restored during concurrent state changes");
         }
         if (loaded.reason)
           await log("Checkpoint cache miss", { reason: loaded.reason });
       }
       const result = await action();
-      disposed.signal.throwIfAborted();
+      if (!completedResponse)
+        disposed.signal.throwIfAborted();
       if (deleted.has(session))
         throw new Error("KV guard: session was deleted during preparation");
       if (store && loaded) {
-        const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session) };
+        const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) };
         if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty))
           await store.save(session, snapshot, loaded.revision);
       }
@@ -1946,7 +2890,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
         if (custom !== undefined && typeof custom !== "function")
           throw new Error(`KV guard: ${id} has a non-function fetch`);
         const local = endpointGate(baseURL, maxConcurrent);
-        const shared = options.crossProcess === false ? undefined : processEndpointGate(baseURL, maxConcurrent, join3(stateDirectory, "admission"));
+        const shared = options.crossProcess === false ? undefined : processEndpointGate(baseURL, maxConcurrent, join4(stateDirectory, "admission"));
         const gate = shared ? {
           capacity: maxConcurrent,
           async acquire(signal) {
@@ -1969,16 +2913,21 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
         return { id, provider, baseURL, endpoint, gate, fetch: custom ?? globalThis.fetch };
       });
       if (options.persistence !== false)
-        store = new CheckpointStore(join3(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]), JSON.stringify({
+        store = new CheckpointStore(join4(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]), JSON.stringify({
           version: 1,
           providers: [...providers].sort(),
           compaction: options.compaction,
           compactPrompt: options.compactPrompt !== false,
           compactSkills: options.compactSkills !== false,
+          compactTools: options.compactTools !== false,
           stabilizeEnvironment: options.stabilizeEnvironment !== false,
           retainModeReminders: options.retainModeReminders !== false,
           canonicalToolSchemas: options.canonicalToolSchemas !== false,
-          glm: options.glm
+          glm: options.glm,
+          sessionHeads: options.sessionHeads !== false,
+          prefixGuard: options.prefixGuard !== false,
+          prefixHandoff: options.prefixHandoff !== false,
+          shrinkToolOutputs: options.shrinkToolOutputs
         }));
       for (const target of targets) {
         target.provider.options ??= {};
@@ -2004,7 +2953,9 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
           headers.delete(systemSuffixHeader);
           headers.delete("content-length");
           const currentUser = userTurns.consume(body.messages, session && expectedUser ? userTurns.marker(session, expectedUser) : undefined);
-          const lane = hash4(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]));
+          const lane = hash6(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]));
+          const headScope = hash6(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]));
+          const headLane = hash6(JSON.stringify([headScope, agent]));
           if (session) {
             const lanes = sessionLanes.get(session) ?? new Set;
             lanes.add(lane);
@@ -2048,6 +2999,12 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
             } else
               body.max_tokens = Math.min(typeof body.max_tokens === "number" ? body.max_tokens : maxOutputTokens, maxOutputTokens);
           }
+          if (options.compactTools !== false && Array.isArray(body.tools)) {
+            const compacted = compactToolDescriptions(body.tools);
+            body.tools = compacted.tools;
+            if (compacted.report)
+              await log("Tool description compression", { ...compacted.report });
+          }
           if (options.canonicalToolSchemas !== false && body.tools)
             body.tools = canonical(body.tools);
           if (options.compactSkills !== false && encodedSystemSuffix) {
@@ -2059,6 +3016,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
             if (compacted.report)
               await log("Skill catalog compression", { ...compacted.report });
           }
+          let replayReceipt;
           const send = async (outgoing, label) => {
             const requestLane = label === "summary" ? `${lane}:summary` : lane;
             const ticket = usage.begin(outgoing, requestLane);
@@ -2081,12 +3039,30 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
               signal,
               label,
               transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
+              onAssistant: session && agent && label === "main" && options.prefixGuard !== false ? (assistant) => {
+                checkpoint(session, () => prefixGuard.record(outgoing, assistant, { session, lane, outcome: "success", finishReason: assistant.tool_calls ? "tool_calls" : "stop", receipt: replayReceipt }), true).catch(() => log("Response replay checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}));
+              } : undefined,
               onReport: (report) => log("Request usage and lifecycle", { ...report, admissionWaitMs, upstreamHeaderMs: Math.max(0, report.headerMs - admissionWaitMs) })
             });
           };
           const prepare = async () => {
             if (session && agent && options.stabilizeEnvironment !== false)
               environments.apply(body.messages, session, lane);
+            if (session && agent && options.sessionHeads !== false) {
+              const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
+              const prepared = heads.apply(body, { session, lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined });
+              body = prepared.body;
+              await log("Session head contract", { ...prepared.report });
+              if (!["title", "summary", "compaction"].includes(agent)) {
+                const lanes = parentHeadLanes.get(session) ?? new Map;
+                lanes.set(headScope, headLane);
+                parentHeadLanes.set(session, lanes);
+              }
+            }
+            if (session && agent && options.prefixGuard !== false && (!encodedLimits || options.compaction === false)) {
+              const guarded = prefixGuard.apply(body, { session, lane, currentUser, observe: false });
+              body = guarded.body;
+            }
             if (session && agent && encodedLimits) {
               const allowSummary = !["title", "summary", "compaction"].includes(agent);
               if (allowSummary && options.compaction !== false && !currentUser) {
@@ -2108,6 +3084,8 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
                 signal,
                 allowSummary,
                 currentUser,
+                prefixHandoff: options.prefixHandoff !== false,
+                restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
                 completeSummary: (summary) => send(summary, "summary")
               });
@@ -2116,6 +3094,12 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
               body = prepared.body;
               if (prepared.report)
                 await log("Preflight budget (usage-anchored when available; otherwise estimated)", prepared.report);
+            }
+            if (session && agent && options.prefixGuard !== false) {
+              const guarded = prefixGuard.apply(body, { session, lane, currentUser, replay: false });
+              body = guarded.body;
+              replayReceipt = guarded.report.receipt;
+              await log("Prefix guard comparison", { ...guarded.report });
             }
           };
           const failed = session && agent ? await checkpoint(session, prepare) : await prepare();
@@ -2136,14 +3120,36 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
       output.maxOutputTokens = Math.min(output.maxOutputTokens ?? maxOutputTokens, maxOutputTokens);
     },
     async "chat.headers"(input, output) {
+      if (!["title", "summary", "compaction"].includes(input.agent)) {
+        if (activeProviders.has(input.model.providerID))
+          outputSessions.add(input.sessionID);
+        else
+          outputSessions.delete(input.sessionID);
+      }
       if (!activeProviders.has(input.model.providerID))
         return;
       output.headers[agentHeader] = input.agent;
       output.headers[limitsHeader] = JSON.stringify(input.model.limit);
       const system = input.message.system ?? "";
-      output.headers[systemSuffixHeader] = JSON.stringify({ length: system.length, hash: hash4(system) });
+      output.headers[systemSuffixHeader] = JSON.stringify({ length: system.length, hash: hash6(system) });
       if (options.compaction !== false)
         output.headers[userHeader] = input.message.id;
+    },
+    async "tool.execute.before"(input) {
+      if (!outputShrinker || !outputSessions.has(input.sessionID))
+        return;
+      const calls = outputCalls.get(input.sessionID) ?? new Set;
+      calls.add(input.callID);
+      outputCalls.set(input.sessionID, calls);
+    },
+    async "tool.execute.after"(input, output) {
+      const calls = outputCalls.get(input.sessionID);
+      const selected = calls?.delete(input.callID);
+      if (!calls?.size)
+        outputCalls.delete(input.sessionID);
+      if (!outputShrinker || !selected)
+        return;
+      Object.assign(output, await outputShrinker.apply(input.tool, output));
     },
     async "experimental.chat.system.transform"(input, output) {
       if (!activeProviders.has(input.model.providerID))
@@ -2172,6 +3178,8 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
       if (pending)
         return pending;
       deleted.add(session);
+      outputSessions.delete(session);
+      outputCalls.delete(session);
       compaction.delete(session);
       const deletion = (async () => {
         await stateTails.get(session);
@@ -2181,12 +3189,15 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
         environments.delete(session);
         reminders.delete(session);
         audit.delete(session);
+        heads.delete(session);
+        prefixGuard.delete(session);
         compaction.delete(session);
         for (const lane of sessionLanes.get(session) ?? []) {
           usage.delete(lane);
           usage.delete(`${lane}:summary`);
         }
         sessionLanes.delete(session);
+        parentHeadLanes.delete(session);
       })().catch(async (error) => {
         deletionFailures.push(error);
         await client.app.log({ body: { service: "kv-guard", level: "error", message: "Checkpoint deletion failed; durable cleanup is incomplete", extra: { operation: "delete", state: "failed" } } }).catch(() => {});
@@ -2204,9 +3215,14 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
       environments.clear();
       reminders.clear();
       audit.clear();
+      heads.clear();
+      prefixGuard.clear();
       compaction.clear();
       usage.clear();
       sessionLanes.clear();
+      parentHeadLanes.clear();
+      outputSessions.clear();
+      outputCalls.clear();
       if (deletionFailures.length)
         throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion");
     }

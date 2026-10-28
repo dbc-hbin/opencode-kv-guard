@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { RollingCompaction, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
+import { RollingCompaction, isCompactionSnapshot, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
 import { Environments, type WireMessage } from "../src/prefix"
 
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8")
@@ -52,6 +52,351 @@ function batch(index: number, size = 350): WireMessage[] {
     { role: "tool", tool_call_id: `call-${index}-a`, content: "a".repeat(size) },
   ]
 }
+
+function readOutput(size = 300) {
+  return `<path>/project/file.ts</path>\n<type>file</type>\n<content>\n\n${Array.from({ length: 5 }, (_, index) => `${index + 1}: ${"x".repeat(size)}`).join("\n")}\n\n(End of file - total 5 lines)\n</content>`
+}
+
+function readBatch(id: string, content = readOutput(), args = JSON.stringify({ filePath: "/project/file.ts" })): WireMessage[] {
+  return [
+    { role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "read", arguments: args } }] },
+    { role: "tool", tool_call_id: id, content },
+  ]
+}
+
+function repeatedReads(): ChatBody {
+  const original = history(0)
+  original.messages.splice(1, 0, { role: "user", content: "Inspect the file" }, ...readBatch("earlier"))
+  original.messages.push(...readBatch("later"))
+  return original
+}
+
+describe("staged pressure reductions", () => {
+  test("recovered reasoning in the current tool batch remains protected under pressure", async () => {
+    const original = history()
+    const currentUser = original.messages.at(-1)!
+    const tools = batch(9, 50)
+    original.messages.push(...tools)
+    const reasoning = "recovered current reasoning ".repeat(15)
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => success(), {
+      currentUser,
+      restoreReasoning: (body) => ({ ...body, messages: body.messages.map((message) => message === tools[0] ? { ...message, reasoning_content: reasoning } : message) }),
+    }))
+    const outgoing = forwarded(result)
+    expect(outgoing.messages.find((message) => message.tool_calls === tools[0]!.tool_calls)?.reasoning_content).toBe(reasoning)
+    expect(outgoing.messages).toContain(currentUser)
+    expect(bytes(outgoing)).toBeLessThanOrEqual("report" in result ? Number(result.report?.target) : 0)
+  })
+
+  test("plaintext reasoning is removed only from prior turns, before semantic inference", async () => {
+    const original = history(1, 60)
+    const prior = original.messages[2]!
+    prior.reasoning_content = "historical thought ".repeat(500)
+    prior.reasoning = "other historical thought"
+    const signed: WireMessage = { role: "assistant", content: "signed", reasoning_content: "signed thought", signature: "signature" }
+    const opaque: WireMessage = { role: "assistant", content: "opaque", reasoning: [{ type: "reasoning", signature: "opaque" }] }
+    original.messages.splice(3, 0, signed, opaque)
+    const current = original.messages.at(-1)!
+    const assistant: WireMessage = { role: "assistant", content: "working", reasoning_content: "current thought" }
+    original.messages.push(assistant, ...batch(0, 50))
+    const copy = structuredClone(original)
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { throw new Error("Unexpected summary") }, { currentUser: current }))
+    const body = forwarded(result)
+    expect(body.messages[2]!.reasoning_content).toBeUndefined()
+    expect(body.messages[2]!.reasoning).toBeUndefined()
+    expect(body.messages[2]!.content).toBe(prior.content)
+    expect(body.messages).toContain(signed)
+    expect(body.messages).toContain(opaque)
+    expect(body.messages).toContain(current)
+    expect(body.messages).toContain(assistant)
+    expect(body.messages.slice(-3)).toEqual(original.messages.slice(-3))
+    expect("report" in result && result.report?.reducedReasoning).toBe(1)
+    expect("report" in result && result.report?.summaryRequests).toBe(0)
+    expect(original).toEqual(copy)
+  })
+
+  test("reductions freeze below pressure and survive a validated snapshot restart", async () => {
+    const original = history(1, 50)
+    original.messages[2]!.reasoning_content = "r".repeat(6000)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const first = forwarded(await compaction.prepare(original, context(async () => { throw new Error("Unexpected summary") })))
+    const snapshot = compaction.snapshot("session")
+    expect(isCompactionSnapshot(snapshot)).toBe(true)
+    expect(snapshot.lanes[0]!.state.archived).toEqual([])
+    expect(snapshot.lanes[0]!.state.summary).toBe("")
+    const restored = new RollingCompaction({ bytesPerToken: 1 })
+    expect(await restored.restore("session", snapshot)).toBe(true)
+    const extension = { ...original, messages: [...original.messages, { role: "assistant", content: "Done", reasoning_content: "newly historical, not yet reduced" }, { role: "user", content: "Continue" }] }
+    const next = forwarded(await restored.prepare(extension, context(async () => { throw new Error("Unexpected summary") }, { contextWindow: 50000 })))
+    expect(next.messages.slice(0, first.messages.length)).toEqual(first.messages)
+    expect(next.messages.at(-2)!.reasoning_content).toBe("newly historical, not yet reduced")
+    expect(next.messages.at(-1)).toBe(extension.messages.at(-1))
+    const edited = structuredClone(original)
+    edited.messages[2]!.reasoning_content = "edited, no longer under pressure"
+    const invalidated = forwarded(await restored.prepare(edited, context(async () => { throw new Error("Unexpected summary") }, { contextWindow: 50000 })))
+    expect(invalidated).toEqual(edited)
+  })
+
+  test("only identical complete successful read results can supersede an older result", async () => {
+    const original = repeatedReads()
+    const current = original.messages[4]!
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const result = await compaction.prepare(original, context(async () => { throw new Error("Unexpected summary") }, { currentUser: current }))
+    const body = forwarded(result)
+    expect(body.messages[3]!.tool_call_id).toBe("earlier")
+    expect(body.messages[3]!.content).toContain("later")
+    expect(body.messages[3]!.content).not.toBe(original.messages[3]!.content)
+    expect(body.messages[2]).toBe(original.messages[2])
+    expect(body.messages.slice(4)).toEqual(original.messages.slice(4))
+    expect(body.messages[4]).toBe(current)
+    expect("report" in result && result.report?.supersededReads).toBe(1)
+    expect("report" in result && result.report?.summaryRequests).toBe(0)
+    const restored = new RollingCompaction({ bytesPerToken: 1 })
+    expect(await restored.restore("session", compaction.snapshot("session"))).toBe(true)
+    expect(forwarded(await restored.prepare(original, context(async () => { throw new Error("Unexpected summary") }, { contextWindow: 50000 })))).toEqual(body)
+    const changed = structuredClone(original)
+    changed.messages[6]!.content = readOutput(250)
+    expect(forwarded(await restored.prepare(changed, context(async () => { throw new Error("Unexpected summary") }, { contextWindow: 50000 })))).toEqual(changed)
+  })
+
+  test("reasoning reduction precedes duplicate reads and the combined checkpoint restarts exactly", async () => {
+    const original = repeatedReads()
+    original.messages.splice(2, 0, { role: "assistant", content: "Earlier plan", reasoning_content: "r".repeat(6000) })
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const result = await compaction.prepare(original, context(async () => { throw new Error("Unexpected summary") }))
+    expect("report" in result && result.report?.reducedReasoning).toBe(1)
+    expect("report" in result && result.report?.supersededReads).toBe(1)
+    const restored = new RollingCompaction({ bytesPerToken: 1 })
+    const snapshot = compaction.snapshot("session")
+    expect(isCompactionSnapshot(snapshot)).toBe(true)
+    expect(await restored.restore("session", snapshot)).toBe(true)
+    const extended = { ...original, messages: [...original.messages, { role: "assistant", content: "Done" }, { role: "user", content: "Read it again" }, ...readBatch("newest")] }
+    const next = forwarded(await restored.prepare(extended, context(async () => { throw new Error("Unexpected summary") }, { contextWindow: 50000 })))
+    expect(next.messages.slice(0, original.messages.length)).toEqual(forwarded(result).messages)
+    expect(next.messages.at(-1)).toBe(extended.messages.at(-1))
+  })
+
+  test("identical text without complete coverage, matching calls or prior-turn provenance is retained", async () => {
+    const variants: ((body: ChatBody) => void)[] = [
+      (body) => { body.messages[6]!.content = readOutput(299) },
+      (body) => { (body.messages[5]!.tool_calls as { function: { arguments: string } }[])[0]!.function.arguments = JSON.stringify({ filePath: "/project/other.ts" }) },
+      (body) => { for (const index of [3, 6]) body.messages[index]!.content = "Error: Permission denied " + "x".repeat(1500) },
+      (body) => { for (const index of [3, 6]) body.messages[index]!.content = readOutput().replace("(End of file - total 5 lines)", "(Showing lines 1-5 of 10. Use offset=6 to continue.)") },
+      (body) => { for (const index of [3, 6]) body.messages[index]!.content = readOutput().replace("1: ", "2: ") },
+      (body) => { for (const index of [3, 6]) body.messages[index]!.content = readOutput().replace("1: ", "1: ... (line truncated to 2000 chars)") },
+      (body) => { for (const index of [3, 6]) body.messages[index]!.content = readOutput() + "\n\n<system-reminder>\nKeep this instruction\n</system-reminder>" },
+    ]
+    for (const change of variants) {
+      const original = repeatedReads()
+      change(original)
+      let calls = 0
+      const copy = structuredClone(original)
+      await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; throw new Error("Rejected reduction needs semantic folding") }, {
+        currentUser: original.messages[4]!,
+      }))).rejects.toThrow("needs semantic folding")
+      expect(calls).toBe(1)
+      expect(original).toEqual(copy)
+    }
+    const sameTurn = repeatedReads()
+    sameTurn.messages.splice(4, 1)
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(sameTurn, context(async () => success(), { contextWindow: 50000 }))
+    expect(forwarded(result)).toBe(sameTurn)
+  })
+
+  test("under-pressure-only reductions preserve current-turn thoughts and read batches", async () => {
+    const original = repeatedReads()
+    const current = original.messages[1]!
+    original.messages[2]!.reasoning_content = "current thought ".repeat(500)
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => success(), { currentUser: current }))
+    expect("report" in result && result.report?.reducedReasoning).toBe(0)
+    expect("report" in result && result.report?.supersededReads).toBe(0)
+    const small = history(1, 20)
+    small.messages[2]!.reasoning_content = "not under pressure"
+    expect(forwarded(await new RollingCompaction({ bytesPerToken: 1 }).prepare(small, context(async () => { throw new Error("Unexpected summary") })))).toBe(small)
+  })
+
+  test("snapshot validators reject malformed reductions and replay checks signed reasoning", async () => {
+    const original = history(1, 50)
+    original.messages[2]!.reasoning_content = "r".repeat(6000)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    await compaction.prepare(original, context(async () => { throw new Error("Unexpected summary") }))
+    for (const reductions of [
+      [], [{ index: -1, kind: "reasoning" }], [{ index: 2, kind: "unknown" }],
+      [{ index: 2, kind: "read", proof: 1 }], [{ index: 2, kind: "read", proof: 999 }],
+      [{ index: 2, kind: "reasoning", proof: 3 }], [{ index: 2, kind: "reasoning" }, { index: 2, kind: "reasoning" }],
+      [{ index: 0, kind: "read", proof: 1 }, { index: 1, kind: "read", proof: 2 }],
+    ]) {
+      const snapshot = compaction.snapshot("session")
+      Object.assign(snapshot.lanes[0]!.state, { reductions })
+      expect(isCompactionSnapshot(snapshot)).toBe(false)
+    }
+    const signed = structuredClone(original)
+    signed.messages[2]!.signature = "signed"
+    const restored = new RollingCompaction({ bytesPerToken: 1 })
+    expect(await restored.restore("session", compaction.snapshot("session"))).toBe(true)
+    expect(forwarded(await restored.prepare(signed, context(async () => { throw new Error("Unexpected summary") }, { contextWindow: 50000 })))).toEqual(signed)
+    await expect(restored.prepare(original, context(async () => success(), { currentUser: structuredClone(original.messages.at(-1)!) }))).rejects.toThrow("exact current user")
+  })
+})
+
+describe("prefix-sharing summary handoff", () => {
+  function fixture() {
+    const original = history(6, 220)
+    delete original.response_format
+    original.max_tokens = 4000
+    original.cache_salt = "tenant"
+    original.stream_options = { include_usage: true }
+    original.messages[2]!.reasoning_content = "unreduced historical reasoning ".repeat(70)
+    return original
+  }
+
+  function handoffContext(original: ChatBody, completeSummary: CompactionContext["completeSummary"], overrides: Partial<CompactionContext> = {}) {
+    return context(completeSummary, { prefixHandoff: true, contextWindow: bytes(original) + 2500, outputLimit: 4000, currentUser: original.messages.at(-1), ...overrides })
+  }
+
+  test("handoff appends to the exact outgoing prefix with the same tools and system", async () => {
+    const original = fixture()
+    const copy = structuredClone(original)
+    const requests: ChatBody[] = []
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const result = await compaction.prepare(original, handoffContext(original, async (body) => { requests.push(body); return success("handoff-summary") }))
+    expect(requests).toHaveLength(1)
+    const request = requests[0]!
+    expect(request.messages.slice(0, -1)).toEqual(original.messages)
+    expect(request.messages[2]!.reasoning_content).toBe(original.messages[2]!.reasoning_content)
+    expect(request.messages.at(-2)).toBe(original.messages.at(-1))
+    expect(request.tools).toBe(original.tools)
+    expect(request.messages[0]).toBe(original.messages[0])
+    expect(request.messages.at(-1)!.role).toBe("user")
+    expect(request.tool_choice).toBe("auto")
+    expect(request.stream).toBe(false)
+    expect(request.stream_options).toBeUndefined()
+    expect(request.max_tokens).toBe(100)
+    expect(request.cache_salt).toBe("tenant")
+    expect(bytes(request)).toBeLessThanOrEqual(bytes(original) + 2500 - 100)
+    const body = forwarded(result)
+    expect(body.messages).toContain(original.messages.at(-1)!)
+    expect("report" in result && result.report?.prefixHandoff).toBe(true)
+    expect("report" in result && result.report?.summaryRequests).toBe(1)
+    expect(bytes(body)).toBeLessThanOrEqual("report" in result ? result.report!.target as number : 0)
+    expect(original).toEqual(copy)
+    const restored = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    expect(await restored.restore("session", compaction.snapshot("session"))).toBe(true)
+    expect(forwarded(await restored.prepare(original, handoffContext(original, async () => { throw new Error("Unexpected inference") })))).toEqual(body)
+  })
+
+  test("handoff preserves the previous frozen effective prefix when extending a checkpoint", async () => {
+    const original = fixture()
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const first = forwarded(await compaction.prepare(original, handoffContext(original, async () => success("first-summary"))))
+    const extension = history(6, 220, "extension").messages.slice(1)
+    const extended = { ...original, messages: [...original.messages, ...extension] }
+    const expectedPrefix = [...first.messages, ...extension]
+    const effectiveSize = bytes({ ...extended, messages: expectedPrefix })
+    const requests: ChatBody[] = []
+    const result = await compaction.prepare(extended, handoffContext(extended, async (body) => { requests.push(body); return success("extended-summary") }, {
+      contextWindow: effectiveSize + 2500,
+    }))
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.messages.slice(0, -1)).toEqual(expectedPrefix)
+    expect(requests[0]!.tools).toBe(original.tools)
+    expect(forwarded(result).messages).toContain(extended.messages.at(-1)!)
+    expect("report" in result && result.report?.prefixHandoff).toBe(true)
+  })
+
+  test("oversized exact prefix falls back to bounded fragments without shortening a handoff", async () => {
+    const original = history(8, 450)
+    delete original.response_format
+    const requests: ChatBody[] = []
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async (body) => { requests.push(body); return success() }, { prefixHandoff: true }))
+    expect(requests.length).toBeGreaterThan(1)
+    for (const request of requests) {
+      expect(request.messages).toHaveLength(2)
+      expect(request.tools).toBeUndefined()
+      expect(bytes(request)).toBeLessThanOrEqual(4500)
+    }
+    expect(archived(requests).length).toBeGreaterThan(0)
+    expect("report" in result && result.report?.prefixHandoff).toBe(false)
+  })
+
+  test("handoff keeps measured prefix usage when stream controls invalidate the exact usage anchor", async () => {
+    const original = fixture()
+    const requests: ChatBody[] = []
+    const limits = handoffContext(original, async (body) => { requests.push(body); return success("folded-summary") })
+    const measured = limits.contextWindow
+    const result = await new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 }).prepare(original, {
+      ...limits,
+      estimate: (body, fallback) => body === original ? measured : fallback(body),
+    })
+    expect("report" in result && result.report?.prefixHandoff).toBe(false)
+    expect(requests.every((body) => body.tools === undefined && body.messages.length === 2)).toBe(true)
+  })
+
+  test("constrained tool choice and output modes use existing fragment folding", async () => {
+    for (const constraint of [
+      { tool_choice: "required" }, { tool_choice: "none" },
+      { tool_choice: { type: "function", function: { name: "read" } } },
+      { response_format: { type: "json_object" } }, { guided_json: { type: "object" } },
+      { structured_outputs: { regex: "constrained" } }, { modalities: ["text", "audio"] },
+    ]) {
+      const original = { ...fixture(), ...constraint }
+      const requests: ChatBody[] = []
+      const result = await new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 }).prepare(original, handoffContext(original, async (body) => { requests.push(body); return success("folded-summary") }))
+      expect(requests.length).toBeGreaterThan(0)
+      for (const request of requests) {
+        expect(request.messages).toHaveLength(2)
+        expect(request.tools).toBeUndefined()
+        expect(request.tool_choice).toBeUndefined()
+        expect(request.response_format).toBeUndefined()
+      }
+      expect(payload(requests[0]!).previous_summary).toBeNull()
+      expect("report" in result && result.report?.prefixHandoff).toBe(false)
+    }
+  })
+
+  test("handoff rejects non-stop, empty and tool-call responses without committing reductions", async () => {
+    for (const invalid of [
+      () => success("truncated", "length"),
+      () => success(" "),
+      () => Response.json({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "bad", tool_calls: [{ id: "call" }] } }] }),
+      () => Response.json({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "bad", function_call: { name: "read" } } }] }),
+    ]) {
+      const original = fixture()
+      const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+      let calls = 0
+      await expect(compaction.prepare(original, handoffContext(original, async () => { calls++; return invalid() }))).rejects.toThrow("summary")
+      expect(calls).toBe(1)
+      expect(compaction.snapshot("session")).toEqual({ lanes: [] })
+    }
+  })
+
+  test("handoff HTTP errors propagate untouched without a fragment retry or new state", async () => {
+    const original = fixture()
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const response = new Response("capacity exhausted", { status: 429, headers: { "retry-after": "7" } })
+    let calls = 0
+    const result = await compaction.prepare(original, handoffContext(original, async () => { calls++; return response }))
+    expect(calls).toBe(1)
+    expect("response" in result && result.response).toBe(response)
+    expect(response.bodyUsed).toBe(false)
+    expect(compaction.snapshot("session")).toEqual({ lanes: [] })
+  })
+
+  test("deleting an in-flight handoff cancels its returned body and prevents state resurrection", async () => {
+    const original = fixture()
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<Response>()
+    const cancelled = Promise.withResolvers<unknown>()
+    const pending = compaction.prepare(original, handoffContext(original, async () => { entered.resolve(); return release.promise })).catch((error: unknown) => error)
+    await entered.promise
+    compaction.delete("session")
+    release.resolve(new Response(new ReadableStream({ cancel: cancelled.resolve })))
+    expect(await pending).toBeInstanceOf(Error)
+    expect(await cancelled.promise).toBeInstanceOf(Error)
+    expect(compaction.snapshot("session")).toEqual({ lanes: [] })
+  }, 5000)
+})
 
 describe("rolling semantic compaction", () => {
   test("tool-generated user-role media cannot replace real current-user provenance", async () => {

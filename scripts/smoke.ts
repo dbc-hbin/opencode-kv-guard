@@ -20,8 +20,8 @@ const encoder = new TextEncoder()
 const children: Subprocess<"ignore", "pipe", "pipe">[] = []
 const servers: Server<undefined>[] = []
 
-async function scenario(guarded: boolean, disableTitle = false, codeMode = false) {
-  const home = join(root, codeMode ? "code-mode" : disableTitle ? "no-title" : guarded ? "guarded" : "baseline")
+async function scenario(guarded: boolean, disableTitle = false, codeMode = false, outputStorage = false, subagent = false) {
+  const home = join(root, subagent ? "subagent" : outputStorage ? "output-storage" : codeMode ? "code-mode" : disableTitle ? "no-title" : guarded ? "guarded" : "baseline")
   await mkdir(home, { recursive: true })
   const fixture = join(home, "fixture.txt")
   await Bun.write(fixture, "Fixture content for a real read-tool round trip.\n")
@@ -78,13 +78,19 @@ async function scenario(guarded: boolean, disableTitle = false, codeMode = false
         finish() {
           if (main) control.enqueue(chunk({ reasoning_text: `Fixture reasoning for step ${call}.` }))
           if (main && call === 1) {
-            control.enqueue(chunk({ tool_calls: [{ index: 0, id: "fixture-read-call", type: "function", function: { name: "read", arguments: JSON.stringify({ filePath: fixture }) } }] }))
+            const name = subagent ? "task" : outputStorage ? "bash" : "read"
+            const args = subagent
+              ? { description: "Check fixture", prompt: "Return KV_GUARD_CHILD_OK without calling tools.", subagent_type: "general" }
+              : outputStorage
+                ? { command: "printf 'OUTPUT_HEAD\\n'; printf 'fixture-line-012345678901234567890123456789012345678901234567890123456789\\n%.0s' {1..500}; printf 'OUTPUT_TAIL\\n'", description: "Emit a bounded output fixture" }
+                : { filePath: fixture }
+            control.enqueue(chunk({ tool_calls: [{ index: 0, id: "fixture-read-call", type: "function", function: { name, arguments: JSON.stringify(args) } }] }))
             control.enqueue(chunk({}, "tool_calls"))
           } else if (main && codeMode && call === 2) {
             control.enqueue(chunk({ tool_calls: [{ index: 0, id: "fixture-mcp-call", type: "function", function: { name: "execute", arguments: JSON.stringify({ code: 'return await tools.fixture.echo({value: "CODE_MODE_OK"})' }) } }] }))
             control.enqueue(chunk({}, "tool_calls"))
           } else {
-            control.enqueue(chunk({ content: main ? "KV_GUARD_OK" : "Fixture session" }))
+            control.enqueue(chunk({ content: main ? subagent && request.headers.has("x-opencode-parent-session-id") ? "KV_GUARD_CHILD_OK" : "KV_GUARD_OK" : "Fixture session" }))
             control.enqueue(chunk({}, "stop"))
           }
           control.enqueue(encoder.encode(`data: ${JSON.stringify({ id: `fixture-${captures.length}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices: [], usage: { prompt_tokens: 2048, completion_tokens: 32, total_tokens: 2080, prompt_tokens_details: { cached_tokens: call > 1 ? 1024 : 0 } } })}\n\n`))
@@ -139,7 +145,7 @@ async function scenario(guarded: boolean, disableTitle = false, codeMode = false
   }
   const third = await Promise.race([next(), ended])
   third.finish()
-  if (codeMode) (await Promise.race([next(), ended])).finish()
+  if (codeMode || subagent) (await Promise.race([next(), ended])).finish()
   const exit = await child.exited
   const output = await stdout
   const errors = await stderr
@@ -148,10 +154,26 @@ async function scenario(guarded: boolean, disableTitle = false, codeMode = false
   void ended.catch(() => {})
   assert.equal(exit, 0, errors)
   assert.ok(output.includes("KV_GUARD_OK"), `${errors}\n${output}`)
-  assert.equal(captures.length, (disableTitle ? 2 : 3) + Number(codeMode))
+  assert.equal(captures.length, (disableTitle ? 2 : 3) + Number(codeMode || subagent))
   const main = captures.filter((capture) => capture.body.tools?.length)
-  assert.equal(main.length, codeMode ? 3 : 2)
-  assert.ok(main[1]!.body.messages.some((message) => message.role === "tool" && JSON.stringify(message.content).includes("Fixture content")), "actual read result must return to the model")
+  assert.equal(main.length, codeMode || subagent ? 3 : 2)
+  if (!outputStorage && !subagent) assert.ok(main[1]!.body.messages.some((message) => message.role === "tool" && JSON.stringify(message.content).includes("Fixture content")), "actual read result must return to the model")
+  if (outputStorage) {
+    const result = main[1]!.body.messages.find((message) => message.role === "tool")
+    const text = JSON.stringify(result?.content)
+    assert.ok(text.includes("OUTPUT_HEAD") && text.includes("OUTPUT_TAIL"), "stored preview must retain both ends")
+    assert.ok(Buffer.byteLength(text) < 18 * 1024, "stored output must stay within the configured preview budget")
+    const artifacts = await Array.fromAsync(new Bun.Glob("tool_*").scan({ cwd: join(home, "data", "opencode", "tool-output"), absolute: true }))
+    const raw = await Promise.all(artifacts.map((path) => Bun.file(path).text()))
+    assert.ok(raw.some((value) => value.startsWith("OUTPUT_HEAD\n") && value.endsWith("OUTPUT_TAIL\n") && value.split("fixture-line-").length === 501), "raw artifact must retain every original output line")
+    assert.ok(artifacts.some((path) => text.includes(path)), "preview must identify its retrievable raw artifact")
+  }
+  if (subagent) {
+    const child = main.find((capture) => capture.headers.has("x-opencode-parent-session-id"))
+    assert.ok(child, "actual task tool must launch a child session")
+    assert.equal(child.headers.get("x-litellm-session-id"), child.headers.get("x-opencode-parent-session-id"))
+    assert.ok(JSON.stringify(main[2]!.body.messages).includes("KV_GUARD_CHILD_OK"), "child result must reach parent")
+  }
   if (guarded) {
     assert.equal(maxActive, 1)
     assert.ok(captures.every((capture) => capture.body.max_tokens === 128))
@@ -163,12 +185,17 @@ async function scenario(guarded: boolean, disableTitle = false, codeMode = false
     assert.ok(captures.every((capture) => capture.headers.has("x-litellm-session-id")))
     assert.ok(!JSON.stringify(main.map((capture) => capture.body.messages)).includes("Today's date:"))
     const previous = main[0]!.body.messages
-    assert.deepEqual(main[1]!.body.messages.slice(0, previous.length), previous, "tool round trip must preserve the entire previous request prefix")
-    assert.equal(main[1]!.body.messages.find((message) => message.role === "assistant")?.reasoning_content, "Fixture reasoning for step 1.")
+    const followup = main[subagent ? 2 : 1]!
+    assert.deepEqual(followup.body.messages.slice(0, previous.length), previous, "tool round trip must preserve the entire previous request prefix")
+    assert.equal(followup.body.messages.find((message) => message.role === "assistant")?.reasoning_content, "Fixture reasoning for step 1.")
     const system = main[0]!.body.messages.filter((message) => message.role === "system").map((message) => message.content).join("\n")
     assert.ok(system.includes(skillDescription), "skill routing description must be preserved")
     assert.ok(!system.includes(join(skillDirectory, "SKILL.md")), "eager skill path must be removed")
     assert.ok(captures.every((capture) => capture.body.reasoning_effort === "max"))
+    const toolText = (main[0]!.body.tools as { function: { name: string; description: string } }[]).map((tool) => tool.function)
+    assert.ok(toolText.find((tool) => tool.name === "bash")?.description.startsWith("Runs a command in a persistent"), "builtin bash description must be compacted")
+    assert.ok(toolText.find((tool) => tool.name === "read")?.description.includes("`<line>: <content>`"), "read output contract must remain")
+    assert.ok(!toolText.some((tool) => tool.description.includes("<good-example>") || tool.description.includes("## Examples")), "verbose builtin examples must be removed")
     if (codeMode) {
       const tools = main[0]!.body.tools as { function: { name: string } }[]
       assert.ok(tools.some((tool) => tool.function.name === "execute"))
@@ -178,17 +205,18 @@ async function scenario(guarded: boolean, disableTitle = false, codeMode = false
     }
   } else assert.ok(JSON.stringify(main[0]!.body.messages).includes("Today's date:"))
   server.stop(true)
-  return { requests: captures.length, maxActive, titleEnabled: !disableTitle, codeMode, mcpCalls, glmReasoningReplay: guarded, skillCatalogCompacted: guarded, systemChars: main[0]!.body.messages.filter((message) => message.role === "system").reduce((sum, message) => {
+  return { requests: captures.length, maxActive, titleEnabled: !disableTitle, codeMode, outputStorage, subagent, mcpCalls, glmReasoningReplay: guarded, skillCatalogCompacted: guarded, systemChars: main[0]!.body.messages.filter((message) => message.role === "system").reduce((sum, message) => {
     assert.equal(typeof message.content, "string")
     return sum + (message.content as string).length
-  }, 0), toolRoundTrip: true, generatedDate: !guarded, stdout: output.trim() }
+  }, 0), toolDescriptionChars: (main[0]!.body.tools as { function: { description: string } }[]).reduce((sum, tool) => sum + tool.function.description.length, 0), toolRoundTrip: true, generatedDate: !guarded, stdout: output.trim() }
 }
 
 const deadline = Promise.withResolvers<never>()
 const timer = setTimeout(() => deadline.reject(new Error("Pinned CLI smoke exceeded 120 seconds")), 120_000)
 try {
-  const results = await Promise.race([(async () => ({ baseline: await scenario(false), guarded: await scenario(true), noTitle: await scenario(true, true), codeMode: await scenario(true, true, true) }))(), deadline.promise])
+  const results = await Promise.race([(async () => ({ baseline: await scenario(false), guarded: await scenario(true), noTitle: await scenario(true, true), codeMode: await scenario(true, true, true), outputStorage: await scenario(true, true, false, true), subagent: await scenario(true, true, false, false, true) }))(), deadline.promise])
   assert.ok(results.guarded.systemChars < results.baseline.systemChars)
+  assert.ok(results.guarded.toolDescriptionChars < results.baseline.toolDescriptionChars / 2)
   console.log(JSON.stringify({ version: "1.19.4", ...results }, null, 2))
 } finally {
   clearTimeout(timer)
