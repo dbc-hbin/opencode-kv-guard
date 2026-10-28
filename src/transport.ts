@@ -1,8 +1,11 @@
 export type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
+export type GateRelease = () => void | Promise<void>
+export type AdmissionGate = { readonly capacity: number; acquire(signal?: AbortSignal): Promise<GateRelease> }
+
 type Waiter = { grant: (release: () => void) => void; reject: (reason: unknown) => void; signal?: AbortSignal; abort: () => void }
 
-export class Gate {
+export class Gate implements AdmissionGate {
   private active = 0
   private waiting: Waiter[] = []
 
@@ -44,11 +47,16 @@ export class Gate {
 
 // Shared by project instances importing this module, never by other OS processes.
 const gates = new Map<string, Gate>()
+export function endpointKey(baseURL: string) {
+  const url = new URL(baseURL)
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}${url.search}`
+}
+
 export function endpointGate(baseURL: string, capacity: number) {
-  const key = new URL(baseURL).href.replace(/\/$/, "")
+  const key = endpointKey(baseURL)
   const existing = gates.get(key)
   if (existing) {
-    if (existing.capacity !== capacity) throw new Error(`KV guard: conflicting maxConcurrent for ${key}`)
+    if (existing.capacity !== capacity) throw new Error("KV guard: conflicting maxConcurrent for endpoint")
     return existing
   }
   const gate = new Gate(capacity)
@@ -56,7 +64,7 @@ export function endpointGate(baseURL: string, capacity: number) {
   return gate
 }
 
-export async function admittedFetch(fetch: Fetch, gate: Gate, input: RequestInfo | URL, init?: RequestInit) {
+export async function admittedFetch(fetch: Fetch, gate: AdmissionGate, input: RequestInfo | URL, init?: RequestInit) {
   const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
   const release = await gate.acquire(signal ?? undefined)
   let response: Response
@@ -64,28 +72,38 @@ export async function admittedFetch(fetch: Fetch, gate: Gate, input: RequestInfo
     signal?.throwIfAborted()
     response = await fetch(input, init)
   } catch (error) {
-    release()
+    await release()
     throw error
   }
   if (!response.body) {
-    release()
+    await release()
     return response
   }
 
   const reader = response.body.getReader()
   let finished = false
+  let completion: Promise<void> | undefined
   let controller: ReadableStreamDefaultController<Uint8Array>
-  const finish = () => {
-    if (finished) return false
+  const finish = (cancel = false, reason?: unknown) => {
+    if (completion) return completion
     finished = true
     signal?.removeEventListener("abort", abort)
-    release()
-    return true
+    // Publish completion before cancellation invokes upstream callbacks.
+    completion = Promise.resolve().then(async () => {
+      try {
+        if (cancel) await reader.cancel(reason)
+      } finally {
+        await release()
+      }
+    })
+    return completion
   }
   const abort = () => {
-    if (!finish()) return
-    controller.error(signal!.reason)
-    void reader.cancel(signal!.reason).catch(() => {})
+    if (finished) return
+    void finish(true, signal!.reason).then(
+      () => controller.error(signal!.reason),
+      (error) => controller.error(error),
+    )
   }
   const body = new ReadableStream<Uint8Array>({
     start(value) {
@@ -94,23 +112,33 @@ export async function admittedFetch(fetch: Fetch, gate: Gate, input: RequestInfo
       if (signal?.aborted) abort()
     },
     async pull(value) {
+      let item: Awaited<ReturnType<typeof reader.read>>
       try {
-        const item = await reader.read()
-        if (finished) return
-        if (item.done) {
-          finish()
-          value.close()
-        } else value.enqueue(item.value)
+        item = await reader.read()
       } catch (error) {
-        if (finish()) value.error(error)
+        if (finished) return
+        try {
+          await finish()
+          value.error(error)
+        } catch (releaseError) {
+          value.error(releaseError)
+        }
+        return
+      }
+      if (finished) return
+      if (item.done) {
+        try {
+          await finish()
+          value.close()
+        } catch (error) {
+          value.error(error)
+        }
+      } else {
+        value.enqueue(item.value)
       }
     },
     async cancel(reason) {
-      try {
-        await reader.cancel(reason)
-      } finally {
-        finish()
-      }
+      await finish(true, reason)
     },
   }, { highWaterMark: 0 })
   // Preserve status, headers and SSE bytes, including upstream error bodies.

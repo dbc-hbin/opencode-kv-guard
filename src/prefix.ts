@@ -11,6 +11,8 @@ export function isGeneratedEnvironment(message: WireMessage) {
 }
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex")
+const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
+const sha256 = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)
 
 // The compatible wire format drops OpenCode message IDs and may add user-role
 // media messages. Carry the real user provenance through conversion in an
@@ -85,6 +87,23 @@ const modeReminders: Record<string, true> = {
 }
 const isModeReminder = (part: Part) => part.type === "text" && part.synthetic === true && !part.ignored && modeReminders[digest(part.text)] === true
 
+export type ModeRemindersSnapshot = { messages: { id: string; base: string; parts: Part[] }[] }
+
+export function isModeRemindersSnapshot(value: unknown, session: string): value is ModeRemindersSnapshot {
+  if (!record(value) || Object.keys(value).some((key) => key !== "messages") || !Array.isArray(value.messages)) return false
+  const ids = new Set<string>()
+  const parts = new Set<string>()
+  return value.messages.every((message) => {
+    if (!record(message) || Object.keys(message).some((key) => !["id", "base", "parts"].includes(key)) || typeof message.id !== "string" || !message.id || ids.has(message.id) || !sha256(message.base) || !Array.isArray(message.parts) || !message.parts.length) return false
+    ids.add(message.id)
+    return message.parts.every((part) => {
+      if (!record(part) || Object.keys(part).some((key) => !["type", "id", "sessionID", "messageID", "text", "synthetic"].includes(key)) || part.type !== "text" || typeof part.id !== "string" || !part.id || parts.has(part.id) || part.sessionID !== session || part.messageID !== message.id || part.synthetic !== true || typeof part.text !== "string" || modeReminders[digest(part.text)] !== true) return false
+      parts.add(part.id)
+      return true
+    })
+  })
+}
+
 export class ModeReminders {
   private sessions = new Map<string, Map<string, { base: string; parts: Part[] }>>()
 
@@ -118,6 +137,22 @@ export class ModeReminders {
     }
   }
 
+  snapshot(session: string): ModeRemindersSnapshot {
+    return { messages: [...(this.sessions.get(session) ?? [])].map(([id, value]) => ({
+      id, base: value.base,
+      parts: value.parts.map((part) => {
+        if (part.type !== "text") throw new Error("Mode reminder state contains a non-text part")
+        return { type: "text" as const, id: part.id, sessionID: part.sessionID, messageID: part.messageID, text: part.text, synthetic: true }
+      }),
+    })) }
+  }
+
+  restore(session: string, value: unknown) {
+    if (!isModeRemindersSnapshot(value, session)) return false
+    this.sessions.set(session, new Map(value.messages.map(({ id, base, parts }) => [id, { base, parts: structuredClone(parts) }])))
+    return true
+  }
+
   delete(sessionID: string) { this.sessions.delete(sessionID) }
   clear() { this.sessions.clear() }
 }
@@ -126,6 +161,23 @@ export class ModeReminders {
 // its model identity line. Other env blocks and user-authored dates stay intact.
 const environment = /(You are powered by the model named [^\n]+\. The exact model ID is [^\n]+\n)(Here is some useful information about the environment you are running in:\n<env>\n  Working directory: [^\n]+\n  Workspace root folder: [^\n]+\n  Is directory a git repo: (?:yes|no)\n  Platform: [^\n]+(?:\n  Today's date: [^\n]+)?\n<\/env>)/
 type Checkpoint = { anchor: string; environment: string }
+export type EnvironmentsSnapshot = { lanes: { key: string; checkpoints: Checkpoint[] }[] }
+const environmentBlock = /^Here is some useful information about the environment you are running in:\n<env>\n  Working directory: [^\n]+\n  Workspace root folder: [^\n]+\n  Is directory a git repo: (?:yes|no)\n  Platform: [^\n]+\n<\/env>$/
+
+export function isEnvironmentsSnapshot(value: unknown): value is EnvironmentsSnapshot {
+  if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes)) return false
+  const lanes = new Set<string>()
+  return value.lanes.every((lane) => {
+    if (!record(lane) || Object.keys(lane).some((key) => !["key", "checkpoints"].includes(key)) || !sha256(lane.key) || lanes.has(lane.key) || !Array.isArray(lane.checkpoints) || !lane.checkpoints.length) return false
+    lanes.add(lane.key)
+    const anchors = new Set<string>()
+    return lane.checkpoints.every((checkpoint) => {
+      if (!record(checkpoint) || Object.keys(checkpoint).some((key) => key !== "anchor" && key !== "environment") || !sha256(checkpoint.anchor) || anchors.has(checkpoint.anchor) || typeof checkpoint.environment !== "string" || !environmentBlock.test(checkpoint.environment)) return false
+      anchors.add(checkpoint.anchor)
+      return true
+    })
+  })
+}
 
 export function stripEnvironmentDate(system: string[]) {
   for (let index = 0; index < system.length; index++) {
@@ -153,14 +205,15 @@ export class Environments {
       return prefix
     })
     if (!anchors.length) return
-    const prior = this.lanes.get(lane)
+    const key = digest(JSON.stringify([session, lane]))
+    const prior = this.lanes.get(key)
     const present = new Set(anchors)
     const checkpoints = (prior?.checkpoints ?? []).filter((checkpoint) => present.has(checkpoint.anchor))
     const current = match[2]!.replace(/\n  Today's date: [^\n]+/, "")
     if (checkpoints.at(-1)?.environment !== current) {
       checkpoints.push({ anchor: anchors.at(-1)!, environment: current })
     }
-    this.lanes.set(lane, { session, checkpoints })
+    this.lanes.set(key, { session, checkpoints })
     system.content = system.content.replace(environment, "$1")
 
     const result: WireMessage[] = [system]
@@ -177,6 +230,19 @@ export class Environments {
       }
     }
     messages.splice(0, messages.length, ...result)
+  }
+
+  snapshot(session: string): EnvironmentsSnapshot {
+    return { lanes: [...this.lanes].flatMap(([key, lane]) => lane.session === session ? [{ key, checkpoints: structuredClone(lane.checkpoints) }] : []) }
+  }
+
+  restore(session: string, value: unknown) {
+    if (!isEnvironmentsSnapshot(value)) return false
+    this.delete(session)
+    for (const lane of value.lanes) {
+      if (!this.lanes.has(lane.key)) this.lanes.set(lane.key, { session, checkpoints: structuredClone(lane.checkpoints) })
+    }
+    return true
   }
 
   delete(sessionID: string) {

@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { Gate, admittedFetch } from "../src/transport"
 import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDate, UserTurns, type WireMessage } from "../src/prefix"
-import plugin from "../src/index"
+import createPlugin from "../src/index"
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import type { Fetch } from "../src/transport"
+
+const plugin: typeof createPlugin = (input, options) => createPlugin(input, { persistence: false, crossProcess: false, ...options })
 
 function system(date: string, cwd = "/project") {
   return `Stable policy.\nYou are powered by the model named fixture. The exact model ID is proxy/fixture\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: ${cwd}\n  Workspace root folder: /project\n  Is directory a git repo: yes\n  Platform: linux\n  Today's date: ${date}\n</env>\nProject instructions: obey the current policy.`
@@ -236,6 +238,35 @@ describe("stream admission", () => {
 test("invalid target options fail before activation", async () => {
   await expect(plugin({} as PluginInput, {})).rejects.toThrow("providers")
   await expect(plugin({} as PluginInput, { providers: ["proxy"], maxConcurrent: 0 })).rejects.toThrow("maxConcurrent")
+})
+
+test("per-turn OpenCode request IDs preserve the previous environment prefix", async () => {
+  const captured: { body: { messages: WireMessage[] }; requestID: string | null }[] = []
+  const config = { provider: { "opencode-local": { npm: "@ai-sdk/openai-compatible", options: {
+    baseURL: "http://request-identity.test/v1",
+    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      captured.push({ body: await request.json() as { messages: WireMessage[] }, requestID: request.headers.get("x-opencode-request") })
+      return new Response("ok")
+    },
+  } } } }
+  const hooks = await plugin({} as PluginInput, { providers: ["opencode-local"], compaction: false })
+  await hooks.config!(config)
+  for (const [id, messages] of [
+    ["turn-one", history("DAY_A")],
+    ["turn-two", history("DAY_A", [{ role: "assistant", content: "Done" }, { role: "user", content: "Next" }])],
+  ] as const) {
+    const response = await config.provider["opencode-local"].options.fetch("http://request-identity.test/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-opencode-session-id": "request-id-session", "x-opencode-kv-guard-agent": "build", "x-opencode-request": id },
+      body: JSON.stringify({ model: "fixture", messages }),
+    })
+    await response.text()
+  }
+  expect(captured.map((capture) => capture.requestID)).toEqual(["turn-one", "turn-two"])
+  const previous = captured[0]!.body.messages
+  expect(captured[1]!.body.messages.slice(0, previous.length)).toEqual(previous)
+  await hooks.dispose!()
 })
 
 test("URL templates bind to the resolved endpoint and unresolved targets do not activate hooks", async () => {

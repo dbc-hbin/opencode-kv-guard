@@ -9,6 +9,10 @@ The audit covers the complete **custom OpenAI-compatible request path**, from st
 - OpenCode default AI SDK: `ai@6.0.168`, `@ai-sdk/openai-compatible@2.0.41`.
 - Full source inventories and line references: [system/tools](analysis/prompt-tools.md), [history/replay](analysis/history.md), [transport/pressure](analysis/transport.md). These are analysis artifacts; their fixability descriptions characterize upstream, not an inventory of this plugin's later fixes.
 
+The current implementation additionally covers request-correlated usage anchors, same-host cross-process admission, an explicit GLM plaintext-reasoning profile, durable reconstruction checkpoints and compact generated skill catalogs. See [README.md](README.md) for defaults, deployment options and final verification. Native MCP Code Mode is reused rather than reimplemented.
+
+For the suspected GLM 5.3 NVFP4 deployment, the [public NVIDIA template](https://huggingface.co/nvidia/GLM-5.3-NVFP4/blob/main/chat_template.jinja) renders reasoning effort at the very beginning (default `max`) and defaults `clear_thinking` to false. Changing effort or stripping historical reasoning can change prefixes, but neither behavior is established on the private server. NVFP4 weights/activations do not establish the KV dtype, serving engine or deployed context limit. The explicit GLM profile preserves request overrides and does not apply Qwen options.
+
 ## Findings ranked by relevance
 
 | Mechanism | What differs from OMP | When it matters | Response |

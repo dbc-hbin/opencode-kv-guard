@@ -1,6 +1,6 @@
 # OpenCode KV Guard
 
-A local plugin for **OpenCode 1.19.4** and explicitly selected `@ai-sdk/openai-compatible` providers. Intended for LiteLLM -> vLLM installations. It has no runtime npm dependencies; the bundle uses Node's built-in crypto module.
+A local plugin for **OpenCode 1.19.4** and explicitly selected `@ai-sdk/openai-compatible` providers. Intended for LiteLLM -> vLLM/SGLang installations. It has no runtime npm dependencies; it uses Bun's built-in SQLite and Node builtins. Cross-process admission supports Linux and macOS.
 
 Source baseline: OpenCode tag `v1.19.4`, commit `148842ef7cb1bc34192b3fff57d0f9721ab9c801`. OMP comparison: `can1357/oh-my-pi` commit `6f3fbc94c567c0ac619c013dd15d718356eecba1`.
 
@@ -39,15 +39,21 @@ The selected providers must explicitly have `npm: "@ai-sdk/openai-compatible"` a
 - **No generated date.** Removes the exact core-generated `Today's date` field. It is not relocated or frozen in another message. Dates in user text, project instructions and tool results remain intact.
 - **Append-only environment.** Moves the recognized core environment out of the initial system block and into anchored conversation reminders. Previously transmitted context remains stable; a real working-directory change appends updated context rather than rewriting it. Other system policies remain live. Unsupported layouts containing later system/developer messages are left in place, apart from the earlier date-removal hook.
 - **Stable historical mode reminders.** The default core plan/build reminders are transient. The plugin remembers exact recognized synthetic reminders and reattaches them to their historical user turn. It does not revive a previous mode on the current turn, freeze permissions, overwrite edited messages or write to the session database.
-- **Stream-lifetime admission.** FIFO per configured base URL, shared by instances importing the same module in one process. Default one active HTTP generation. The lease lasts through response-body EOF, cancellation or error, not just arrival of HTTP headers. Queued aborts do not dispatch. HTTP status, error bodies and SSE bytes remain intact.
+- **Stream-lifetime admission across processes.** Default one active HTTP generation per normalized endpoint across local processes sharing the state directory. A local FIFO gate sits in front of the SQLite coordinator; ordering across processes is not guaranteed. The lease lasts through response-body EOF, cancellation or error, not just arrival of HTTP headers. Queued aborts do not dispatch. Verified dead owners are reclaimed without evicting merely slow live owners. Set `crossProcess: false` for only the original in-process FIFO gate.
 - **Stable schema object order.** Canonicalizes object keys in tool definitions. Does not reorder tool arrays, enum arrays, examples or tool-call argument strings. This only helps when otherwise identical schemas arrive with different object-member ordering; actual tool/schema changes remain visible.
 - **Wire-correct cache key.** Normalizes the core's `promptCacheKey` passthrough field to `prompt_cache_key`; an explicit snake-case value wins. Optional generation of a session key is off by default. Does not modify `cache_salt` or tenant isolation.
 - **Session routing metadata.** Adds `x-litellm-session-id` only if absent, using the parent session where OpenCode supplies one. Preserves existing OpenCode affinity headers and explicit LiteLLM session headers.
 - **Optional output ceiling.** `maxOutputTokens` reduces both `chat.params` and the final compatible wire limit, including passthrough overrides. It does not change OpenCode's context metadata or silently increase its compaction threshold. No arbitrary output cap is imposed by default.
 - **Preflight rolling compaction.** Counts the pending wire request before dispatch, reuses a frozen summary, and summarizes only newly archived history. Full parallel tool-call/result batches are indivisible; long current tool loops can be split at completed batches while the current user instruction and newest batch stay exact. Native OpenCode history is never overwritten. See the budgeting and failure contract below.
-- **Content-free diagnostics.** `diagnostics: true` writes `kv-guard` entries through OpenCode's logging API: system/tool changes, historical-message rewrites and unchanged message counts. These are request comparisons, **not tokenizer-level prefix hits or GPU measurements**. Prompt text, paths, secrets and tool arguments are not logged by this feature.
+- **Usage-anchored budgeting.** A successful response's raw `prompt_tokens` anchors the next unchanged prefix; only appended accountable text/tool messages are estimated. Cached input is included, never subtracted or counted twice. Model, policy, tools, request-field changes, edited history and compaction invalidate incompatible anchors. Missing usage falls back to the configured byte estimator. The plugin requests streaming usage unless explicitly disabled in the request.
+- **Durable reconstruction checkpoints.** Completed summaries, retained boundaries, environment anchors and historical mode reminders are stored together and restored before preparation. Original-history/policy validation still applies. SQLite compare-and-swap prevents a stale process from overwriting another process's checkpoint; conflicts stop before main dispatch. Session deletion waits for competing writers, removes the payload and retains an opaque tombstone. Disposal waits for pending deletion work but otherwise keeps durable state; non-contention cleanup failures are logged and surfaced at disposal.
+- **Opt-in GLM profile.** Exact model IDs can select GLM 5.3 defaults and plaintext reasoning-response adaptation. Explicit request controls win; conflicts remain intact and are reported rather than silently resolved. Unknown models, signed/opaque payloads and unsupported response layouts are not rewritten.
+- **Compact skill catalog.** The recognized generated catalog retains its currently advertised names and complete descriptions but removes eager absolute locations and per-entry XML scaffolding. The name-based skill tool remains available. A private user-system suffix fingerprint prevents rewriting a user-authored trailing catalog. Ambiguous or unsupported layouts are left intact.
+- **Content-free diagnostics.** `diagnostics: true` logs prefix comparisons, GLM policy, skill reductions, request usage and lifecycle timings, including internal summaries. Reports distinguish admission wait, upstream header time, first actual output and completion; cache counters are the server's reports, not GPU measurements. Unreported counters remain absent. Prompt text, paths, credentials and tool arguments are not logged.
 
-Options: `providers` (required string array), `maxConcurrent` (positive integer, default 1), `maxOutputTokens` (optional positive integer), `compactPrompt`, `stabilizeEnvironment`, `retainModeReminders`, `canonicalToolSchemas` (default true), `promptCacheKey`, `diagnostics` (default false), and `compaction` (enabled by default; `false` or the object below). Generated date removal is always active for selected providers. Same-endpoint instances must agree on `maxConcurrent`.
+Options: `providers` (required string array), `maxConcurrent` (positive integer, default 1), `maxOutputTokens` (optional positive integer), `compactPrompt`, `compactSkills`, `stabilizeEnvironment`, `retainModeReminders`, `canonicalToolSchemas`, `usageAccounting`, `crossProcess`, `persistence` (default true), `promptCacheKey`, `diagnostics` (default false), `stateDirectory` (optional absolute path), `glm` (off unless configured), and `compaction` (enabled by default; `false` or the object below). Generated date removal is always active for selected providers.
+
+State defaults to `$XDG_STATE_HOME/opencode-kv-guard`, or `~/.local/state/opencode-kv-guard`. Keep it on a private local filesystem. Admission is endpoint-scoped; checkpoint files are project/policy/session-scoped and include hashed endpoint/header identity in their lanes. The known per-turn `x-opencode-request` correlation header is forwarded but excluded from state identity; credential and tenant headers remain part of identity. Checkpoints contain conversation summaries and environment/reminder text and use private directory/file permissions. Same-endpoint processes sharing this directory must agree on `maxConcurrent`; the coordinator persists that capacity and rejects conflicting values. To change capacity, stop all users of that coordinator and select a new shared `stateDirectory`. This does not coordinate other hosts or unguarded clients.
 
 ## OMP-inspired rolling compaction
 
@@ -66,7 +72,7 @@ Optional settings inside the plugin's `compaction` object:
 
 The model's actual metadata arrives through `chat.headers`; internal metadata headers are stripped before HTTP. For context window `C`, optional input limit `I`, final requested output cap `O`, and margin `M`, the budget is `min(I, C - O) - M`. The trigger is 85% of that budget by default, and the recovery target is 80% of the trigger. Fixed system instructions, tool schemas, output-format constraints and newly added user/tool content are included. A declared zero/unknown context window is not replaced with a guessed limit: configure `provider.models.<model>.limit.context` and output/input limits to match the actual served model.
 
-**This is an estimator, not the server tokenizer.** UTF-8 bytes improve on UTF-16 character counting for multilingual input, but neither the estimate nor the ratio guarantees the tokenizer, chat-template overhead, media tokens or GPU KV allocation. Use a lower `bytesPerToken` or extra margin if the deployment needs it. One byte per token is more conservative for common byte-based tokenizers but still not a universal media/template bound.
+**This is not the server tokenizer.** With `usageAccounting` enabled, a completed request supplies the exact reported prompt-token baseline only while its policy and message prefix remain identical. The appended suffix is still estimated. Changed prefixes, unreported usage and new media/signed content use the byte estimator. UTF-8 bytes improve on UTF-16 character counting for multilingual input, but neither estimator nor ratio guarantees chat-template overhead, media tokens or GPU KV allocation. Use a lower `bytesPerToken` or extra margin if the deployment needs it. One byte per token is more conservative for common byte-based tokenizers but still not a universal media/template bound. Set OpenCode's existing `provider.models.<model>.limit` values to the actual served limits; a model card advertising 1M is not evidence that a particular deployment serves 1M.
 
 Each internal summary request has its own output reserve and input budget. Oversized archived text is folded through bounded sequential fragments carrying the previous summary; it is not sent as one enormous rescue request. Summary calls use the same endpoint gate and cancellation signal and do not reenter compaction. They remove ordinary tool/schema/stop constraints while retaining model/template and tenant-isolation settings. They incur real inference work on the configured model and are additional to the main response; native OpenCode token/cost UI does not aggregate this plugin's internal summary calls. Diagnostic reports include summary-request counts.
 
@@ -76,13 +82,34 @@ Real-user provenance is carried through OpenCode/SDK conversion with an instance
 
 Between compactions, summary bytes and retained messages stay stable. A compaction boundary intentionally changes history; the lower recovery target prevents repeated tiny rewrites every turn. Opaque/signed and multimodal data remain exact. If mandatory content alone cannot fit, the plugin fails with the region/budget instead of silently cutting the current user request or a tool pair. Semantic summaries are inherently lossy; quality needs evaluation with the actual on-prem model.
 
-The core's `client.session.summarize()` cannot safely be awaited inside a running request hook: it waits for the same session loop containing that hook. This is why the implementation compacts only outgoing requests. It reduces wire history but cannot remove OpenCode's own cost of loading/converting the full stored transcript. On restart, in-memory summaries are rebuilt through bounded folding before an oversized main request is sent.
+The core's `client.session.summarize()` cannot safely be awaited inside a running request hook: it waits for the same session loop containing that hook. This is why the implementation compacts only outgoing requests. It reduces wire history but cannot remove OpenCode's own cost of loading/converting the full stored transcript. With persistence enabled, a restart restores the coherent checkpoint; a missing, incompatible or malformed payload is rebuilt through bounded folding. Unreadable storage fails explicitly. With `persistence: false`, state is instance-local and restart requires reconstruction.
 
 For a fully guarded profile, use native `compaction.auto: false` and `prune: false` as shown above. With native compaction still enabled, its independent old-usage trigger can fire after a long completion; builtin title/summary/compaction requests are budget-checked but are not recursively summarized. To turn plugin compaction off, use plugin `compaction: false` and restore native `compaction.auto: true`.
 
 ## Model-specific template settings
 
+For a confirmed GLM 5.3 deployment, add this object to the plugin options, replacing the model ID with the exact outgoing Chat Completions `model` value:
+
+```json
+{
+  "glm": {
+    "models": ["your-served-glm-model-id"],
+    "reasoningEffort": "max",
+    "clearThinking": false,
+    "cumulativeReasoning": false
+  }
+}
+```
+
+The public NVIDIA GLM-5.3-NVFP4 template puts reasoning effort at the beginning of the prompt, defaults it to `max`, and defaults `clear_thinking` to false. This opt-in profile makes missing settings explicit without overriding supplied top-level/template values. It normalizes unambiguous camelCase controls and adapts otherwise unsupported plaintext `reasoning_text` responses so the pinned SDK can persist and replay them. `low`, `high` and `max` are the supported profile efforts. Set `cumulativeReasoning` only when the backend actually emits cumulative rather than incremental reasoning snapshots; incompatible non-append-only snapshots fail rather than duplicating or inventing reasoning. The plugin cannot recover reasoning already removed upstream. Preserving thinking can increase input size even when it improves prefix reuse.
+
+The model name does not establish the serving engine or KV dtype. NVIDIA's public checkpoint documents SGLang and quantized weights/activations, not a guarantee of FP4 KV. Verify the actual deployment/template before enabling the profile. Internal summaries retain the effective model/template settings; this release does not implement prefix-preserving handoff summarization.
+
 For an affected Qwen template that supports it, put `chat_template_kwargs: { "preserve_thinking": true }` in that model's existing `options`. This preserves historical thinking; it does not force current-turn thinking on. Do not assume an arbitrary company model alias uses Qwen or that every LiteLLM deployment forwards the same extras. The plugin repairs the known camelCase spellings generated by experimental mode expansion, including template kwargs, thinking-preservation flags, cache salt and token-limit names; it does not invent template flags.
+
+## Native MCP Code Mode
+
+OpenCode 1.19.4 already implements MCP progressive disclosure. Start it with `OPENCODE_EXPERIMENTAL_CODE_MODE=true` to expose connected MCP tools through the permission-aware `execute` tool and a bounded searchable catalog instead of separate top-level MCP schemas. This is an existing OpenCode flag, not a plugin executor or a replacement for builtin tools. The plugin does not enable this process-wide experimental setting silently. Catalog/permission changes remain live. Skill-description text is preserved in full; this release does not add lossy or model-generated routing hints.
 
 The exhaustive comparison, counterexamples and ranked causal distinctions are in [ANALYSIS.md](ANALYSIS.md), with complete evidence maps under [analysis/](analysis/).
 
@@ -116,8 +143,8 @@ The exact reported string `kv cache capacity exhausted` was not conclusively att
 ## Boundaries
 
 - OpenAI Chat Completions is stateless. Do not send only a suffix and assume the server remembers the missing conversation. Prefix caching saves repeated computation; it is not a conversation storage API.
-- State is in memory, per plugin instance/session/model/agent. Restart/reload may require a fresh warm-up. Deleted sessions and dispose clear retained prompt state. The original OpenCode history is untouched.
-- The gate cannot limit other OS processes, other clients, or LiteLLM's own hidden fan-out. Parent/subagent requests share it only when they use the same configured endpoint and module instance.
+- Completed reconstruction state is durable by default, but usage anchors are instance-local. Restoring identical request bytes cannot restore GPU blocks that have already been evicted. The original OpenCode history is untouched.
+- The cross-process gate covers guarded local processes sharing the state directory and endpoint. It cannot limit other machines, unrelated clients, or LiteLLM's hidden fan-out. Capacity configuration persists, and global FIFO ordering is not promised. Process death permits local lease recovery but cannot prove that upstream GPU computation has stopped.
 - Queue time is inside OpenCode's normal request timeout. Very long queues can hit that timeout. Abort/cancel is propagated, but only the inference server can confirm that GPU resources have actually been reclaimed.
 - Shortening a builtin prompt changes the model's behavioral guidance. `compactPrompt: false` restores it while keeping the other protections and date removal.
 - User/project/MCP policy updates, agent/model changes, tool catalog changes, compaction and deliberate history edits can require a new prefix. Freezing them to force hits would be incorrect.
@@ -125,7 +152,7 @@ The exact reported string `kv cache capacity exhausted` was not conclusively att
 
 ## Validation
 
-`bun run typecheck`, `bun test`, `bun run smoke`, and `bun run smoke:compaction` are local checks. The first smoke uses the actual pinned 1.19.4 CLI with isolated config/data directories and an event-controlled loopback OpenAI-compatible server. It exercises a real file read and the next model request, both with serialized titles and titles disabled. The compaction smoke drives multiple user turns through the actual pinned server and checks reduced wire history, reused summaries and unchanged stored user history. No paid model is called. Temporary data and child processes are removed on exit.
+`bun run typecheck`, `bun test`, `bun run build`, `bun run smoke`, and `bun run smoke:compaction` are local checks. The first smoke uses the actual pinned 1.19.4 CLI with isolated config/data directories and an event-controlled loopback OpenAI-compatible server. It exercises a real read-tool round trip, GLM reasoning alias capture/replay, compact skill catalogs, serialized/disabled titles, and a real local MCP call through native Code Mode. The compaction smoke restarts the actual pinned server after compaction and verifies prefix/checkpoint reuse without another summary, reduced wire history and unchanged original history. Process tests also exercise independent workers, crash recovery, cancellation and transactional conflicts. No paid model is called. Temporary data and child processes are removed on exit.
 
 Builtin replacement was independently exercised against all 11 original provider outputs, including both substituted Muse names: suffix preservation, boundary rejection, custom-prompt preservation and repeat-call stability passed. Original builtin sizes range from 4,076 to 15,372 characters; replacement is 1,887 characters (53.7%-87.7% smaller). These are character counts, not model-token or GPU-memory measurements.
 
@@ -133,12 +160,17 @@ Observed with the shipped bundle loaded in the actual 1.19.4 runtime:
 
 | Scenario | Result |
 | --- | --- |
-| Typecheck and regression suite | Clean typecheck; 45 tests passed, 371 assertions. |
-| Title plus main/read round trip, unmodified | 3 HTTP generations, peak 2 active, 9,625 system-message characters. |
-| Same scenario with plugin | 3 generations, peak 1 active, 2,672 system-message characters; no generated date; previous request prefix preserved on the tool round trip. |
+| Typecheck and regression suite | Clean typecheck; 133 tests passed, 850 assertions. |
+| Title plus main/read round trip, unmodified | 3 HTTP generations, peak 2 active, 9,957 system-message characters. |
+| Same scenario with plugin | 3 generations, peak 1 active, 2,664 system-message characters; no generated date; previous request prefix and GLM reasoning preserved on the tool round trip. |
 | Plugin plus native title disable | 2 generations, peak 1 active; real read result still returned to the model. |
-| 15-turn rolling-compaction scenario | 15 main calls, 4 summary calls; 10 main calls carried a summary and 6 reused it without another summary inference. |
-| Wire-history reduction | For example, serialized message characters fell from 78,808 to 49,880 at a compaction boundary; similar reductions occurred at later boundaries. |
+| Native MCP Code Mode | One actual local MCP call through `execute`; direct MCP schema absent; returned result reached the next model request. |
+| 15-turn rolling-compaction scenario | 15 main calls, 5 summary calls; 14 main calls carried a summary and 9 reused it without another summary inference. |
+| Usage-driven early compaction | A controlled high `prompt_tokens` report caused compaction on the second user turn even though the byte estimate alone fit below the trigger. |
+| Per-turn correlation headers | All 15 native `x-opencode-request` values differed and remained forwarded without invalidating shared state. |
+| Restart after compaction | A fresh server process reused the checkpoint without a new summary call and reproduced the previous request prefix. |
+| Wire-history reduction | For example, serialized message characters fell from 80,853 to 49,775 at a compaction boundary; similar reductions occurred at later boundaries. |
+| Concurrent deletion | Competing writers delayed deletion rather than losing it; disposal drained even a second deletion arriving during the first wait, both tombstones committed, and stale saves were rejected. |
 | Stored transcript | All 15 original user turns remained in OpenCode storage. |
 
 The summary responses in the local scenarios are controlled fixtures. They verify orchestration, budgeting, protocol preservation and state reuse, not the semantic quality or latency of the private model.
