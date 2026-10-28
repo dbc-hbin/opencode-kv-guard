@@ -1,0 +1,225 @@
+import { createHash, randomUUID } from "node:crypto"
+import type { Hooks } from "@opencode-ai/plugin"
+
+type Messages = Parameters<NonNullable<Hooks["experimental.chat.messages.transform"]>>[1]["messages"]
+type Part = Messages[number]["parts"][number]
+export type WireMessage = { role: string; content?: unknown; [key: string]: unknown }
+
+const generatedEnvironments = new WeakSet<WireMessage>()
+export function isGeneratedEnvironment(message: WireMessage) {
+  return generatedEnvironments.has(message)
+}
+
+const digest = (value: string) => createHash("sha256").update(value).digest("hex")
+
+// The compatible wire format drops OpenCode message IDs and may add user-role
+// media messages. Carry the real user provenance through conversion in an
+// instance-private marker, then remove it before any inference or hashing.
+export class UserTurns {
+  private readonly prefix = `\u001ekv-guard-user:${randomUUID()}:`
+  private readonly pattern = new RegExp(`${this.prefix}[a-f0-9]{64}\u001f`, "g")
+
+  marker(session: string, message: string) {
+    return this.prefix + digest(JSON.stringify([session, message])) + "\u001f"
+  }
+
+  clean(messages: Messages) {
+    for (const message of messages) {
+      if (message.info.role !== "user") continue
+      message.parts = message.parts.filter((part) => {
+        if (part.type !== "text" || !part.text.includes(this.prefix)) return true
+        part.text = part.text.replace(this.pattern, "")
+        return part.text !== ""
+      })
+    }
+  }
+
+  mark(messages: Messages, providers: Set<string>) {
+    const current = messages.findLast((message) => message.info.role === "user")
+    if (!current || current.info.role !== "user" || !providers.has(current.info.model.providerID)) return
+    const marker = this.marker(current.info.sessionID, current.info.id)
+    const part = current.parts.find((part) => part.type === "text" && !part.ignored && part.text !== "")
+    if (part?.type === "text") part.text = marker + part.text
+    else current.parts.push({
+      type: "text", id: `prt_${digest(marker)}`, sessionID: current.info.sessionID,
+      messageID: current.info.id, text: marker, synthetic: true,
+    })
+  }
+
+  consume(messages: WireMessage[], expected?: string | null) {
+    let current: WireMessage | undefined
+    for (const message of messages) {
+      if (typeof message.content === "string") {
+        if (message.role === "user" && expected && message.content.startsWith(expected)) current = message
+        message.content = message.content.replace(this.pattern, "")
+      } else if (Array.isArray(message.content)) {
+        let removedPart = false
+        message.content = message.content.filter((part: unknown) => {
+          if (!part || typeof part !== "object" || !("text" in part) || typeof part.text !== "string") return true
+          if (message.role === "user" && expected && part.text.startsWith(expected)) current = message
+          const owned = part.text.includes(this.prefix)
+          part.text = part.text.replace(this.pattern, "")
+          if (owned && part.text === "") { removedPart = true; return false }
+          return true
+        })
+        // Restore the SDK's single-text representation if a marker-only part
+        // was added to a user turn containing a core-generated text part.
+        if (removedPart && Array.isArray(message.content) && message.content.length === 1) {
+          const only = message.content[0]
+          if (only?.type === "text" && typeof only.text === "string") {
+            const { type: _type, text, ...metadata } = only
+            Object.assign(message, metadata, { content: text })
+          }
+        }
+      }
+    }
+    return current
+  }
+}
+
+// SHA-256 of the unmodified v1.19.4 plan.txt and build-switch.txt. Only these
+// core-generated, synthetic parts qualify; arbitrary plugin/user text does not.
+const modeReminders: Record<string, true> = {
+  "455db97e0d21e8097c2afb539d167b4b2483e99b585dbc4fff23cafd4a3029b8": true,
+  "5e3db616a685a3dfaaf95fb86ae6e2acfbdf520bda60f7b27f727d2a88ba8a25": true,
+}
+const isModeReminder = (part: Part) => part.type === "text" && part.synthetic === true && !part.ignored && modeReminders[digest(part.text)] === true
+
+export class ModeReminders {
+  private sessions = new Map<string, Map<string, { base: string; parts: Part[] }>>()
+
+  apply(messages: Messages, providers: Set<string>) {
+    const last = messages.findLast((message) => message.info.role === "user")
+    if (!last || last.info.role !== "user" || !providers.has(last.info.model.providerID)) return
+    const session = last.info.sessionID
+    const records = this.sessions.get(session) ?? new Map<string, { base: string; parts: Part[] }>()
+    this.sessions.set(session, records)
+    const present = new Set(messages.map((message) => message.info.id))
+    for (const id of records.keys()) if (!present.has(id)) records.delete(id)
+
+    for (const message of messages) {
+      if (message.info.role !== "user") continue
+      const parts = message.parts.filter(isModeReminder)
+      const base = digest(JSON.stringify(message.parts.filter((part) => !isModeReminder(part))))
+      if (message === last) {
+        // The current mode is always authoritative. A plan/build switch on the
+        // same user message replaces the record instead of reviving old policy.
+        if (parts.length) records.set(message.info.id, { base, parts: structuredClone(parts) })
+        else records.delete(message.info.id)
+        continue
+      }
+      const prior = records.get(message.info.id)
+      if (!prior) continue
+      if (prior.base !== base) {
+        records.delete(message.info.id) // Edited history must not inherit stale instructions.
+        continue
+      }
+      if (!parts.length) message.parts.push(...structuredClone(prior.parts))
+    }
+  }
+
+  delete(sessionID: string) { this.sessions.delete(sessionID) }
+  clear() { this.sessions.clear() }
+}
+
+// Match only OpenCode 1.19.4's generated environment, immediately following
+// its model identity line. Other env blocks and user-authored dates stay intact.
+const environment = /(You are powered by the model named [^\n]+\. The exact model ID is [^\n]+\n)(Here is some useful information about the environment you are running in:\n<env>\n  Working directory: [^\n]+\n  Workspace root folder: [^\n]+\n  Is directory a git repo: (?:yes|no)\n  Platform: [^\n]+(?:\n  Today's date: [^\n]+)?\n<\/env>)/
+type Checkpoint = { anchor: string; environment: string }
+
+export function stripEnvironmentDate(system: string[]) {
+  for (let index = 0; index < system.length; index++) {
+    system[index] = system[index]!.replace(environment, (_match, identity: string, env: string) =>
+      identity + env.replace(/\n  Today's date: [^\n]+/, ""),
+    )
+  }
+}
+
+export class Environments {
+  private lanes = new Map<string, { session: string; checkpoints: Checkpoint[] }>()
+
+  apply(messages: WireMessage[], session: string, lane: string) {
+    const system = messages[0]
+    if (system?.role !== "system" || typeof system.content !== "string") return
+    const match = environment.exec(system.content)
+    if (!match || !messages.some((message) => message.role === "user")) return
+    // Do not move data across later system/developer instructions, which may
+    // intentionally delimit different policy contexts.
+    if (messages.slice(1).some((message) => message.role === "system" || message.role === "developer")) return
+
+    let prefix = ""
+    const anchors = messages.slice(1).map((message) => {
+      prefix = digest(prefix + "\n" + JSON.stringify(message))
+      return prefix
+    })
+    if (!anchors.length) return
+    const prior = this.lanes.get(lane)
+    const present = new Set(anchors)
+    const checkpoints = (prior?.checkpoints ?? []).filter((checkpoint) => present.has(checkpoint.anchor))
+    const current = match[2]!.replace(/\n  Today's date: [^\n]+/, "")
+    if (checkpoints.at(-1)?.environment !== current) {
+      checkpoints.push({ anchor: anchors.at(-1)!, environment: current })
+    }
+    this.lanes.set(lane, { session, checkpoints })
+    system.content = system.content.replace(environment, "$1")
+
+    const result: WireMessage[] = [system]
+    for (let index = 1; index < messages.length; index++) {
+      result.push(messages[index]!)
+      for (const checkpoint of checkpoints) {
+        if (checkpoint.anchor !== anchors[index - 1]) continue
+        const reminder: WireMessage = {
+          role: "user",
+          content: `<system-reminder>\n${checkpoint.environment}\n</system-reminder>`,
+        }
+        generatedEnvironments.add(reminder)
+        result.push(reminder)
+      }
+    }
+    messages.splice(0, messages.length, ...result)
+  }
+
+  delete(sessionID: string) {
+    for (const [key, value] of this.lanes) if (value.session === sessionID) this.lanes.delete(key)
+  }
+  clear() { this.lanes.clear() }
+}
+
+// JSON object member order is not schema semantics. Array order and strings
+// (including enum values, examples and tool-call argument strings) are retained.
+export function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical)
+  if (value === null || typeof value !== "object") return value
+  return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => [key, canonical(item)]))
+}
+
+export class PrefixAudit {
+  private lanes = new Map<string, { session: string; system: string; tools: string; messages: string[] }>()
+
+  observe(body: { messages: WireMessage[]; tools?: unknown }, session: string, lane: string) {
+    const next = {
+      session,
+      system: digest(JSON.stringify(body.messages.filter((message) => message.role === "system"))),
+      tools: digest(JSON.stringify(body.tools ?? [])),
+      messages: body.messages.filter((message) => message.role !== "system").map((message) => digest(JSON.stringify(message))),
+    }
+    const previous = this.lanes.get(lane)
+    this.lanes.set(lane, next)
+    if (!previous) return { firstRequest: true }
+    let sharedMessages = 0
+    while (sharedMessages < previous.messages.length && previous.messages[sharedMessages] === next.messages[sharedMessages]) sharedMessages++
+    return {
+      systemChanged: previous.system !== next.system,
+      toolsChanged: previous.tools !== next.tools,
+      historyRewritten: sharedMessages < previous.messages.length,
+      sharedMessages,
+      previousMessages: previous.messages.length,
+      currentMessages: next.messages.length,
+    }
+  }
+
+  delete(sessionID: string) {
+    for (const [key, value] of this.lanes) if (value.session === sessionID) this.lanes.delete(key)
+  }
+  clear() { this.lanes.clear() }
+}
