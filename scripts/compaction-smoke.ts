@@ -99,6 +99,30 @@ try {
   const result = await Promise.race([(async () => {
     let runtime = await startServer()
     let client = runtime.client
+    const toasts: { title?: string; message: string; variant: string }[] = []
+    let toastWaiter: (() => void) | undefined
+    // Notifications are fire-and-forget; wait for the published events rather
+    // than assuming they landed before the prompt returned.
+    const settled = () => {
+      const started = toasts.filter((toast) => toast.message === "Compacting session").length
+      return started > 0 && toasts.filter((toast) => toast.message === "Session compacted").length === started
+    }
+    const toastsSettled = () => {
+      if (settled()) return Promise.resolve()
+      const { promise, resolve, reject } = Promise.withResolvers<void>()
+      const timeout = setTimeout(() => reject(new Error(`Compaction toasts did not settle: ${JSON.stringify(toasts)}`)), 10_000)
+      toastWaiter = () => { if (settled()) { clearTimeout(timeout); toastWaiter = undefined; resolve() } }
+      return promise
+    }
+    const watchToasts = async (events: typeof client) => {
+      // Each stream ends when its server is killed; cap reconnects so the
+      // stopped first server does not keep the smoke alive.
+      const stream = await events.event.subscribe({ sseMaxRetryAttempts: 1 })
+      void (async () => {
+        for await (const event of stream.stream) if (event.type === "tui.toast.show") { toasts.push(event.properties); toastWaiter?.() }
+      })().catch(() => {})
+    }
+    await watchToasts(client)
     const created = await client.session.create({ body: { title: "Rolling compaction fixture" } })
     assert.ok(created.data)
     const sessionID = created.data.id
@@ -126,12 +150,20 @@ try {
       if (restartAfter === undefined && summaries > 0 && turn < turns - 1) {
         restartAfter = turn
         summariesAtRestart = summaries
+        await toastsSettled()
         runtime.child.kill()
         await runtime.child.exited
         runtime = await startServer()
         client = runtime.client
+        await watchToasts(client)
       }
     }
+    await toastsSettled()
+    const compactingToasts = toasts.filter((toast) => toast.message === "Compacting session")
+    const compactedToasts = toasts.filter((toast) => toast.message === "Session compacted")
+    assert.ok(compactingToasts.length > 0, "summary compaction must announce its start")
+    assert.equal(compactedToasts.length, compactingToasts.length, "every started compaction must announce completion")
+    assert.ok(toasts.every((toast) => toast.title === "Rolling compaction fixture"), "toasts must carry the session title like the builtin notifier")
     const stored = await client.session.messages({ path: { id: sessionID } })
     assert.equal(stored.data?.filter((message) => message.info.role === "user").length, turns, "original OpenCode user history must remain intact")
     assert.ok(!JSON.stringify(stored.data).includes("kv-guard-user:"), "private provenance must not enter stored history")
@@ -160,7 +192,7 @@ try {
     for (let index = 0; index < main.length; index++) {
       assert.ok(JSON.stringify(main[index]!.messages).includes(`USER_TURN_${index}: retain the current instruction.`), "current instruction must not be summarized away")
     }
-    return { version: "1.19.4", mainRequests: normal, summaryRequests: summaries, prefixSharingHandoffs: handoffs.length, usageTriggeredEarlyCompaction: true, perTurnRequestIDsPreserved: new Set(requestIDs).size, restartAfterTurn: restartAfter, checkpointReusedAcrossProcess: true, requestsWithSummary: compacted.length, requestsReusingSummaryWithoutNewInference: reuses, wireMessageChars: lengths, originalUserTurnsPreserved: turns }
+    return { version: "1.19.4", mainRequests: normal, summaryRequests: summaries, prefixSharingHandoffs: handoffs.length, usageTriggeredEarlyCompaction: true, perTurnRequestIDsPreserved: new Set(requestIDs).size, restartAfterTurn: restartAfter, checkpointReusedAcrossProcess: true, requestsWithSummary: compacted.length, requestsReusingSummaryWithoutNewInference: reuses, wireMessageChars: lengths, originalUserTurnsPreserved: turns, compactionToasts: compactingToasts.length }
   })(), deadline.promise])
   console.log(JSON.stringify(result, null, 2))
 } finally {

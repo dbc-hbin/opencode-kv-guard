@@ -71,6 +71,27 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   const log = async (message: string, extra: Record<string, unknown>) => {
     if (options.diagnostics === true) await client.app.log({ body: { service: "kv-guard", level: "info", message, extra } })
   }
+  // Rolling compaction runs inside the provider fetch, so OpenCode never shows
+  // its own compaction feedback. Mirror it with TUI toasts titled like the
+  // builtin notifier (session title, then the event message).
+  const compactionNotice = (session: string) => {
+    let title: Promise<string | undefined> | undefined
+    let started = false
+    const show = (message: string, variant: "info" | "success") => {
+      title ??= Promise.resolve().then(() => client.session.get({ path: { id: session } })).then((result) => result.data?.title)
+      void title.then((resolved) => client.tui.showToast({ body: { title: resolved, message, variant } })).catch((error) =>
+        Promise.resolve().then(() => client.app.log({ body: { service: "kv-guard", level: "warn", message: "Compaction notification failed", extra: { error: error instanceof Error ? error.message : String(error) } } })).catch(() => {}))
+    }
+    return {
+      summary(run: () => Promise<Response>) {
+        if (!started) { started = true; show("Compacting session", "info") }
+        return run()
+      },
+      finished(report?: Record<string, unknown>) {
+        if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0) show("Session compacted", "success")
+      },
+    }
+  }
   const checkpoint = async <T>(session: string, action: () => T | Promise<T>, completedResponse = false): Promise<T> => {
     const prior = stateTails.get(session) ?? Promise.resolve()
     const pending = prior.then(async () => {
@@ -306,6 +327,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               }
               const output = body.max_completion_tokens ?? body.max_tokens
               if (typeof output !== "number") throw new Error("KV guard: an actual completion token limit is required")
+              const notice = compactionNotice(session)
               const prepared = await compaction.prepare(body, {
                 session, lane, contextWindow: limits.context,
                 inputLimit: "input" in limits && typeof limits.input === "number" && limits.input > 0 ? limits.input : undefined,
@@ -313,9 +335,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
                 allowSummary, currentUser, prefixHandoff: options.prefixHandoff !== false,
                 restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
-                completeSummary: (summary) => send(summary, "summary"),
+                completeSummary: (summary) => notice.summary(() => send(summary, "summary")),
               })
               if ("response" in prepared) return prepared.response
+              notice.finished(prepared.report)
               body = prepared.body
               if (prepared.report) await log("Preflight budget (usage-anchored when available; otherwise estimated)", prepared.report)
             }

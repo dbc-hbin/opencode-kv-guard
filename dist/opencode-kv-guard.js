@@ -2931,6 +2931,27 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
     if (options.diagnostics === true)
       await client.app.log({ body: { service: "kv-guard", level: "info", message, extra } });
   };
+  const compactionNotice = (session) => {
+    let title;
+    let started = false;
+    const show = (message, variant) => {
+      title ??= Promise.resolve().then(() => client.session.get({ path: { id: session } })).then((result) => result.data?.title);
+      title.then((resolved) => client.tui.showToast({ body: { title: resolved, message, variant } })).catch((error) => Promise.resolve().then(() => client.app.log({ body: { service: "kv-guard", level: "warn", message: "Compaction notification failed", extra: { error: error instanceof Error ? error.message : String(error) } } })).catch(() => {}));
+    };
+    return {
+      summary(run) {
+        if (!started) {
+          started = true;
+          show("Compacting session", "info");
+        }
+        return run();
+      },
+      finished(report) {
+        if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0)
+          show("Session compacted", "success");
+      }
+    };
+  };
   const checkpoint = async (session, action, completedResponse = false) => {
     const prior = stateTails.get(session) ?? Promise.resolve();
     const pending = prior.then(async () => {
@@ -3199,6 +3220,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
               const output = body.max_completion_tokens ?? body.max_tokens;
               if (typeof output !== "number")
                 throw new Error("KV guard: an actual completion token limit is required");
+              const notice = compactionNotice(session);
               const prepared = await compaction.prepare(body, {
                 session,
                 lane,
@@ -3211,10 +3233,11 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
                 prefixHandoff: options.prefixHandoff !== false,
                 restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
-                completeSummary: (summary) => send(summary, "summary")
+                completeSummary: (summary) => notice.summary(() => send(summary, "summary"))
               });
               if ("response" in prepared)
                 return prepared.response;
+              notice.finished(prepared.report);
               body = prepared.body;
               if (prepared.report)
                 await log("Preflight budget (usage-anchored when available; otherwise estimated)", prepared.report);
