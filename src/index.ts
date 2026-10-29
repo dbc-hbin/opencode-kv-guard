@@ -5,7 +5,7 @@ import { admittedFetch, endpointGate, type AdmissionGate, type Fetch } from "./t
 import { processEndpointGate } from "./process-gate"
 import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDate, UserTurns } from "./prefix"
 import { compactSystem } from "./compact"
-import { RollingCompaction, type ChatBody } from "./compaction"
+import { RollingCompaction, constrainedOutput, readSummary, summaryRequestBase, type ChatBody, type SummaryResult } from "./compaction"
 import { CheckpointStore, type CheckpointSnapshot } from "./checkpoints"
 import { UsageTracker, observeResponse } from "./usage"
 import { parseGLMOptions, normalizeGLMRequest, createGLMChunkAdapter } from "./glm"
@@ -13,7 +13,7 @@ import { compactSkillCatalog } from "./skills"
 import { compactToolDescriptions } from "./tools"
 import { ToolOutputShrinker } from "./output"
 import { SessionHeads, PrefixGuard } from "./heads"
-import { digest as hash } from "./shared"
+import { digest as hash, record } from "./shared"
 
 const agentHeader = "x-opencode-kv-guard-agent"
 const limitsHeader = "x-opencode-kv-guard-limits"
@@ -21,6 +21,12 @@ const userHeader = "x-opencode-kv-guard-user"
 const systemSuffixHeader = "x-opencode-kv-guard-system-suffix"
 // Internal OpenCode agents that never own a resumable conversation.
 const internalAgents = ["title", "summary", "compaction"]
+// Pinned OpenCode 1.19.4 compaction prompt (core session/compaction.ts
+// buildPrompt): the serialized history this plugin replaces with the cached
+// wire prefix, followed by the native summary instructions it keeps.
+const nativeConversationStart = "Here is the conversation so far:\n\n<conversation>\n"
+const nativeConversationEnd = "\n</conversation>\n\n"
+type Exchange = { target: string; headScope: string; lane: string; userID: string; body: ChatBody; assistant: ChatBody["messages"][number] }
 
 const plugin: Plugin = async ({ client, project, directory, worktree }, options = {}) => {
   const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs"]
@@ -66,6 +72,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   const pendingDeletions = new Map<string, Promise<void>>()
   const deletionFailures: unknown[] = []
   const deleted = new Set<string>()
+  // Last completed main request per session, kept so a manual /compact can
+  // summarize by extending that exact prefix instead of a fresh transcript.
+  const lastExchanges = new Map<string, Exchange>()
+  const manualHandoff = options.compaction !== false && options.prefixHandoff !== false
   const disposed = new AbortController()
   let store: CheckpointStore | undefined
   const log = async (message: string, extra: Record<string, unknown>) => {
@@ -91,6 +101,27 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0) show("Session compacted", "success")
       },
     }
+  }
+  // A manual /compact may reuse the recorded exchange only when nothing was
+  // added since: the compaction marker must follow that exact user turn,
+  // and the recorded response must be its last completed assistant step.
+  const manualExchange = async (session: string, targetID: string, headScope: string, model: string): Promise<Exchange | undefined> => {
+    const exchange = lastExchanges.get(session)
+    if (!exchange || exchange.target !== targetID || exchange.headScope !== headScope || exchange.body.model !== model) return undefined
+    const stored = await client.session.messages({ path: { id: session } })
+    const messages = stored.data ?? []
+    const marker = messages.findLastIndex((message) => message.info.role === "user" && message.parts.some((part) => part.type === "compaction"))
+    if (marker < 0) return undefined
+    const user = messages.slice(0, marker).findLastIndex((message) => message.info.role === "user")
+    if (user < 0 || messages[user]!.info.id !== exchange.userID) return undefined
+    const between = messages.slice(user + 1, marker).map((message) => message.info)
+    if (!between.length) return undefined
+    for (const info of between) {
+      if (info.role !== "assistant" || info.error || !info.finish || info.summary) return undefined
+    }
+    const last = between.at(-1)!
+    if (last.role !== "assistant" || ["tool-calls", "unknown"].includes(last.finish ?? "")) return undefined
+    return exchange
   }
   const checkpoint = async <T>(session: string, action: () => T | Promise<T>, completedResponse = false): Promise<T> => {
     const prior = stateTails.get(session) ?? Promise.resolve()
@@ -274,7 +305,9 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             return observeResponse(response, {
               body: outgoing, lane: requestLane, tracker: usage, request: ticket, signal, label,
               transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
-              onAssistant: session && agent && label === "main" && options.prefixGuard !== false ? (assistant) => {
+              onAssistant: session && agent && label === "main" && (options.prefixGuard !== false || manualHandoff && !internalAgents.includes(agent)) ? (assistant) => {
+                if (manualHandoff && !internalAgents.includes(agent) && expectedUser) lastExchanges.set(session, { target: target.id, headScope, lane, userID: expectedUser, body: outgoing, assistant })
+                if (options.prefixGuard === false) return
                 // Enqueue synchronously before EOF so the next request cannot
                 // restore an older checkpoint over this completed response.
                 void checkpoint(session, () => prefixGuard.record(outgoing, assistant, { session, lane, outcome: "success", finishReason: assistant.tool_calls ? "tool_calls" : "stop", receipt: replayReceipt }), true)
@@ -282,6 +315,85 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               } : undefined,
               onReport: (report) => log("Request usage and lifecycle", { ...report, admissionWaitMs, upstreamHeaderMs: Math.max(0, report.headerMs - admissionWaitMs) }),
             })
+          }
+          // Manual /compact: summarize by extending the last dispatched main
+          // request, so the prefix stays KV-cached, and answer OpenCode's own
+          // compaction request with that summary. Any mismatch keeps the
+          // native request unchanged.
+          const manualCompaction = async (sessionID: string): Promise<Response | undefined> => {
+            // The native request is [compaction system, one user prompt]. Keep
+            // its instructions (template, prior summary, plugin context) and
+            // drop only the serialized history the cached prefix replaces.
+            const prompt = body.messages.at(-1)
+            const text = prompt?.role === "user" && typeof prompt.content === "string" ? prompt.content : undefined
+            const end = text?.startsWith(nativeConversationStart) ? text.indexOf(nativeConversationEnd) : -1
+            if (!text || end < 0) {
+              await log("Manual compaction kept the native request", { reason: "unrecognized compaction prompt" })
+              return undefined
+            }
+            const instructions = text.slice(end + nativeConversationEnd.length)
+            let exchange: Exchange | undefined
+            try { exchange = await manualExchange(sessionID, target.id, headScope, body.model) } catch (error) {
+              await log("Manual compaction kept the native request", { reason: "history unavailable", error: error instanceof Error ? error.message : String(error) })
+              return undefined
+            }
+            if (!exchange) {
+              await log("Manual compaction kept the native request", { reason: "no matching cached exchange" })
+              return undefined
+            }
+            const prior = exchange.body
+            if (constrainedOutput(prior)) {
+              await log("Manual compaction kept the native request", { reason: "constrained output" })
+              return undefined
+            }
+            const limits: unknown = JSON.parse(encodedLimits!)
+            const output = typeof body.max_completion_tokens === "number" ? body.max_completion_tokens : typeof body.max_tokens === "number" ? body.max_tokens : undefined
+            if (!record(limits) || typeof limits.context !== "number" || output === undefined) return undefined
+            const handoff: ChatBody = {
+              ...summaryRequestBase(prior),
+              ...(prior.tools !== undefined ? { tools: prior.tools, tool_choice: "auto" } : {}),
+              messages: [...prior.messages, exchange.assistant, {
+                role: "user",
+                content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.\n\n${instructions}`,
+              }],
+              stream: false,
+              ...(prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }),
+            }
+            const fallback = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / (compaction.options ? compaction.options.bytesPerToken : 4))
+            const size = options.usageAccounting === false ? fallback(handoff) : usage.estimate(handoff, exchange.lane, fallback)
+            const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - (compaction.options ? compaction.options.marginTokens : 0)
+            if (size > budget) {
+              await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: size, budget })
+              return undefined
+            }
+            const notice = compactionNotice(sessionID)
+            const response = await notice.summary(() => send(handoff, "summary"))
+            if (!response.ok) return response
+            let summary: SummaryResult
+            try { summary = await readSummary(response, signal) } catch (error) {
+              await log("Manual compaction kept the native request", { reason: "summary rejected", error: error instanceof Error ? error.message : String(error) })
+              return undefined
+            }
+            notice.finished({ summaryRequests: 1 })
+            lastExchanges.delete(sessionID)
+            await log("Manual compaction via prefix handoff", { estimated: size, budget, cachedMessages: prior.messages.length + 1 })
+            const id = typeof summary.completion.id === "string" ? summary.completion.id : `kv-guard-${hash(summary.content).slice(0, 16)}`
+            const created = Math.floor(Date.now() / 1000)
+            const usageField = summary.completion.usage !== undefined ? { usage: summary.completion.usage } : {}
+            if (body.stream !== true) return Response.json({ id, object: "chat.completion", created, model: body.model, choices: [{ index: 0, message: { role: "assistant", content: summary.content }, finish_reason: "stop" }], ...usageField })
+            // OpenCode streams compaction like any turn; replay the validated
+            // summary as one SSE completion so the SDK consumes it unchanged.
+            const frames = [
+              { choices: [{ index: 0, delta: { role: "assistant", content: summary.content }, finish_reason: null }] },
+              { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+              ...(summary.completion.usage !== undefined ? [{ choices: [], ...usageField }] : []),
+            ]
+            const events = frames.map((frame) => `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: body.model, ...frame })}\n\n`).join("")
+            return new Response(events + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+          }
+          if (session && agent === "compaction" && manualHandoff && encodedLimits) {
+            const handled = await manualCompaction(session)
+            if (handled) return handled
           }
           const prepare = async () => {
             const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined
@@ -413,6 +525,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       deleted.add(session)
       outputSessions.delete(session)
       outputCalls.delete(session)
+      lastExchanges.delete(session)
       compaction.delete(session)
       // OpenCode fires event hooks without awaiting them. Own this work until
       // the tombstone commits, including when plugin disposal follows deletion.
@@ -455,6 +568,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       parentHeadLanes.clear()
       outputSessions.clear()
       outputCalls.clear()
+      lastExchanges.clear()
       if (deletionFailures.length) throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion")
     },
   }

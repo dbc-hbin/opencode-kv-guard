@@ -921,6 +921,89 @@ function abortable(pending, signal) {
   pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
   return promise;
 }
+function summaryRequestBase(body) {
+  const base = { ...body };
+  for (const key of [
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "functions",
+    "function_call",
+    "response_format",
+    "stream_options",
+    "stop",
+    "stop_token_ids",
+    "include_stop_str_in_output",
+    "ignore_eos",
+    "n",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "prediction",
+    "modalities",
+    "audio",
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "min_tokens",
+    "truncate_prompt_tokens",
+    "allowed_token_ids",
+    "bad_words",
+    "structured_outputs",
+    "guided_json",
+    "guided_regex",
+    "guided_choice",
+    "guided_grammar",
+    "guided_decoding_backend",
+    "guided_whitespace_pattern"
+  ])
+    delete base[key];
+  return base;
+}
+function constrainedOutput(body) {
+  return [
+    "functions",
+    "function_call",
+    "structured_outputs",
+    "guided_json",
+    "guided_regex",
+    "guided_choice",
+    "guided_grammar",
+    "guided_decoding_backend",
+    "guided_whitespace_pattern",
+    "modalities",
+    "audio"
+  ].some((key) => body[key] !== undefined) || body.tool_choice !== undefined && body.tool_choice !== "auto" || body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type"));
+}
+async function readSummary(response, signal) {
+  let value;
+  const reader = response.body?.getReader();
+  try {
+    if (!reader)
+      throw new Error("Empty summary response body");
+    const decoder = new TextDecoder;
+    let text = "";
+    while (true) {
+      const chunk = await abortable(reader.read(), signal);
+      if (chunk.done)
+        break;
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    text += decoder.decode();
+    value = JSON.parse(text);
+  } catch (error) {
+    await reader?.cancel(error).catch(() => {});
+    throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error });
+  } finally {
+    reader?.releaseLock();
+  }
+  const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined;
+  const message = record(choice) && record(choice.message) ? choice.message : undefined;
+  if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0) || message.function_call !== undefined) {
+    throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed");
+  }
+  return { content: message.content, completion: value };
+}
 
 class RollingCompaction {
   options;
@@ -1182,55 +1265,8 @@ class RollingCompaction {
     }
     let calls = 0;
     const summaryBudget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - summaryCap) - config.marginTokens);
-    const summaryBase = { ...body };
-    for (const key of [
-      "tools",
-      "tool_choice",
-      "parallel_tool_calls",
-      "functions",
-      "function_call",
-      "response_format",
-      "stream_options",
-      "stop",
-      "stop_token_ids",
-      "include_stop_str_in_output",
-      "ignore_eos",
-      "n",
-      "logit_bias",
-      "logprobs",
-      "top_logprobs",
-      "prediction",
-      "modalities",
-      "audio",
-      "max_tokens",
-      "max_completion_tokens",
-      "max_output_tokens",
-      "min_tokens",
-      "truncate_prompt_tokens",
-      "allowed_token_ids",
-      "bad_words",
-      "structured_outputs",
-      "guided_json",
-      "guided_regex",
-      "guided_choice",
-      "guided_grammar",
-      "guided_decoding_backend",
-      "guided_whitespace_pattern"
-    ])
-      delete summaryBase[key];
-    const constrained = [
-      "functions",
-      "function_call",
-      "structured_outputs",
-      "guided_json",
-      "guided_regex",
-      "guided_choice",
-      "guided_grammar",
-      "guided_decoding_backend",
-      "guided_whitespace_pattern",
-      "modalities",
-      "audio"
-    ].some((key) => body[key] !== undefined) || body.tool_choice !== undefined && body.tool_choice !== "auto" || body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type"));
+    const summaryBase = summaryRequestBase(body);
+    const constrained = constrainedOutput(body);
     for (const plan of [...touched.values()].sort((a, b) => a.segment.archived[0] - b.segment.archived[0])) {
       plan.additions.sort((a, b) => a - b);
       const transcript = plan.additions.map((index) => JSON.stringify({ source_index: index, message: body.messages[index] })).join(`
@@ -1294,35 +1330,15 @@ Produce the historical checkpoint using only the messages at these zero-based po
         }
         if (!response.ok)
           return { response };
-        let value;
-        const reader = response.body?.getReader();
+        let content;
         try {
-          if (!reader)
-            throw new Error("Empty summary response body");
-          const decoder = new TextDecoder;
-          let text = "";
-          while (true) {
-            const chunk = await abortable(reader.read(), context.signal);
-            if (chunk.done)
-              break;
-            text += decoder.decode(chunk.value, { stream: true });
-          }
-          text += decoder.decode();
-          value = JSON.parse(text);
+          content = (await readSummary(response, context.signal)).content;
         } catch (error) {
-          await reader?.cancel(error).catch(() => {});
           active();
-          throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error });
-        } finally {
-          reader?.releaseLock();
+          throw error;
         }
         active();
-        const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined;
-        const message = record(choice) && record(choice.message) ? choice.message : undefined;
-        if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0) || message.function_call !== undefined) {
-          throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed");
-        }
-        summary = message.content;
+        summary = content;
         if (estimate(summary) > summaryCap)
           throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`);
         offset += low;
@@ -2893,6 +2909,14 @@ var limitsHeader = "x-opencode-kv-guard-limits";
 var userHeader = "x-opencode-kv-guard-user";
 var systemSuffixHeader = "x-opencode-kv-guard-system-suffix";
 var internalAgents = ["title", "summary", "compaction"];
+var nativeConversationStart = `Here is the conversation so far:
+
+<conversation>
+`;
+var nativeConversationEnd = `
+</conversation>
+
+`;
 var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs"];
   for (const key of Object.keys(options)) {
@@ -2938,6 +2962,8 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   const pendingDeletions = new Map;
   const deletionFailures = [];
   const deleted = new Set;
+  const lastExchanges = new Map;
+  const manualHandoff = options.compaction !== false && options.prefixHandoff !== false;
   const disposed = new AbortController;
   let store;
   const log = async (message, extra) => {
@@ -2964,6 +2990,30 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
           show("Session compacted", "success");
       }
     };
+  };
+  const manualExchange = async (session, targetID, headScope, model) => {
+    const exchange = lastExchanges.get(session);
+    if (!exchange || exchange.target !== targetID || exchange.headScope !== headScope || exchange.body.model !== model)
+      return;
+    const stored = await client.session.messages({ path: { id: session } });
+    const messages = stored.data ?? [];
+    const marker = messages.findLastIndex((message) => message.info.role === "user" && message.parts.some((part) => part.type === "compaction"));
+    if (marker < 0)
+      return;
+    const user = messages.slice(0, marker).findLastIndex((message) => message.info.role === "user");
+    if (user < 0 || messages[user].info.id !== exchange.userID)
+      return;
+    const between = messages.slice(user + 1, marker).map((message) => message.info);
+    if (!between.length)
+      return;
+    for (const info of between) {
+      if (info.role !== "assistant" || info.error || !info.finish || info.summary)
+        return;
+    }
+    const last = between.at(-1);
+    if (last.role !== "assistant" || ["tool-calls", "unknown"].includes(last.finish ?? ""))
+      return;
+    return exchange;
   };
   const checkpoint = async (session, action, completedResponse = false) => {
     const prior = stateTails.get(session) ?? Promise.resolve();
@@ -3179,12 +3229,100 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
               signal,
               label,
               transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
-              onAssistant: session && agent && label === "main" && options.prefixGuard !== false ? (assistant) => {
+              onAssistant: session && agent && label === "main" && (options.prefixGuard !== false || manualHandoff && !internalAgents.includes(agent)) ? (assistant) => {
+                if (manualHandoff && !internalAgents.includes(agent) && expectedUser)
+                  lastExchanges.set(session, { target: target.id, headScope, lane, userID: expectedUser, body: outgoing, assistant });
+                if (options.prefixGuard === false)
+                  return;
                 checkpoint(session, () => prefixGuard.record(outgoing, assistant, { session, lane, outcome: "success", finishReason: assistant.tool_calls ? "tool_calls" : "stop", receipt: replayReceipt }), true).catch(() => log("Response replay checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}));
               } : undefined,
               onReport: (report) => log("Request usage and lifecycle", { ...report, admissionWaitMs, upstreamHeaderMs: Math.max(0, report.headerMs - admissionWaitMs) })
             });
           };
+          const manualCompaction = async (sessionID) => {
+            const prompt = body.messages.at(-1);
+            const text = prompt?.role === "user" && typeof prompt.content === "string" ? prompt.content : undefined;
+            const end = text?.startsWith(nativeConversationStart) ? text.indexOf(nativeConversationEnd) : -1;
+            if (!text || end < 0) {
+              await log("Manual compaction kept the native request", { reason: "unrecognized compaction prompt" });
+              return;
+            }
+            const instructions = text.slice(end + nativeConversationEnd.length);
+            let exchange;
+            try {
+              exchange = await manualExchange(sessionID, target.id, headScope, body.model);
+            } catch (error) {
+              await log("Manual compaction kept the native request", { reason: "history unavailable", error: error instanceof Error ? error.message : String(error) });
+              return;
+            }
+            if (!exchange) {
+              await log("Manual compaction kept the native request", { reason: "no matching cached exchange" });
+              return;
+            }
+            const prior = exchange.body;
+            if (constrainedOutput(prior)) {
+              await log("Manual compaction kept the native request", { reason: "constrained output" });
+              return;
+            }
+            const limits = JSON.parse(encodedLimits);
+            const output = typeof body.max_completion_tokens === "number" ? body.max_completion_tokens : typeof body.max_tokens === "number" ? body.max_tokens : undefined;
+            if (!record(limits) || typeof limits.context !== "number" || output === undefined)
+              return;
+            const handoff = {
+              ...summaryRequestBase(prior),
+              ...prior.tools !== undefined ? { tools: prior.tools, tool_choice: "auto" } : {},
+              messages: [...prior.messages, exchange.assistant, {
+                role: "user",
+                content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.
+
+${instructions}`
+              }],
+              stream: false,
+              ...prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }
+            };
+            const fallback = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / (compaction.options ? compaction.options.bytesPerToken : 4));
+            const size = options.usageAccounting === false ? fallback(handoff) : usage.estimate(handoff, exchange.lane, fallback);
+            const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - (compaction.options ? compaction.options.marginTokens : 0);
+            if (size > budget) {
+              await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: size, budget });
+              return;
+            }
+            const notice = compactionNotice(sessionID);
+            const response = await notice.summary(() => send(handoff, "summary"));
+            if (!response.ok)
+              return response;
+            let summary;
+            try {
+              summary = await readSummary(response, signal);
+            } catch (error) {
+              await log("Manual compaction kept the native request", { reason: "summary rejected", error: error instanceof Error ? error.message : String(error) });
+              return;
+            }
+            notice.finished({ summaryRequests: 1 });
+            lastExchanges.delete(sessionID);
+            await log("Manual compaction via prefix handoff", { estimated: size, budget, cachedMessages: prior.messages.length + 1 });
+            const id = typeof summary.completion.id === "string" ? summary.completion.id : `kv-guard-${digest(summary.content).slice(0, 16)}`;
+            const created = Math.floor(Date.now() / 1000);
+            const usageField = summary.completion.usage !== undefined ? { usage: summary.completion.usage } : {};
+            if (body.stream !== true)
+              return Response.json({ id, object: "chat.completion", created, model: body.model, choices: [{ index: 0, message: { role: "assistant", content: summary.content }, finish_reason: "stop" }], ...usageField });
+            const frames = [
+              { choices: [{ index: 0, delta: { role: "assistant", content: summary.content }, finish_reason: null }] },
+              { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+              ...summary.completion.usage !== undefined ? [{ choices: [], ...usageField }] : []
+            ];
+            const events = frames.map((frame) => `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: body.model, ...frame })}
+
+`).join("");
+            return new Response(events + `data: [DONE]
+
+`, { headers: { "content-type": "text/event-stream" } });
+          };
+          if (session && agent === "compaction" && manualHandoff && encodedLimits) {
+            const handled = await manualCompaction(session);
+            if (handled)
+              return handled;
+          }
           const prepare = async () => {
             const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
             const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined };
@@ -3340,6 +3478,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
       deleted.add(session);
       outputSessions.delete(session);
       outputCalls.delete(session);
+      lastExchanges.delete(session);
       compaction.delete(session);
       const deletion = (async () => {
         await stateTails.get(session);
@@ -3383,6 +3522,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
       parentHeadLanes.clear();
       outputSessions.clear();
       outputCalls.clear();
+      lastExchanges.clear();
       if (deletionFailures.length)
         throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion");
     }

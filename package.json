@@ -10,7 +10,8 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "smoke": "bun run scripts/smoke.ts",
-    "smoke:compaction": "bun run scripts/compaction-smoke.ts"
+    "smoke:compaction": "bun run scripts/compaction-smoke.ts",
+    "smoke:manual-compaction": "bun run scripts/manual-compaction-smoke.ts"
   },
   "devDependencies": {
     "@ai-sdk/openai-compatible": "2.0.41",

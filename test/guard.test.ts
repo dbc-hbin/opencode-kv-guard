@@ -399,3 +399,59 @@ test("real compatible SDK passthrough keys are normalized without losing tenant 
   expect(captured[3]!.body.max_tokens).toBe(32)
   expect(captured[3]!.body.maxTokens).toBeUndefined()
 })
+
+test("manual compaction reuses the cached main prefix only when history still matches it", async () => {
+  const sent: Record<string, unknown>[] = []
+  const fetch: Fetch = async (input, init) => {
+    const body = await new Request(input, init).json() as Record<string, unknown>
+    sent.push(body)
+    if (body.stream === false) return Response.json({ id: "handoff", object: "chat.completion", created: 1, model: "fixture", choices: [{ index: 0, message: { role: "assistant", content: "HANDOFF" }, finish_reason: "stop" }], usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55 } })
+    return new Response(`data: ${JSON.stringify({ id: "main", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  let stored: unknown[] = []
+  const client = { session: { messages: async () => ({ data: stored }) }, app: { log: async () => {} } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://manual.test/v1", fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"] })
+  await hooks.config!(config)
+  const headers = (agent: string, user: string) => ({ "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": agent, "x-opencode-kv-guard-limits": JSON.stringify({ context: 100_000, output: 1000 }), "x-opencode-kv-guard-user": user })
+  const post = (agent: string, user: string, body: Record<string, unknown>) => config.provider.proxy.options.fetch("http://manual.test/v1/chat/completions", { method: "POST", headers: headers(agent, user), body: JSON.stringify(body) })
+  // The real messages.transform hook adds the current-user provenance marker.
+  const turn: Messages = [user("msg_user", "Task")]
+  await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+  const marked = turn[0]!.parts[0]!
+  if (marked.type !== "text") throw new Error("Expected text fixture")
+  const main = { model: "fixture", stream: true, max_tokens: 1000, messages: [{ role: "system", content: "Policy" }, { role: "user", content: marked.text }], tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }] }
+  await (await post("build", "msg_user", main)).text()
+  const native = { model: "fixture", stream: true, max_tokens: 1000, messages: [{ role: "system", content: "Summarizer" }, { role: "user", content: "Here is the conversation so far:\n\n<conversation>\n[User]: Task\n</conversation>\n\nCreate a new anchored summary." }] }
+  const history = (assistant: Record<string, unknown>) => [
+    { info: { role: "user", id: "msg_user" }, parts: [] },
+    { info: { role: "assistant", id: "msg_answer", finish: "stop", ...assistant }, parts: [] },
+    { info: { role: "user", id: "msg_compact" }, parts: [{ type: "compaction" }] },
+  ]
+
+  // A failed last step is not the recorded exchange: send the native request.
+  stored = history({ error: { name: "APIError" } })
+  await (await post("compaction", "msg_compact", native)).text()
+  expect(sent).toHaveLength(2)
+  expect(sent[1]!.messages).toEqual(native.messages)
+
+  stored = history({})
+  const answered = await (await post("compaction", "msg_compact", native)).text()
+  expect(sent).toHaveLength(3)
+  const handoff = sent[2]!
+  expect(handoff.stream).toBe(false)
+  expect((handoff.messages as unknown[]).slice(0, 2)).toEqual(sent[0]!.messages as unknown[])
+  expect(handoff.tools).toEqual(sent[0]!.tools)
+  expect(handoff.tool_choice).toBe("auto")
+  const instruction = String((handoff.messages as { content: unknown }[]).at(-1)!.content)
+  expect(instruction).toContain("Create a new anchored summary.")
+  expect(instruction).not.toContain("[User]: Task")
+  expect(answered).toContain('"content":"HANDOFF"')
+  expect(answered).toContain("data: [DONE]")
+
+  // The exchange is consumed: a repeated /compact falls back to native.
+  await (await post("compaction", "msg_compact", native)).text()
+  expect(sent).toHaveLength(4)
+  expect(sent[3]!.messages).toEqual(native.messages)
+  await hooks.dispose!()
+})

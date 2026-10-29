@@ -224,6 +224,61 @@ function abortable<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
   return promise
 }
 
+// Retain tenant/cache isolation and provider-specific template settings, but
+// not the main response's tools, schema, stopping or generation caps.
+export function summaryRequestBase(body: ChatBody): ChatBody {
+  const base = { ...body }
+  for (const key of [
+    "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call", "response_format", "stream_options",
+    "stop", "stop_token_ids", "include_stop_str_in_output", "ignore_eos", "n", "logit_bias", "logprobs", "top_logprobs",
+    "prediction", "modalities", "audio", "max_tokens", "max_completion_tokens", "max_output_tokens", "min_tokens",
+    "truncate_prompt_tokens", "allowed_token_ids", "bad_words", "structured_outputs", "guided_json", "guided_regex",
+    "guided_choice", "guided_grammar", "guided_decoding_backend", "guided_whitespace_pattern",
+  ]) delete base[key]
+  return base
+}
+
+// Output constraints a text summary cannot honor while keeping the prefix.
+export function constrainedOutput(body: ChatBody) {
+  return [
+    "functions", "function_call", "structured_outputs", "guided_json", "guided_regex", "guided_choice",
+    "guided_grammar", "guided_decoding_backend", "guided_whitespace_pattern", "modalities", "audio",
+  ].some((key) => body[key] !== undefined)
+    || (body.tool_choice !== undefined && body.tool_choice !== "auto")
+    || (body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type")))
+}
+
+// Read one non-streaming summary completion; returns its validated text and the
+// parsed completion so callers can forward usage.
+export type SummaryResult = { content: string; completion: Record<string, unknown> }
+export async function readSummary(response: Response, signal?: AbortSignal): Promise<SummaryResult> {
+  let value: unknown
+  const reader = response.body?.getReader()
+  try {
+    if (!reader) throw new Error("Empty summary response body")
+    const decoder = new TextDecoder()
+    let text = ""
+    while (true) {
+      const chunk = await abortable(reader.read(), signal)
+      if (chunk.done) break
+      text += decoder.decode(chunk.value, { stream: true })
+    }
+    text += decoder.decode()
+    value = JSON.parse(text)
+  } catch (error) {
+    await reader?.cancel(error).catch(() => {})
+    throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error })
+  } finally {
+    reader?.releaseLock()
+  }
+  const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined
+  const message = record(choice) && record(choice.message) ? choice.message : undefined
+  if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)) || message.function_call !== undefined) {
+    throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed")
+  }
+  return { content: message.content, completion: value as Record<string, unknown> }
+}
+
 export class RollingCompaction {
   readonly options: Readonly<Options> | false
   private readonly lanes = new Map<string, Lane>()
@@ -473,22 +528,8 @@ export class RollingCompaction {
 
     let calls = 0
     const summaryBudget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - summaryCap) - config.marginTokens)
-    // Retain tenant/cache isolation and provider-specific template settings,
-    // but not the main response's tools, schema, stopping or generation caps.
-    const summaryBase = { ...body }
-    for (const key of [
-      "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call", "response_format", "stream_options",
-      "stop", "stop_token_ids", "include_stop_str_in_output", "ignore_eos", "n", "logit_bias", "logprobs", "top_logprobs",
-      "prediction", "modalities", "audio", "max_tokens", "max_completion_tokens", "max_output_tokens", "min_tokens",
-      "truncate_prompt_tokens", "allowed_token_ids", "bad_words", "structured_outputs", "guided_json", "guided_regex",
-      "guided_choice", "guided_grammar", "guided_decoding_backend", "guided_whitespace_pattern",
-    ]) delete summaryBase[key]
-    const constrained = [
-      "functions", "function_call", "structured_outputs", "guided_json", "guided_regex", "guided_choice",
-      "guided_grammar", "guided_decoding_backend", "guided_whitespace_pattern", "modalities", "audio",
-    ].some((key) => body[key] !== undefined)
-      || (body.tool_choice !== undefined && body.tool_choice !== "auto")
-      || (body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type")))
+    const summaryBase = summaryRequestBase(body)
+    const constrained = constrainedOutput(body)
     for (const plan of [...touched.values()].sort((a, b) => a.segment.archived[0]! - b.segment.archived[0]!)) {
       plan.additions.sort((a, b) => a - b)
       const transcript = plan.additions.map((index) => JSON.stringify({ source_index: index, message: body.messages[index] })).join("\n")
@@ -547,33 +588,15 @@ export class RollingCompaction {
           throw error
         }
         if (!response.ok) return { response }
-        let value: unknown
-        const reader = response.body?.getReader()
+        let content: string
         try {
-          if (!reader) throw new Error("Empty summary response body")
-          const decoder = new TextDecoder()
-          let text = ""
-          while (true) {
-            const chunk = await abortable(reader.read(), context.signal)
-            if (chunk.done) break
-            text += decoder.decode(chunk.value, { stream: true })
-          }
-          text += decoder.decode()
-          value = JSON.parse(text)
+          content = (await readSummary(response, context.signal)).content
         } catch (error) {
-          await reader?.cancel(error).catch(() => {})
           active()
-          throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error })
-        } finally {
-          reader?.releaseLock()
+          throw error
         }
         active()
-        const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined
-        const message = record(choice) && record(choice.message) ? choice.message : undefined
-        if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)) || message.function_call !== undefined) {
-          throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed")
-        }
-        summary = message.content
+        summary = content
         if (estimate(summary) > summaryCap) throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`)
         offset += low
         calls++
