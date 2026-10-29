@@ -38,6 +38,8 @@ function edge(text: string, maxBytes: number, tail = false): string {
 // These limits include the retrieval hint, not just the visible source excerpt.
 function preview(text: string, path: string, limits: Options): string | undefined {
   const marker = `[Output shortened; full output: ${JSON.stringify(path)}]`
+  const complete = `${text}\n${marker}`
+  if (Buffer.byteLength(complete) <= limits.maxBytes && complete.split("\n").length <= limits.maxLines) return complete
   const available = limits.maxBytes - Buffer.byteLength(marker) - 2
   if (available < 0 || limits.maxLines < 3) return
   const lines = text.split("\n")
@@ -103,10 +105,17 @@ export class ToolOutputShrinker {
       // file is unavailable, keep the complete existing result untouched.
       if (native && !await this.nativeArtifact(metadata.outputPath)) return result
       const path = native ? metadata.outputPath as string : join(this.directory, `tool_kvguard_${randomBytes(24).toString("hex")}`)
-      const output = clipped ? preview(text, path, this.limits) : text
+      // OpenCode appends shell status after saving the raw command output.
+      // Match only that final block: command output can contain a literal one.
+      const annotation = native && tool === "bash" ? text.match(/\n\n<shell_metadata>\n(?:(?!<\/?shell_metadata>)[\s\S])*\n<\/shell_metadata>$/)?.[0] ?? "" : ""
+      const excerpt = annotation ? text.slice(0, -annotation.length) : text
+      const output = preview(excerpt, path, {
+        maxBytes: this.limits.maxBytes - Buffer.byteLength(annotation),
+        maxLines: this.limits.maxLines - (annotation.match(/\n/g)?.length ?? 0),
+      })
       if (output === undefined) return result
       if (!native) await this.save(path, result.output)
-      return { ...result, output, metadata: { ...metadata, truncated: native || clipped, outputPath: path, kvGuardOutput: 1 } }
+      return { ...result, output: output + annotation, metadata: { ...metadata, truncated: native || clipped, outputPath: path, kvGuardOutput: 1 } }
     } catch {
       // A hook failure must not turn a successful tool call into a lost result.
       return result

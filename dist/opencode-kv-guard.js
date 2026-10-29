@@ -568,6 +568,8 @@ class Environments {
     }));
     const current = match[2].replace(/\n  Today's date: [^\n]+/, "");
     if (checkpoints.at(-1)?.environment !== current) {
+      if (checkpoints.at(-1)?.position === messages.length - 1)
+        checkpoints.pop();
       checkpoints.push({ anchor: sourceAnchors.at(-1), position: messages.length - 1, environment: current });
     }
     if (!options.reconstruct)
@@ -1181,6 +1183,8 @@ class RollingCompaction {
     entry.promise = (async () => {
       try {
         const result = await this.compact(body, { ...context, signal, force: true, speculate: false }, scratch, active);
+        if ("response" in result)
+          await result.response.body?.cancel().catch(() => {});
         active();
         if ("body" in result && result.report?.compacted && scratch.state && JSON.stringify(lane.state ?? null) === base)
           entry.staged = scratch.state;
@@ -1268,8 +1272,8 @@ class RollingCompaction {
       if (speculation.staged && speculation.base === JSON.stringify(lane.state ?? null)) {
         const committed = lane.state;
         lane.state = speculation.staged;
-        if (this.retained(body, context).state) {
-          const result = await this.compact(body, context, lane, active, true);
+        if (this.retained(source, context).state) {
+          const result = await this.compact(source, context, lane, active, true);
           if ("body" in result)
             return { body: result.body, report: { ...result.report, compacted: true, speculative: true } };
           return result;
@@ -1333,6 +1337,7 @@ class RollingCompaction {
     const candidates = [...eligible.filter((group) => group.end <= recent), ...eligible.filter((group) => group.end > recent)];
     const derivedCap = Math.min(context.outputLimit, Math.max(1, trigger - target));
     const summaryCap = Math.min(context.outputLimit, config.summaryOutputTokens ?? derivedCap);
+    const summaryReserve = Math.ceil(summaryCap * overflowScale);
     const touched = new Map;
     let plannedSize = reducedSize;
     for (const group of candidates) {
@@ -1350,7 +1355,7 @@ class RollingCompaction {
             additions.push(index);
           const segment = { summary: "", archived: [...previous?.archived ?? [], ...additions].sort((a, b) => a - b) };
           const trial = [...segments.filter((entry) => entry !== previous), segment].sort((a, b) => a.archived[0] - b.archived[0]);
-          const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryCap;
+          const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryReserve;
           if (size >= plannedSize)
             continue;
           plan = { segment, previous, additions };
@@ -1373,7 +1378,7 @@ class RollingCompaction {
           archived.add(index);
         }
         plan.segment.archived.sort((a, b) => a - b);
-        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryCap;
+        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryReserve;
       }
       if (plannedSize <= target)
         break;
@@ -1381,7 +1386,7 @@ class RollingCompaction {
     const mandatorySize = estimate(rewritten(body, segments));
     if (!touched.size || plannedSize > target) {
       const opaque = units.some((group) => !group.plain && !instruction(body.messages[group.start]));
-      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""} require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryCap}. Reduce the mandatory input or supply larger actual model limits`);
+      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""} require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}. Reduce the mandatory input or supply larger actual model limits`);
     }
     let calls = 0;
     const summaryBudget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - summaryCap) - config.marginTokens);
@@ -1858,7 +1863,7 @@ class PrefixGuard {
         records = [];
       else if (report.sharedMessages < prior.previous.messages.length)
         records = records.filter((entry) => entry.request.length < report.sharedMessages);
-      records = records.filter((entry) => bound(entry.request, fields, anchors) && (!current.messages[entry.request.length] || current.messages[entry.request.length].hash === hash(entry.assistant)));
+      records = records.filter((entry) => bound(entry.request, fields, anchors) && current.messages[entry.request.length]?.hash === hash(entry.assistant));
     }
     if (context.observe !== false)
       this.lanes.set(id, { session: context.session, state: { lane: context.lane, receipt: report.receipt, previous: current, records } });
@@ -2388,7 +2393,19 @@ function observeResponse(response, options) {
     };
     if (outcome === "complete" && replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
       const ordered = [...calls].sort(([a], [b]) => a - b);
-      if (ordered.every(([index, call], offset) => index === offset && call.id && call.function.name)) {
+      if (ordered.every(([index, call], offset) => {
+        if (index !== offset || !call.id || !call.function.name)
+          return false;
+        try {
+          const input = JSON.parse(call.function.arguments);
+          if (!record(input))
+            return false;
+          call.function.arguments = JSON.stringify(input);
+          return true;
+        } catch {
+          return false;
+        }
+      })) {
         if (ordered.length)
           assistant.tool_calls = ordered.map(([, call]) => call);
         options.onAssistant?.(assistant);
@@ -2946,6 +2963,11 @@ function edge(text, maxBytes, tail = false) {
 }
 function preview(text, path, limits) {
   const marker = `[Output shortened; full output: ${JSON.stringify(path)}]`;
+  const complete = `${text}
+${marker}`;
+  if (Buffer.byteLength(complete) <= limits.maxBytes && complete.split(`
+`).length <= limits.maxLines)
+    return complete;
   const available = limits.maxBytes - Buffer.byteLength(marker) - 2;
   if (available < 0 || limits.maxLines < 3)
     return;
@@ -3019,12 +3041,17 @@ class ToolOutputShrinker {
       if (native && !await this.nativeArtifact(metadata.outputPath))
         return result;
       const path = native ? metadata.outputPath : join3(this.directory, `tool_kvguard_${randomBytes(24).toString("hex")}`);
-      const output = clipped ? preview(text, path, this.limits) : text;
+      const annotation = native && tool === "bash" ? text.match(/\n\n<shell_metadata>\n(?:(?!<\/?shell_metadata>)[\s\S])*\n<\/shell_metadata>$/)?.[0] ?? "" : "";
+      const excerpt = annotation ? text.slice(0, -annotation.length) : text;
+      const output = preview(excerpt, path, {
+        maxBytes: this.limits.maxBytes - Buffer.byteLength(annotation),
+        maxLines: this.limits.maxLines - (annotation.match(/\n/g)?.length ?? 0)
+      });
       if (output === undefined)
         return result;
       if (!native)
         await this.save(path, result.output);
-      return { ...result, output, metadata: { ...metadata, truncated: native || clipped, outputPath: path, kvGuardOutput: 1 } };
+      return { ...result, output: output + annotation, metadata: { ...metadata, truncated: native || clipped, outputPath: path, kvGuardOutput: 1 } };
     } catch {
       return result;
     }
@@ -3091,6 +3118,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   const deletionFailures = [];
   const deleted = new Set;
   const lastExchanges = new Map;
+  const nativeCompactions = new Set;
   const toolChoiceNoneRejected = new Set;
   const manualHandoff = options.compaction !== false && options.prefixHandoff !== false;
   const disposed = new AbortController;
@@ -3134,7 +3162,7 @@ The previous response stopped at the output token limit before finishing. Contin
       const messages = (await client.session.messages({ path: { id: session } })).data ?? [];
       const last = messages.at(-1)?.info;
       const prior = truncatedHandled.get(session);
-      if (last?.role !== "assistant" || last.finish !== "length" || last.error || last.summary || !activeProviders.has(last.providerID) || internalAgents.includes(last.mode)) {
+      if (last?.role !== "assistant" || last.finish !== "length" || !last.time.completed || last.error || last.summary || !activeProviders.has(last.providerID) || internalAgents.includes(last.mode)) {
         truncatedHandled.delete(session);
         return;
       }
@@ -3213,16 +3241,22 @@ The previous response stopped at the output token limit before finishing. Contin
           await log("Checkpoint cache miss", { reason: loaded.reason });
       }
       const result = await action();
-      if (!completedResponse)
-        disposed.signal.throwIfAborted();
-      if (deleted.has(session))
-        throw new Error("KV guard: session was deleted during preparation");
-      if (store && loaded) {
-        const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) };
-        if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty))
-          await store.save(session, snapshot, loaded.revision);
+      try {
+        if (!completedResponse)
+          disposed.signal.throwIfAborted();
+        if (deleted.has(session))
+          throw new Error("KV guard: session was deleted during preparation");
+        if (store && loaded) {
+          const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) };
+          if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty))
+            await store.save(session, snapshot, loaded.revision);
+        }
+        return result;
+      } catch (error) {
+        if (result instanceof Response)
+          await result.body?.cancel().catch(() => {});
+        throw error;
       }
-      return result;
     });
     const tail = pending.then(() => {}, () => {});
     stateTails.set(session, tail);
@@ -3256,6 +3290,9 @@ The previous response stopped at the output token limit before finishing. Contin
         const custom = provider.options?.fetch;
         if (custom !== undefined && typeof custom !== "function")
           throw new Error(`KV guard: ${id} has a non-function fetch`);
+        const headerTimeout = provider.options?.headerTimeout === false ? undefined : provider.options?.headerTimeout ?? 300000;
+        const requestTimeout = provider.options?.timeout === false || provider.options?.timeout == null ? undefined : provider.options.timeout;
+        const summaryTimeouts = { header: typeof headerTimeout === "number" ? headerTimeout : undefined, request: typeof requestTimeout === "number" ? requestTimeout : undefined };
         const local = endpointGate(baseURL, maxConcurrent);
         const shared = options.crossProcess === false ? undefined : processEndpointGate(baseURL, maxConcurrent, join4(stateDirectory, "admission"));
         const gate = shared ? {
@@ -3277,7 +3314,7 @@ The previous response stopped at the output token limit before finishing. Contin
             }
           }
         } : local;
-        return { id, provider, baseURL, endpoint, gate, fetch: custom ?? globalThis.fetch };
+        return { id, provider, baseURL, endpoint, gate, summaryTimeouts, fetch: custom ?? globalThis.fetch };
       });
       if (options.persistence !== false)
         store = new CheckpointStore(join4(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]), JSON.stringify(canonical({
@@ -3385,12 +3422,12 @@ The previous response stopped at the output token limit before finishing. Contin
               await log("Skill catalog compression", { ...compacted.report });
           }
           let replayReceipt;
-          const sendSummary = async (outgoing, summarySignal = signal) => {
+          const sendSummary = async (outgoing, attempt = (body) => send(body, "summary")) => {
             if (outgoing.tool_choice !== "none")
-              return send(outgoing, "summary", summarySignal);
+              return attempt(outgoing);
             if (toolChoiceNoneRejected.has(target.id))
-              return send({ ...outgoing, tool_choice: "auto" }, "summary", summarySignal);
-            const response = await send(outgoing, "summary", summarySignal);
+              return attempt({ ...outgoing, tool_choice: "auto" });
+            const response = await attempt(outgoing);
             if (response.ok)
               return response;
             const error = await providerError(response);
@@ -3400,10 +3437,12 @@ The previous response stopped at the output token limit before finishing. Contin
               return error.response();
             toolChoiceNoneRejected.add(target.id);
             await log("Summary tool_choice none was rejected; using auto", { status: response.status });
-            return send({ ...outgoing, tool_choice: "auto" }, "summary", summarySignal);
+            return attempt({ ...outgoing, tool_choice: "auto" });
           };
           let afterMain;
           const send = async (outgoing, label, requestSignal = signal) => {
+            if (session && agent && label === "main" && !internalAgents.includes(agent))
+              lastExchanges.delete(session);
             const requestLane = label === "summary" ? `${lane}:summary` : lane;
             const ticket = usage.begin(outgoing, requestLane);
             let admissionWaitMs = 0;
@@ -3447,6 +3486,12 @@ The previous response stopped at the output token limit before finishing. Contin
               await log("Manual compaction kept the native request", { reason: "unrecognized compaction prompt" });
               return;
             }
+            const system = body.messages.filter((message) => message.role === "system");
+            if (system.some((message) => typeof message.content !== "string"))
+              return;
+            const systemInstructions = system.map((message) => message.content).join(`
+
+`);
             const instructions = text.slice(end + nativeConversationEnd.length);
             let exchange;
             try {
@@ -3474,6 +3519,11 @@ The previous response stopped at the output token limit before finishing. Contin
               messages: [...prior.messages, exchange.assistant, {
                 role: "user",
                 content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.
+
+For this handoff, follow these compaction-agent system instructions instead of the task instructions in the conversation above:
+<compaction-system-instructions>
+${systemInstructions}
+</compaction-system-instructions>
 
 ${instructions}`
               }],
@@ -3606,7 +3656,16 @@ ${instructions}`
                     ...compactionContext,
                     signal: disposed.signal,
                     overflow: undefined,
-                    completeSummary: (summary, summarySignal) => sendSummary(summary, summarySignal)
+                    completeSummary: (summary, summarySignal) => sendSummary(summary, async (body) => {
+                      const header = target.summaryTimeouts.header === undefined ? undefined : new AbortController;
+                      const timer = header && setTimeout(() => header.abort(new DOMException("Summary header timeout", "TimeoutError")), target.summaryTimeouts.header);
+                      const signals = [summarySignal ?? disposed.signal, ...header ? [header.signal] : [], ...target.summaryTimeouts.request === undefined ? [] : [AbortSignal.timeout(target.summaryTimeouts.request)]];
+                      try {
+                        return await send(body, "summary", AbortSignal.any(signals));
+                      } finally {
+                        clearTimeout(timer);
+                      }
+                    })
                   });
                   log("Speculative compaction started", { estimated: prepared.report?.estimatedAfter ?? null });
                 };
@@ -3675,6 +3734,8 @@ ${instructions}`
       output.maxOutputTokens = Math.min(output.maxOutputTokens ?? maxOutputTokens, maxOutputTokens);
     },
     async "chat.headers"(input, output) {
+      if (input.agent === "compaction")
+        nativeCompactions.delete(input.sessionID);
       if (!internalAgents.includes(input.agent)) {
         if (activeProviders.has(input.model.providerID))
           outputSessions.add(input.sessionID);
@@ -3713,21 +3774,27 @@ ${instructions}`
         compactSystem(output.system);
       stripEnvironmentDate(output.system);
     },
+    async "experimental.session.compacting"(input) {
+      nativeCompactions.add(input.sessionID);
+    },
     async "experimental.chat.messages.transform"(_input, output) {
       userTurns.clean(output.messages);
       const current = output.messages.findLast((message) => message.info.role === "user");
+      const nativeCompaction = current ? nativeCompactions.delete(current.info.sessionID) : false;
       if (current?.info.role === "user" && activeProviders.has(current.info.model.providerID)) {
         await checkpoint(current.info.sessionID, () => {
           if (options.retainModeReminders !== false)
             reminders.apply(output.messages, activeProviders);
         });
       }
-      if (options.compaction !== false)
+      if (options.compaction !== false && !nativeCompaction)
         userTurns.mark(output.messages, activeProviders);
     },
     async event({ event }) {
-      if (event.type === "session.idle")
+      if (event.type === "session.idle") {
+        nativeCompactions.delete(event.properties.sessionID);
         return continueTruncated(event.properties.sessionID);
+      }
       if (event.type !== "session.deleted")
         return;
       const session = event.properties.info.id;
@@ -3739,6 +3806,7 @@ ${instructions}`
       outputSessions.delete(session);
       outputCalls.delete(session);
       lastExchanges.delete(session);
+      nativeCompactions.delete(session);
       compaction.delete(session);
       const deletion = (async () => {
         await stateTails.get(session);
@@ -3783,6 +3851,7 @@ ${instructions}`
       outputSessions.clear();
       outputCalls.clear();
       lastExchanges.clear();
+      nativeCompactions.clear();
       truncatedHandled.clear();
       toolChoiceNoneRejected.clear();
       if (deletionFailures.length)

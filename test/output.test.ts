@@ -95,12 +95,22 @@ describe("tool output storage reduction", () => {
     const raw = "\u001b[31mred\u001b[0m \u001b]8;;https://example.test\u0007link\u001b]8;;\u0007"
     for (const tool of ["bash", "grep", "glob", "webfetch"]) {
       const compacted = await new ToolOutputShrinker(undefined, data).apply(tool, result(raw, { exit: 0 }))
-      expect(compacted.output).toBe("red link")
+      expect(compacted.output).toBe(`red link\n[Output shortened; full output: ${JSON.stringify(compacted.metadata.outputPath)}]`)
       expect(compacted.metadata.exit).toBe(0)
       expect(compacted.metadata.truncated).toBe(false)
       expect(await artifact(compacted)).toBe(raw)
     }
     expect((await readdir(directory(data))).length).toBe(4)
+  })
+
+  test("keeps an OSC hyperlink target retrievable after ANSI-only cleanup", async () => {
+    const data = await root()
+    const raw = "\u001b]8;;https://example.test/hidden-target\u0007click here\u001b]8;;\u0007"
+    const compacted = await new ToolOutputShrinker({ maxBytes: 512, maxLines: 2 }, data).apply("bash", result(raw))
+    expect(compacted.output.startsWith("click here\n")).toBe(true)
+    expect(compacted.output).toContain(`[Output shortened; full output: ${JSON.stringify(compacted.metadata.outputPath)}]`)
+    expect(compacted.output.split("\n").length).toBeLessThanOrEqual(2)
+    expect(await artifact(compacted)).toBe(raw)
   })
 
   test("leaves exact-threshold and ordinary short output untouched without artifacts", async () => {
@@ -171,6 +181,41 @@ describe("tool output storage reduction", () => {
     }
     expect((await readdir(directory(data))).sort()).toEqual(["tool_directory", "tool_linked"])
     expect(await readFile(outside, "utf8")).toBe("full output outside the native directory")
+  })
+
+  test("preserves trailing shell timeout metadata when shortening a native preview", async () => {
+    const data = await root()
+    await mkdir(directory(data), { recursive: true })
+    const path = join(directory(data), "tool_native_timeout")
+    const raw = lines(500)
+    await writeFile(path, raw)
+    const annotation = "\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout 120000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.\n</shell_metadata>"
+    const original = result(`...output truncated...\n\nFull output saved to: ${path}\n\n${lines(100)}${annotation}`, { truncated: true, outputPath: path, exit: null })
+    const compacted = await new ToolOutputShrinker({ maxBytes: 1024, maxLines: 7 }, data).apply("bash", original)
+    expect(compacted).not.toBe(original)
+    expect(compacted.output.endsWith(annotation)).toBe(true)
+    expect(compacted.output).toContain(`[Output shortened; full output: ${JSON.stringify(path)}]`)
+    expect(compacted.output.split("\n").length).toBeLessThanOrEqual(7)
+    expect(Buffer.byteLength(compacted.output)).toBeLessThanOrEqual(1024)
+    expect(await artifact(compacted)).toBe(raw)
+    expect(await readdir(directory(data))).toEqual([basename(path)])
+    expect(await new ToolOutputShrinker({ maxBytes: 1024, maxLines: 3 }, data).apply("bash", original)).toBe(original)
+  })
+
+  test("a literal shell_metadata block in command output does not defeat clipping", async () => {
+    const data = await root()
+    await mkdir(directory(data), { recursive: true })
+    const path = join(directory(data), "tool_native_literal")
+    await writeFile(path, lines(500))
+    const literal = "\n\n<shell_metadata>\nprinted by the command\n</shell_metadata>\n"
+    const annotation = "\n\n<shell_metadata>\nUser aborted the command\n</shell_metadata>"
+    // More than 16 KiB of ordinary output separates the literal block from the native suffix.
+    const original = result(`...output truncated...\n\nFull output saved to: ${path}\n\nhead${literal}${lines(600)}${annotation}`, { truncated: true, outputPath: path, exit: null })
+    const compacted = await new ToolOutputShrinker({ maxBytes: 4096, maxLines: 40 }, data).apply("bash", original)
+    expect(compacted).not.toBe(original)
+    expect(compacted.output.endsWith(annotation)).toBe(true)
+    expect(Buffer.byteLength(compacted.output)).toBeLessThanOrEqual(4096)
+    expect(compacted.output.split("\n").length).toBeLessThanOrEqual(40)
   })
 
   test("keeps original output and metadata when artifact storage fails", async () => {

@@ -223,6 +223,7 @@ export class Environments {
       }))
     const current = match[2]!.replace(/\n  Today's date: [^\n]+/, "")
     if (checkpoints.at(-1)?.environment !== current) {
+      if (checkpoints.at(-1)?.position === messages.length - 1) checkpoints.pop()
       checkpoints.push({ anchor: sourceAnchors.at(-1)!, position: messages.length - 1, environment: current })
     }
     if (!options.reconstruct) this.lanes.set(key, { session, chain: sourceAnchors, checkpoints })

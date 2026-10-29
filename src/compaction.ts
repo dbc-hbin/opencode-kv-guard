@@ -453,6 +453,9 @@ export class RollingCompaction {
     entry.promise = (async () => {
       try {
         const result = await this.compact(body, { ...context, signal, force: true, speculate: false }, scratch, active)
+        // A discarded upstream error must still be consumed: its body holds
+        // the endpoint admission slot until EOF or cancellation.
+        if ("response" in result) await result.response.body?.cancel().catch(() => {})
         active()
         if ("body" in result && result.report?.compacted && scratch.state && JSON.stringify(lane.state ?? null) === base) entry.staged = scratch.state
       } catch {}
@@ -540,8 +543,9 @@ export class RollingCompaction {
       if (speculation.staged && speculation.base === JSON.stringify(lane.state ?? null)) {
         const committed = lane.state
         lane.state = speculation.staged
-        if (this.retained(body, context).state) {
-          const result = await this.compact(body, context, lane, active, true)
+        // Checkpoint fingerprints describe the original history, before reductions.
+        if (this.retained(source, context).state) {
+          const result = await this.compact(source, context, lane, active, true)
           if ("body" in result) return { body: result.body, report: { ...result.report, compacted: true, speculative: true } }
           return result
         }
@@ -609,6 +613,9 @@ export class RollingCompaction {
     const candidates = [...eligible.filter((group) => group.end <= recent), ...eligible.filter((group) => group.end > recent)]
     const derivedCap = Math.min(context.outputLimit, Math.max(1, trigger - target))
     const summaryCap = Math.min(context.outputLimit, config.summaryOutputTokens ?? derivedCap)
+    // Each planned summary occupies input in the rewritten request, which the
+    // final fit check estimates with the overflow scale applied.
+    const summaryReserve = Math.ceil(summaryCap * overflowScale)
     const touched = new Map<number, { segment: Segment; previous?: Segment; additions: number[] }>()
     let plannedSize = reducedSize
     // Opening an interval must repay its own wrapper and full output reserve.
@@ -626,7 +633,7 @@ export class RollingCompaction {
           for (let index = candidate.start; index < candidate.end; index++) additions.push(index)
           const segment = { summary: "", archived: [...(previous?.archived ?? []), ...additions].sort((a, b) => a - b) }
           const trial = [...segments.filter((entry) => entry !== previous), segment].sort((a, b) => a.archived[0]! - b.archived[0]!)
-          const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryCap
+          const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryReserve
           if (size >= plannedSize) continue
           plan = { segment, previous, additions }
           touched.set(interval, plan)
@@ -645,14 +652,14 @@ export class RollingCompaction {
           archived.add(index)
         }
         plan.segment.archived.sort((a, b) => a - b)
-        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryCap
+        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryReserve
       }
       if (plannedSize <= target) break
     }
     const mandatorySize = estimate(rewritten(body, segments))
     if (!touched.size || plannedSize > target) {
       const opaque = units.some((group) => !group.plain && !instruction(body.messages[group.start]!))
-      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""} require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryCap}. Reduce the mandatory input or supply larger actual model limits`)
+      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""} require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}. Reduce the mandatory input or supply larger actual model limits`)
     }
 
     let calls = 0

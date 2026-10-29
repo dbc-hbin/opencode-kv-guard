@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { PrefixGuard, SessionHeads, isPrefixGuardSnapshot, isSessionHeadsSnapshot, type AssistantContext, type HeadContext } from "../src/heads"
 import type { ChatBody } from "../src/compaction"
-import type { WireMessage } from "../src/prefix"
+import { Environments, isEnvironmentsSnapshot, type WireMessage } from "../src/prefix"
 
 const context: HeadContext = { session: "session", lane: "provider/endpoint/agent" }
 const completed: AssistantContext = { ...context, outcome: "success", finishReason: "stop" }
@@ -327,6 +327,24 @@ describe("recorded-response prefix guard", () => {
     expect(guard.apply(body([policy, user, withoutReasoning(), next]), context).report.replayed).toEqual([])
   })
 
+  test("preparing the same prefix again retires pending reasoning before a replacement without reasoning", () => {
+    const { guard } = recorded()
+    const request = body([policy, user, answer, next])
+    const first = guard.apply(request, context).report.receipt
+    const discarded = { role: "assistant", content: "Answer", reasoning_content: "old reasoning" }
+    expect(guard.record(request, discarded, { ...completed, receipt: first })).toBe(true)
+    const replacement = guard.apply(request, context).report.receipt
+    expect(replacement).not.toBe(first)
+    const assistant = withoutReasoning(discarded)
+    expect(guard.record(request, assistant, { ...completed, receipt: replacement })).toBe(false)
+    const continuation = body([policy, user, withoutReasoning(), next, assistant, { role: "user", content: "third" }])
+    const result = guard.apply(continuation, context)
+    expect(result.report.replayed).toEqual([{ index: 2, fields: ["reasoning_content"] }])
+    expect(result.body.messages[2]).toEqual(answer)
+    expect(result.body.messages[4]).toEqual(assistant)
+    expect(guard.snapshot(context.session).lanes[0]!.records).toHaveLength(1)
+  })
+
   test("genuine reverts and edits revoke records and late completions cannot resurrect them", () => {
     for (const changed of [body([policy, user]), body([policy, user, { ...answer, content: "edited answer" }, next])]) {
       const { guard, request, receipt } = recorded()
@@ -445,5 +463,31 @@ describe("recorded-response prefix guard", () => {
     expect(guard.snapshot(context.session).lanes[0]!.records).toEqual([])
     expect(guard.record(body(), answer, { ...completed, receipt: oldReceipt })).toBe(false)
     expect(guard.apply(reduced, context).report.replayed).toEqual([])
+  })
+})
+
+describe("environment checkpoint coalescing", () => {
+  const environment = (cwd: string) => `Here is some useful information about the environment you are running in:\n<env>\n  Working directory: ${cwd}\n  Workspace root folder: /project\n  Is directory a git repo: yes\n  Platform: linux\n</env>`
+  const history = (cwd: string, extra: WireMessage[] = []): WireMessage[] => [
+    { role: "system", content: `You are powered by the model named fixture. The exact model ID is proxy/fixture\n${environment(cwd)}` },
+    { role: "user", content: "Task" },
+    ...extra,
+  ]
+
+  test.each([false, true])("replaces the terminal environment checkpoint after a history revert=%s", (revert) => {
+    const environments = new Environments()
+    environments.apply(history("/A"), context.session, context.lane)
+    if (revert) environments.apply(history("/later", [answer, next]), context.session, context.lane)
+    const messages = history("/B")
+    environments.apply(messages, context.session, context.lane)
+    const snapshot = environments.snapshot(context.session)
+    expect(isEnvironmentsSnapshot(snapshot)).toBe(true)
+    expect(snapshot.lanes[0]!.checkpoints).toHaveLength(1)
+    expect(snapshot.lanes[0]!.checkpoints[0]!.environment).toBe(environment("/B"))
+    expect(messages).toEqual([
+      { role: "system", content: "You are powered by the model named fixture. The exact model ID is proxy/fixture\n" },
+      { role: "user", content: "Task" },
+      { role: "user", content: `<system-reminder>\n${environment("/B")}\n</system-reminder>` },
+    ])
   })
 })

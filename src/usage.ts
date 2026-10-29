@@ -306,7 +306,17 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
     }
     if (outcome === "complete" && replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
       const ordered = [...calls].sort(([a], [b]) => a - b)
-      if (ordered.every(([index, call], offset) => index === offset && call.id && call.function.name)) {
+      if (ordered.every(([index, call], offset) => {
+        if (index !== offset || !call.id || !call.function.name) return false
+        // SDK tool inputs are parsed and stringified again on the next turn.
+        // Malformed/non-object inputs have schema-dependent recovery; do not replay.
+        try {
+          const input: unknown = JSON.parse(call.function.arguments)
+          if (!record(input)) return false
+          call.function.arguments = JSON.stringify(input)
+          return true
+        } catch { return false }
+      })) {
         if (ordered.length) assistant.tool_calls = ordered.map(([, call]) => call)
         options.onAssistant?.(assistant)
       }

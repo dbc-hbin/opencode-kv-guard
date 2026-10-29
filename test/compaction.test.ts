@@ -357,6 +357,20 @@ describe("prefix-sharing summary handoff", () => {
     expect(forwarded(result).messages).toContain(original.messages.at(-1)!)
   })
 
+  test("overflow recovery reserves scaled room for each planned summary", async () => {
+    // A summary near the cap counts twice after a 2x overflow scale; planning
+    // must archive enough history for that, not only for the unscaled cap.
+    const original = history(12, 220)
+    delete original.response_format
+    const size = bytes(original)
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 300 })
+    const result = await compaction.prepare(original, context(async () => success("s".repeat(290)), {
+      contextWindow: size + 500, outputLimit: 500, currentUser: original.messages.at(-1), overflow: { promptTokens: size * 2 },
+    }))
+    expect("report" in result && result.report?.compacted).toBe(true)
+    expect(bytes(forwarded(result)) * 2).toBeLessThanOrEqual("report" in result ? result.report!.target as number : 0)
+  })
+
   test("handoff preserves the previous frozen effective prefix when extending a checkpoint", async () => {
     const original = fixture()
     const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
@@ -1258,6 +1272,31 @@ describe("speculative compaction", () => {
     expect("report" in next && next.report?.speculative).toBe(true)
     expect(JSON.stringify(forwarded(next).messages)).toContain("speculative-summary")
     expect(forwarded(next).messages).toContain(grown.messages.at(-1)!)
+  })
+
+  test("a speculation after a committed reasoning reduction adopts the original history without a foreground summary", async () => {
+    const body = history(6, 220)
+    body.messages[2]!.reasoning_content = "r".repeat(6000)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const first = await compaction.prepare(body, context(async () => { throw new Error("Reasoning reduction must not summarize") }, {
+      contextWindow: 10000, currentUser: body.messages.at(-1),
+    }))
+    expect("report" in first && first.report?.reducedReasoning).toBe(1)
+    expect("report" in first && first.report?.summaryRequests).toBe(0)
+    const limits = banded(forwarded(first))
+    let summaries = 0
+    compaction.speculate(body, context(async () => { summaries++; return success("speculative-summary") }, limits))
+    const grown = { ...body, messages: [...body.messages, { role: "assistant", content: "tool step " + "t".repeat(900) }, { role: "user", content: "next" }] }
+    let foreground = 0
+    const next = await compaction.prepare(grown, context(async () => { foreground++; return success("foreground-summary") }, {
+      ...limits, currentUser: grown.messages.at(-1),
+    }))
+    expect(summaries).toBeGreaterThan(0)
+    expect("report" in next && next.report?.speculative).toBe(true)
+    expect(foreground).toBe(0)
+    expect("report" in next && next.report?.estimatedBefore).toBe(bytes(grown))
+    expect(JSON.stringify(forwarded(next).messages)).toContain("speculative-summary")
+    expect(forwarded(next).messages.at(-1)).toBe(grown.messages.at(-1))
   })
 
   test("a speculation is discarded when history no longer extends it", async () => {

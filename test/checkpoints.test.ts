@@ -304,7 +304,11 @@ test("auxiliary providers cannot change the eligibility of an executing tool out
     await hooks["tool.execute.before"]?.({ tool: "bash", sessionID: "session", callID: "call" }, { args: {} })
     const output = { title: "fixture", output: "\u001b[31mred\u001b[0m", metadata: {} }
     await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "session", callID: "call", args: {} }, output)
-    expect(output.output).toBe(selected ? "red" : "\u001b[31mred\u001b[0m")
+    // Eligible output is cleaned (with a retrieval hint); ineligible output is untouched.
+    if (selected) {
+      expect(output.output.startsWith("red\n")).toBe(true)
+      expect(output.output).not.toContain("\u001b[")
+    } else expect(output.output).toBe("\u001b[31mred\u001b[0m")
   }
   await hooks.dispose!()
 })

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
+import { jsonSchema, stepCountIs, streamText } from "ai"
 import type { ChatBody } from "../src/compaction"
+import type { WireMessage } from "../src/prefix"
 import { observeResponse, UsageTracker, type ObserveResponseOptions, type UsageReport } from "../src/usage"
 import { createGLMChunkAdapter, parseGLMOptions } from "../src/glm"
 import { admittedFetch, type AdmissionGate } from "../src/transport"
@@ -48,6 +51,60 @@ test("repeated tool-call id and name deltas are recorded once, like the SDK", as
     body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { rejected.push(assistant) },
   }).text()
   expect(rejected).toEqual([])
+})
+
+test("tool replay arguments match the SDK round trip without changing response bytes", async () => {
+  for (const [input, next, replayable] of [
+    ['{"filePath": "/tmp/a"}', '{"filePath":"/tmp/a"}', true],
+    ['{"2": 2, "1": 1, "path": "\\u002ftmp/a", "nested": [1.0, true]}', '{"1":1,"2":2,"path":"/tmp/a","nested":[1,true]}', true],
+    [' [1, 2] ', '[1,2]', false],
+    [' "path" ', '"path"', false],
+    [' 1.0 ', '1', false],
+    ['true', 'true', false],
+    ['null', 'null', false],
+    ['{"filePath":', '{}', false],
+    ['', '{}', false],
+  ] as const) {
+    const recorded: WireMessage[] = []
+    const requests: ChatBody[] = []
+    const values = [
+      { choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "call", type: "function", function: { name: "read", arguments: input.slice(0, 2) } }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: input.slice(2) } }] }, finish_reason: "tool_calls" }] },
+    ]
+    const source = values.map((value) => event(value)).join("") + "data: [DONE]\n\n"
+    const provider = createOpenAICompatible({
+      name: "fixture", baseURL: "http://127.0.0.1:1/v1",
+      fetch: Object.assign(async (url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push(await new Request(url, init).json() as ChatBody)
+        if (requests.length > 1) return stream([encoder.encode(event({ choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n")])
+        const response = observeResponse(stream([encoder.encode(source)]), {
+          body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { recorded.push(assistant) },
+        })
+        expect(await response.clone().text()).toBe(source)
+        return response
+      }, { preconnect: globalThis.fetch.preconnect }),
+    })
+    const result = streamText({
+      model: provider.chatModel("fixture"), prompt: "Task", maxRetries: 0, stopWhen: stepCountIs(2),
+      tools: { read: { inputSchema: jsonSchema({}), execute: async () => "result" } },
+    })
+    for await (const part of result.fullStream) {
+      if (part.type === "error") throw part.error
+    }
+    expect(await result.text).toBe("ok")
+    expect(requests).toHaveLength(2)
+    const assistant = requests[1]!.messages.find((message) => message.role === "assistant")!
+    expect(assistant.tool_calls).toEqual([{ id: "call", type: "function", function: { name: "read", arguments: next } }])
+    expect(recorded).toEqual(replayable ? [assistant] : [])
+
+    const jsonRecorded: WireMessage[] = []
+    const json = JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "", tool_calls: [{ id: "call", type: "function", function: { name: "read", arguments: input } }] }, finish_reason: "tool_calls" }] })
+    const response = observeResponse(new Response(json, { headers: { "content-type": "application/json" } }), {
+      body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { jsonRecorded.push(assistant) },
+    })
+    expect(await response.text()).toBe(json)
+    expect(jsonRecorded).toEqual(recorded)
+  }
 })
 
 test("truncated, opaque and multi-choice completions cannot become replay records", async () => {

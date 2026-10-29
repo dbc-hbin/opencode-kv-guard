@@ -75,6 +75,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   // Last completed main request per session, kept so a manual /compact can
   // summarize by extending that exact prefix instead of a fresh transcript.
   const lastExchanges = new Map<string, Exchange>()
+  const nativeCompactions = new Set<string>()
   // Provider targets observed rejecting tool_choice "none" on a summary.
   const toolChoiceNoneRejected = new Set<string>()
   const manualHandoff = options.compaction !== false && options.prefixHandoff !== false
@@ -121,7 +122,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       const messages = (await client.session.messages({ path: { id: session } })).data ?? []
       const last = messages.at(-1)?.info
       const prior = truncatedHandled.get(session)
-      if (last?.role !== "assistant" || last.finish !== "length" || last.error || last.summary || !activeProviders.has(last.providerID) || internalAgents.includes(last.mode)) {
+      // OpenCode stores the finish reason before a cancelled step records its
+      // error and completion time, and can publish idle in between; only a
+      // completed assistant is a real truncation.
+      if (last?.role !== "assistant" || last.finish !== "length" || !last.time.completed || last.error || last.summary || !activeProviders.has(last.providerID) || internalAgents.includes(last.mode)) {
         truncatedHandled.delete(session)
         return
       }
@@ -196,13 +200,19 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         if (loaded.reason) await log("Checkpoint cache miss", { reason: loaded.reason })
       }
       const result = await action()
-      if (!completedResponse) disposed.signal.throwIfAborted()
-      if (deleted.has(session)) throw new Error("KV guard: session was deleted during preparation")
-      if (store && loaded) {
-        const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) }
-        if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty)) await store.save(session, snapshot, loaded.revision)
+      try {
+        if (!completedResponse) disposed.signal.throwIfAborted()
+        if (deleted.has(session)) throw new Error("KV guard: session was deleted during preparation")
+        if (store && loaded) {
+          const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) }
+          if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty)) await store.save(session, snapshot, loaded.revision)
+        }
+        return result
+      } catch (error) {
+        // An unpublished summary response still owns its admission slot.
+        if (result instanceof Response) await result.body?.cancel().catch(() => {})
+        throw error
       }
-      return result
     })
     const tail = pending.then(() => {}, () => {})
     stateTails.set(session, tail)
@@ -231,6 +241,11 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         if (!["http:", "https:"].includes(endpoint.protocol)) throw new Error(`KV guard: ${id} needs an HTTP baseURL`)
         const custom = provider.options?.fetch
         if (custom !== undefined && typeof custom !== "function") throw new Error(`KV guard: ${id} has a non-function fetch`)
+        // OpenCode 1.19.4 timeoutFetch applies these provider options outside
+        // our wrapper; detached summaries reapply them per request.
+        const headerTimeout = provider.options?.headerTimeout === false ? undefined : provider.options?.headerTimeout ?? 300_000
+        const requestTimeout = provider.options?.timeout === false || provider.options?.timeout == null ? undefined : provider.options.timeout
+        const summaryTimeouts = { header: typeof headerTimeout === "number" ? headerTimeout : undefined, request: typeof requestTimeout === "number" ? requestTimeout : undefined }
         const local = endpointGate(baseURL, maxConcurrent)
         const shared = options.crossProcess === false ? undefined : processEndpointGate(baseURL, maxConcurrent, join(stateDirectory, "admission"))
         const gate: AdmissionGate = shared ? {
@@ -246,7 +261,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             }
           },
         } : local
-        return { id, provider, baseURL, endpoint, gate, fetch: (custom ?? globalThis.fetch) as Fetch }
+        return { id, provider, baseURL, endpoint, gate, summaryTimeouts, fetch: (custom ?? globalThis.fetch) as Fetch }
       })
       if (options.persistence !== false) store = new CheckpointStore(
         join(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]),
@@ -349,20 +364,23 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           // A server that rejects tool_choice "none" (other than as overflow)
           // gets "auto" plus the summary instruction, and is remembered so
           // later summaries do not repeat the failing request.
-          const sendSummary = async (outgoing: ChatBody, summarySignal = signal) => {
-            if (outgoing.tool_choice !== "none") return send(outgoing, "summary", summarySignal)
-            if (toolChoiceNoneRejected.has(target.id)) return send({ ...outgoing, tool_choice: "auto" }, "summary", summarySignal)
-            const response = await send(outgoing, "summary", summarySignal)
+          // `attempt` sends one summary request; detached summaries pass one that
+          // applies fresh provider deadlines to each actual send.
+          const sendSummary = async (outgoing: ChatBody, attempt = (body: ChatBody) => send(body, "summary")) => {
+            if (outgoing.tool_choice !== "none") return attempt(outgoing)
+            if (toolChoiceNoneRejected.has(target.id)) return attempt({ ...outgoing, tool_choice: "auto" })
+            const response = await attempt(outgoing)
             if (response.ok) return response
             const error = await providerError(response)
             if (!error) return response
             if (error.overflow) return error.response()
             toolChoiceNoneRejected.add(target.id)
             await log("Summary tool_choice none was rejected; using auto", { status: response.status })
-            return send({ ...outgoing, tool_choice: "auto" }, "summary", summarySignal)
+            return attempt({ ...outgoing, tool_choice: "auto" })
           }
           let afterMain: (() => void) | undefined
           const send = async (outgoing: ChatBody, label: "main" | "summary", requestSignal = signal) => {
+            if (session && agent && label === "main" && !internalAgents.includes(agent)) lastExchanges.delete(session)
             const requestLane = label === "summary" ? `${lane}:summary` : lane
             const ticket = usage.begin(outgoing, requestLane)
             let admissionWaitMs = 0
@@ -410,6 +428,11 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               await log("Manual compaction kept the native request", { reason: "unrecognized compaction prompt" })
               return undefined
             }
+            const system = body.messages.filter((message) => message.role === "system")
+            if (system.some((message) => typeof message.content !== "string")) return undefined
+            // Keep custom agent prompts and system-transform output without
+            // rewriting the cached system prefix that this handoff extends.
+            const systemInstructions = system.map((message) => message.content).join("\n\n")
             const instructions = text.slice(end + nativeConversationEnd.length)
             let exchange: Exchange | undefined
             try { exchange = await manualExchange(sessionID, target.id, headScope, body.model) } catch (error) {
@@ -433,7 +456,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               ...(prior.tools !== undefined ? { tools: prior.tools, tool_choice: "none" } : {}),
               messages: [...prior.messages, exchange.assistant, {
                 role: "user",
-                content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.\n\n${instructions}`,
+                content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.\n\nFor this handoff, follow these compaction-agent system instructions instead of the task instructions in the conversation above:\n<compaction-system-instructions>\n${systemInstructions}\n</compaction-system-instructions>\n\n${instructions}`,
               }],
               stream: false,
               ...(prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }),
@@ -551,7 +574,15 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
                   afterMain = undefined
                   compaction.speculate(history, {
                     ...compactionContext, signal: disposed.signal, overflow: undefined,
-                    completeSummary: (summary, summarySignal) => sendSummary(summary, summarySignal),
+                    // Like timeoutFetch, each detached request gets the provider's
+                    // header deadline (cleared once headers arrive) and total timeout.
+                    completeSummary: (summary, summarySignal) => sendSummary(summary, async (body) => {
+                      const header = target.summaryTimeouts.header === undefined ? undefined : new AbortController()
+                      const timer = header && setTimeout(() => header.abort(new DOMException("Summary header timeout", "TimeoutError")), target.summaryTimeouts.header)
+                      const signals = [summarySignal ?? disposed.signal, ...(header ? [header.signal] : []), ...(target.summaryTimeouts.request === undefined ? [] : [AbortSignal.timeout(target.summaryTimeouts.request)])]
+                      // The header deadline ends when this attempt's headers arrive.
+                      try { return await send(body, "summary", AbortSignal.any(signals)) } finally { clearTimeout(timer) }
+                    }),
                   })
                   void log("Speculative compaction started", { estimated: prepared.report?.estimatedAfter ?? null })
                 }
@@ -620,6 +651,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       output.maxOutputTokens = Math.min(output.maxOutputTokens ?? maxOutputTokens, maxOutputTokens)
     },
     async "chat.headers"(input, output) {
+      if (input.agent === "compaction") nativeCompactions.delete(input.sessionID)
       if (!internalAgents.includes(input.agent)) {
         if (activeProviders.has(input.model.providerID)) outputSessions.add(input.sessionID)
         else outputSessions.delete(input.sessionID)
@@ -649,18 +681,30 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       if (options.compactPrompt !== false) compactSystem(output.system)
       stripEnvironmentDate(output.system)
     },
+    async "experimental.session.compacting"(input) {
+      // Native compaction transforms a selected history without its marker part.
+      // The next transform for this session serializes text, not a guarded request.
+      nativeCompactions.add(input.sessionID)
+    },
     async "experimental.chat.messages.transform"(_input, output) {
       userTurns.clean(output.messages)
       const current = output.messages.findLast((message) => message.info.role === "user")
+      // Set by experimental.session.compacting immediately before this transform;
+      // session.idle clears a flag left by a compaction cancelled in between.
+      const nativeCompaction = current ? nativeCompactions.delete(current.info.sessionID) : false
       if (current?.info.role === "user" && activeProviders.has(current.info.model.providerID)) {
         await checkpoint(current.info.sessionID, () => {
           if (options.retainModeReminders !== false) reminders.apply(output.messages, activeProviders)
         })
       }
-      if (options.compaction !== false) userTurns.mark(output.messages, activeProviders)
+      if (options.compaction !== false && !nativeCompaction) userTurns.mark(output.messages, activeProviders)
     },
     async event({ event }) {
-      if (event.type === "session.idle") return continueTruncated(event.properties.sessionID)
+      if (event.type === "session.idle") {
+        // A compaction cancelled between its hooks never reaches its transform.
+        nativeCompactions.delete(event.properties.sessionID)
+        return continueTruncated(event.properties.sessionID)
+      }
       if (event.type !== "session.deleted") return
       const session = event.properties.info.id
       const pending = pendingDeletions.get(session)
@@ -670,6 +714,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       outputSessions.delete(session)
       outputCalls.delete(session)
       lastExchanges.delete(session)
+      nativeCompactions.delete(session)
       compaction.delete(session)
       // OpenCode fires event hooks without awaiting them. Own this work until
       // the tombstone commits, including when plugin disposal follows deletion.
@@ -713,6 +758,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       outputSessions.clear()
       outputCalls.clear()
       lastExchanges.clear()
+      nativeCompactions.clear()
       truncatedHandled.clear()
       toolChoiceNoneRejected.clear()
       if (deletionFailures.length) throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion")

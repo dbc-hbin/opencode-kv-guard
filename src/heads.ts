@@ -333,7 +333,7 @@ export class PrefixGuard {
       while (report.sharedMessages < prior.previous.messages.length && prior.previous.messages[report.sharedMessages]?.hash === current.messages[report.sharedMessages]?.hash) report.sharedMessages++
       if (!equal(prior.previous.fields, current.fields)) records = []
       else if (report.sharedMessages < prior.previous.messages.length) records = records.filter((entry) => entry.request.length < report.sharedMessages)
-      records = records.filter((entry) => bound(entry.request, fields, anchors) && (!current.messages[entry.request.length] || current.messages[entry.request.length]!.hash === hash(entry.assistant)))
+      records = records.filter((entry) => bound(entry.request, fields, anchors) && current.messages[entry.request.length]?.hash === hash(entry.assistant))
     }
     if (context.observe !== false) this.lanes.set(id, { session: context.session, state: { lane: context.lane, receipt: report.receipt, previous: current, records } })
     return { body: result, report }

@@ -1,7 +1,11 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { Gate, admittedFetch } from "../src/transport"
 import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDate, UserTurns, type WireMessage } from "../src/prefix"
 import createPlugin from "../src/index"
+import { CheckpointConflictError, CheckpointStore } from "../src/checkpoints"
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import type { Fetch } from "../src/transport"
@@ -506,5 +510,372 @@ test("a summary handoff overflow recovers by folding once; a rejected tool_choic
   sent.length = 0
   await (await post("none-b", "msg_c", history)).text()
   expect(sent.filter((body) => body.stream === false).map((body) => body.tool_choice)).toEqual(["auto"])
+  await hooks.dispose!()
+})
+
+test("a discarded speculative error response releases the endpoint slot", async () => {
+  let summaries = 0
+  const summarySent = Promise.withResolvers<void>()
+  const fetch: Fetch = async (input, init) => {
+    const body = await new Request(input, init).json() as Record<string, unknown>
+    if (body.stream === false) {
+      summaries++
+      summarySent.resolve()
+      // A 503 body that is never read keeps the admission slot unless cancelled.
+      return new Response(new ReadableStream({ pull() {} }), { status: 503, headers: { "content-type": "application/json" } })
+    }
+    const size = Buffer.byteLength(JSON.stringify(body))
+    return new Response(`data: ${JSON.stringify({ id: "main", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ id: "main", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculate.test/v1", fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+  await hooks.config!(config)
+  const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
+  const post = async (userID: string) => {
+    const turn: Messages = [user(userID, "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const body = { model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
+    // Place the request at 95% of the trigger, inside the speculation band.
+    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
+    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": userID }
+    return config.provider.proxy.options.fetch("http://speculate.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })
+  }
+  await (await post("msg_a")).text()
+  // The completed response starts the background summary, which gets 503.
+  const bounded = <T>(pending: Promise<T>, fallback: T) => Promise.race([pending, new Promise<T>((resolve) => setTimeout(() => resolve(fallback), 2000))])
+  await bounded(summarySent.promise, undefined)
+  expect(summaries).toBe(1)
+  // With maxConcurrent 1, the next main request must still be admitted.
+  const next = await bounded(post("msg_b").then((response) => response.text()), "admission blocked")
+  expect(next).toContain("Answer")
+  await hooks.dispose!()
+})
+
+test("a checkpoint publication conflict cancels an unread summary before admitting the next request", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "kv-guard-publication-"))
+  let conflict = false
+  let cancelled = false
+  let mainRequests = 0
+  const original = CheckpointStore.prototype.save
+  const save = spyOn(CheckpointStore.prototype, "save").mockImplementation(async function (this: CheckpointStore, ...args) {
+    if (conflict) {
+      conflict = false
+      // A competing writer commits after preparation loaded its CAS revision.
+      await original.call(this, ...args)
+    }
+    return original.call(this, ...args)
+  })
+  const fetch: Fetch = async (input, init) => {
+    const body = await new Request(input, init).json() as Record<string, unknown>
+    if (body.stream === false) {
+      conflict = true
+      return new Response(new ReadableStream({ pull() {}, cancel() { cancelled = true } }), { status: 503 })
+    }
+    mainRequests++
+    return new Response("admitted")
+  }
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://publication.test/v1", fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], persistence: true, stateDirectory, compaction: { bytesPerToken: 1, summaryOutputTokens: 200 } })
+  try {
+    await hooks.config!(config)
+    const turn: Messages = [user("msg_user", "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const history = Array.from({ length: 14 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(320) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(320) }]).flat()
+    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-user": "msg_user", "x-opencode-kv-guard-limits": JSON.stringify({ context: 12000, output: 500 }) }
+    await expect(config.provider.proxy.options.fetch("http://publication.test/v1/chat/completions", {
+      method: "POST", headers, body: JSON.stringify({ model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }),
+    })).rejects.toBeInstanceOf(CheckpointConflictError)
+    expect(cancelled).toBe(true)
+    const next = await config.provider.proxy.options.fetch("http://publication.test/v1/chat/completions", {
+      method: "POST", signal: AbortSignal.timeout(2000), headers: { "x-opencode-session-id": "next", "x-opencode-kv-guard-agent": "build" },
+      body: JSON.stringify({ model: "fixture", messages: [{ role: "user", content: "Next" }] }),
+    })
+    expect(await next.text()).toBe("admitted")
+    expect(mainRequests).toBe(1)
+  } finally {
+    save.mockRestore()
+    await hooks.dispose!()
+    await rm(stateDirectory, { recursive: true, force: true })
+  }
+})
+
+test.each([
+  { timeout: 25, headerTimeout: 1000 },
+  { timeout: false, headerTimeout: 25 },
+  { timeout: 1000, headerTimeout: 25 },
+])("a detached speculative summary observes provider deadlines %j", async ({ timeout, headerTimeout }) => {
+  const summarySent = Promise.withResolvers<void>()
+  const summaryAborted = Promise.withResolvers<unknown>()
+  const fetch: Fetch = async (input, init) => {
+    const request = new Request(input, init)
+    const body = await request.json() as Record<string, unknown>
+    if (body.stream === false) {
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => { summaryAborted.resolve(request.signal.reason); reject(request.signal.reason) }, { once: true })
+        summarySent.resolve()
+      })
+    }
+    const size = Buffer.byteLength(JSON.stringify(body))
+    return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculation-deadline.test/v1", fetch, timeout, headerTimeout } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+  try {
+    await hooks.config!(config)
+    const turn: Messages = [user("msg_user", "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
+    const body = { model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
+    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
+    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": "msg_user" }
+    await (await config.provider.proxy.options.fetch("http://speculation-deadline.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })).text()
+    await summarySent.promise
+    // Another session must get the same endpoint slot without cancelling speculation itself.
+    const next = await config.provider.proxy.options.fetch("http://speculation-deadline.test/v1/chat/completions", {
+      method: "POST", signal: AbortSignal.timeout(2000), headers: { "x-opencode-session-id": "next", "x-opencode-kv-guard-agent": "build" },
+      body: JSON.stringify({ model: "fixture", stream: true, messages: [{ role: "user", content: "Next" }] }),
+    })
+    expect(await next.text()).toContain("Answer")
+    expect(await summaryAborted.promise).toBeInstanceOf(DOMException)
+  } finally { await hooks.dispose!() }
+})
+
+test("a detached speculative summary keeps upstream header vs total timeout semantics", async () => {
+  // headerTimeout covers only the wait for headers; a slower body is allowed
+  // up to the total timeout, which each request gets afresh.
+  const bodyStarted = Promise.withResolvers<void>()
+  const finishBody = Promise.withResolvers<void>()
+  const summaryDone = Promise.withResolvers<string>()
+  const fetch: Fetch = async (input, init) => {
+    const request = new Request(input, init)
+    const body = await request.json() as Record<string, unknown>
+    if (body.stream === false) {
+      const encoder = new TextEncoder()
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          bodyStarted.resolve()
+          request.signal.addEventListener("abort", () => { summaryDone.resolve("aborted"); controller.error(request.signal.reason) }, { once: true })
+          await finishBody.promise
+          controller.enqueue(encoder.encode(JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "SLOW_BODY_SUMMARY" }, finish_reason: "stop" }] })))
+          controller.close()
+          summaryDone.resolve("completed")
+        },
+      })
+      return new Response(stream, { headers: { "content-type": "application/json" } })
+    }
+    const size = Buffer.byteLength(JSON.stringify(body))
+    return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculation-semantics.test/v1", fetch, timeout: 5000, headerTimeout: 25 } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+  try {
+    await hooks.config!(config)
+    const turn: Messages = [user("msg_user", "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
+    const body = { model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
+    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
+    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": "msg_user" }
+    await (await config.provider.proxy.options.fetch("http://speculation-semantics.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })).text()
+    await bodyStarted.promise
+    // Elapsed real time is the behavior under test: outlive the 25 ms header
+    // deadline after headers arrived, then end the body. Fake timers cannot
+    // drive the AbortSignal.timeout these deadlines use.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    finishBody.resolve()
+    expect(await summaryDone.promise).toBe("completed")
+  } finally { await hooks.dispose!() }
+})
+
+test("a detached tool_choice none rejection gives its auto retry fresh deadlines", async () => {
+  // The rejected response's slow error body and the retry's header wait must
+  // not share one header deadline.
+  const choices: unknown[] = []
+  const errorBodyStarted = Promise.withResolvers<void>()
+  const finishErrorBody = Promise.withResolvers<void>()
+  const retried = Promise.withResolvers<string>()
+  const encoder = new TextEncoder()
+  const fetch: Fetch = async (input, init) => {
+    const request = new Request(input, init)
+    const body = await request.json() as Record<string, unknown>
+    if (body.stream === false) {
+      choices.push(body.tool_choice)
+      if (body.tool_choice === "none") {
+        return new Response(new ReadableStream<Uint8Array>({
+          async start(controller) {
+            errorBodyStarted.resolve()
+            request.signal.addEventListener("abort", () => controller.error(request.signal.reason), { once: true })
+            await finishErrorBody.promise
+            controller.enqueue(encoder.encode(JSON.stringify({ error: { message: "tool_choice none is not supported" } })))
+            controller.close()
+          },
+        }), { status: 400, headers: { "content-type": "application/json" } })
+      }
+      request.signal.addEventListener("abort", () => retried.resolve("aborted"), { once: true })
+      queueMicrotask(() => retried.resolve("sent"))
+      return Response.json({ choices: [{ index: 0, message: { role: "assistant", content: "AUTO_SUMMARY" }, finish_reason: "stop" }] })
+    }
+    const size = Buffer.byteLength(JSON.stringify(body))
+    return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculation-fallback.test/v1", fetch, timeout: 5000, headerTimeout: 25 } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+  try {
+    await hooks.config!(config)
+    const turn: Messages = [user("msg_user", "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
+    const body = { model: "fixture", stream: true, max_tokens: 500, tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }], messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
+    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
+    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": "msg_user" }
+    await (await config.provider.proxy.options.fetch("http://speculation-fallback.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })).text()
+    await errorBodyStarted.promise
+    // Elapsed real time is the behavior under test: the error body outlives the
+    // 25 ms header deadline. Fake timers cannot drive AbortSignal.timeout.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    finishErrorBody.resolve()
+    expect(await retried.promise).toBe("sent")
+    expect(choices).toEqual(["none", "auto"])
+  } finally { await hooks.dispose!() }
+})
+
+test("manual compaction rejects a tool-call exchange superseded by a length-finished step", async () => {
+  const sent: Record<string, unknown>[] = []
+  const toolCall = { id: "call_read", type: "function", function: { name: "read", arguments: "{}" } }
+  const fetch: Fetch = async (input, init) => {
+    const body = await new Request(input, init).json() as Record<string, unknown>
+    sent.push(body)
+    const first = sent.length === 1
+    return Response.json({ choices: [{ index: 0, message: { role: "assistant", content: first ? null : "Partial", ...(first ? { tool_calls: [toolCall] } : {}) }, finish_reason: first ? "tool_calls" : "length" }] })
+  }
+  const stored = [
+    { info: { role: "user", id: "msg_user" }, parts: [] },
+    { info: { role: "assistant", id: "msg_tools", finish: "tool-calls", time: { completed: 1 } }, parts: [] },
+    { info: { role: "assistant", id: "msg_partial", finish: "length", time: { completed: 2 } }, parts: [] },
+    { info: { role: "user", id: "msg_compact" }, parts: [{ type: "compaction" }] },
+  ]
+  const client = { session: { messages: async () => ({ data: stored }) }, app: { log: async () => {} } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://stale-exchange.test/v1", fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"] })
+  try {
+    await hooks.config!(config)
+    const turn: Messages = [user("msg_user", "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const post = (agent: string, messages: WireMessage[]) => config.provider.proxy.options.fetch("http://stale-exchange.test/v1/chat/completions", {
+      method: "POST", headers: { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": agent, "x-opencode-kv-guard-user": agent === "build" ? "msg_user" : "msg_compact", "x-opencode-kv-guard-limits": JSON.stringify({ context: 100_000, output: 1000 }) },
+      body: JSON.stringify({ model: "fixture", max_tokens: 1000, messages }),
+    })
+    const messages = [{ role: "system", content: "Policy" }, { role: "user", content: marked.text }]
+    await (await post("build", messages)).text()
+    await (await post("build", [...messages, { role: "assistant", content: null, tool_calls: [toolCall] }, { role: "tool", tool_call_id: "call_read", content: "Result" }])).text()
+    const native = [{ role: "system", content: "Summarizer" }, { role: "user", content: "Here is the conversation so far:\n\n<conversation>\n[User]: Task\n</conversation>\n\nSummarize." }]
+    await (await post("compaction", native)).text()
+    expect(sent).toHaveLength(3)
+    expect(sent[2]!.messages).toEqual(native)
+  } finally { await hooks.dispose!() }
+})
+
+test("manual compaction preserves custom compaction-agent system instructions", async () => {
+  const sent: Record<string, unknown>[] = []
+  const fetch: Fetch = async (input, init) => {
+    const body = await new Request(input, init).json() as Record<string, unknown>
+    sent.push(body)
+    return Response.json({ choices: [{ index: 0, message: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })
+  }
+  const stored = [
+    { info: { role: "user", id: "msg_user" }, parts: [] },
+    { info: { role: "assistant", id: "msg_answer", finish: "stop" }, parts: [] },
+    { info: { role: "user", id: "msg_compact" }, parts: [{ type: "compaction" }] },
+  ]
+  const client = { session: { messages: async () => ({ data: stored }) }, app: { log: async () => {} } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://custom-compaction.test/v1", fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"] })
+  try {
+    await hooks.config!(config)
+    const turn: Messages = [user("msg_user", "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const post = (agent: string, messages: WireMessage[]) => config.provider.proxy.options.fetch("http://custom-compaction.test/v1/chat/completions", {
+      method: "POST", headers: { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": agent, "x-opencode-kv-guard-user": agent === "build" ? "msg_user" : "msg_compact", "x-opencode-kv-guard-limits": JSON.stringify({ context: 100_000, output: 1000 }) },
+      body: JSON.stringify({ model: "fixture", max_tokens: 1000, messages }),
+    })
+    await (await post("build", [{ role: "system", content: "Policy" }, { role: "user", content: marked.text }])).text()
+    const customSystem = "Preserve every deployment approval and write the summary in Korean."
+    await (await post("compaction", [{ role: "system", content: customSystem }, { role: "user", content: "Here is the conversation so far:\n\n<conversation>\n[User]: Task\n</conversation>\n\nSummarize." }])).text()
+    expect(JSON.stringify(sent[1]!.messages)).toContain(customSystem)
+  } finally { await hooks.dispose!() }
+})
+
+test("native compaction history is cleaned without injecting private user provenance", async () => {
+  const hooks = await plugin({} as PluginInput, { providers: ["proxy"] })
+  await hooks.config!({ provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://native-transform.test/v1" } } } })
+  try {
+    const live: Messages = [user("msg_user", "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: live })
+    expect(JSON.stringify(live)).toContain("kv-guard-user:")
+    // v1.19.4 removes the compaction marker and selects history before this hook.
+    const history = structuredClone(live)
+    await hooks["experimental.session.compacting"]?.({ sessionID: "session" }, { context: [] })
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: history })
+    expect(history).toEqual([user("msg_user", "Task")])
+  } finally { await hooks.dispose!() }
+})
+
+test("a native compaction cancelled before its transform does not strip the next turn's provenance", async () => {
+  const hooks = await plugin({ client: { app: { log: async () => {} }, session: { messages: async () => ({ data: [] }) } } } as unknown as PluginInput, { providers: ["proxy"], continueTruncated: false })
+  await hooks.config!({ provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://native-cancel.test/v1" } } } })
+  try {
+    // compacting fired, then the compaction was cancelled; the session goes idle.
+    await hooks["experimental.session.compacting"]?.({ sessionID: "session" }, { context: [] })
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "session" } } as never })
+    const next: Messages = [user("msg_next", "Next task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: next })
+    expect(JSON.stringify(next)).toContain("kv-guard-user:")
+  } finally { await hooks.dispose!() }
+})
+
+test("an output-limit finish is continued only once its step completed", async () => {
+  const prompts: unknown[] = []
+  let stored: unknown[] = []
+  const assistant = (time: Record<string, number>) => ({ info: { id: "msg_answer", role: "assistant", parentID: "msg_user", finish: "length", time, providerID: "proxy", modelID: "fixture", mode: "build" }, parts: [] })
+  const client = {
+    app: { log: async () => {} },
+    session: { messages: async () => ({ data: stored }), get: async () => ({ data: {} }), promptAsync: async (input: unknown) => { prompts.push(input); return {} } },
+    tui: { showToast: async () => ({}) },
+  }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://idle.test/v1", fetch: (async () => new Response()) as Fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"] })
+  await hooks.config!(config)
+  const idle = () => hooks.event!({ event: { type: "session.idle", properties: { sessionID: "session" } } as never })
+  const userTurn = { info: { id: "msg_user", role: "user", agent: "build", model: { providerID: "proxy", modelID: "fixture" } }, parts: [{ type: "text", text: "Task" }] }
+  // A cancelled step can publish idle after storing finish but before its
+  // error and completion time.
+  stored = [userTurn, assistant({ created: 1 })]
+  await idle()
+  expect(prompts).toHaveLength(0)
+  stored = [userTurn, { ...assistant({ created: 1, completed: 2 }), info: { ...assistant({}).info, time: { created: 1, completed: 2 }, error: { name: "MessageAbortedError", data: {} } } }]
+  await idle()
+  expect(prompts).toHaveLength(0)
+  stored = [userTurn, assistant({ created: 1, completed: 2 })]
+  await idle()
+  expect(prompts).toHaveLength(1)
   await hooks.dispose!()
 })
