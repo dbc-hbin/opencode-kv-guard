@@ -1,17 +1,17 @@
 import { Database } from "bun:sqlite"
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { constants, watch, type FSWatcher } from "node:fs"
 import { chmod, lstat, mkdir, open } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { isCompactionSnapshot, type CompactionSnapshot } from "./compaction"
 import { isEnvironmentsSnapshot, isModeRemindersSnapshot, type EnvironmentsSnapshot, type ModeRemindersSnapshot } from "./prefix"
 import { isSessionHeadsSnapshot, isPrefixGuardSnapshot, type SessionHeadsSnapshot, type PrefixGuardSnapshot } from "./heads"
+import { digest as hash, uuidV4 } from "./shared"
 
 export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot; heads?: SessionHeadsSnapshot; prefixGuard?: PrefixGuardSnapshot }
 export type CheckpointLoad = { revision: string | null; snapshot: CheckpointSnapshot | null; reason?: "malformed" | "version" | "deleted" }
 type Row = { revision: string; version: number; payload: string | null; deleted: number }
 const version = 2
-const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 
 export function isCheckpointSnapshot(value: unknown, session: string): value is CheckpointSnapshot {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
@@ -71,7 +71,7 @@ export class CheckpointStore {
 
   private row(db: Database) {
     const row = db.query<Row, []>("SELECT revision, version, payload, deleted FROM checkpoint WHERE id = 1").get()
-    if (row && (typeof row.revision !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(row.revision) || (row.deleted !== 0 && row.deleted !== 1))) throw new Error("KV guard checkpoint database has an invalid revision or deletion marker")
+    if (row && (typeof row.revision !== "string" || !uuidV4.test(row.revision) || (row.deleted !== 0 && row.deleted !== 1))) throw new Error("KV guard checkpoint database has an invalid revision or deletion marker")
     return row
   }
 

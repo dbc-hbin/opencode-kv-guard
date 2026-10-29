@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto"
 import type { ChatBody } from "./compaction"
+import { digest, record } from "./shared"
 
 export type SkillCatalogProvenance = {
   // The caller attests that user.system is absent when this is undefined.
@@ -16,7 +16,6 @@ export type SkillCatalogReport = { skills: number; originalChars: number; replac
 const header = "Skills provide specialized instructions and workflows for specific tasks.\nUse the skill tool to load a skill when a task matches its description."
 const start = `${header}\n<available_skills>\n`
 const end = "\n</available_skills>"
-const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
 
 export function compactSkillCatalog(body: ChatBody, provenance: SkillCatalogProvenance): { body: ChatBody; report?: SkillCatalogReport } {
   if (!Array.isArray(body.tools) || !body.tools.some((tool) => record(tool) && tool.type === "function" && record(tool.function) && tool.function.name === "skill")) return { body }
@@ -29,7 +28,7 @@ export function compactSkillCatalog(body: ChatBody, provenance: SkillCatalogProv
   if (suffix) {
     if (!Number.isSafeInteger(suffix.length) || suffix.length < 0 || suffix.length > generated.length) return { body }
     const text = suffix.length ? generated.slice(-suffix.length) : ""
-    if (createHash("sha256").update(text).digest("hex") !== suffix.hash) return { body }
+    if (digest(text) !== suffix.hash) return { body }
     if (suffix.length) {
       const delimiter = generated.length - suffix.length - 1
       if (delimiter < 0 || generated[delimiter] !== "\n") return { body }

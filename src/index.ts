@@ -1,5 +1,4 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { isAbsolute, join } from "node:path"
 import { admittedFetch, endpointGate, type AdmissionGate, type Fetch } from "./transport"
@@ -14,12 +13,14 @@ import { compactSkillCatalog } from "./skills"
 import { compactToolDescriptions } from "./tools"
 import { ToolOutputShrinker } from "./output"
 import { SessionHeads, PrefixGuard } from "./heads"
+import { digest as hash } from "./shared"
 
 const agentHeader = "x-opencode-kv-guard-agent"
 const limitsHeader = "x-opencode-kv-guard-limits"
 const userHeader = "x-opencode-kv-guard-user"
 const systemSuffixHeader = "x-opencode-kv-guard-system-suffix"
-const hash = (value: string) => createHash("sha256").update(value).digest("hex")
+// Internal OpenCode agents that never own a resumable conversation.
+const internalAgents = ["title", "summary", "compaction"]
 
 const plugin: Plugin = async ({ client, project, directory, worktree }, options = {}) => {
   const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs"]
@@ -284,7 +285,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               const prepared = heads.apply(body, { ...headContext, replacements })
               body = prepared.body
               await log("Session head contract", { ...prepared.report })
-              if (!["title", "summary", "compaction"].includes(agent)) {
+              if (!internalAgents.includes(agent)) {
                 const lanes = parentHeadLanes.get(session) ?? new Map<string, string>()
                 lanes.set(headScope, headLane)
                 parentHeadLanes.set(session, lanes)
@@ -295,7 +296,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               body = guarded.body
             }
             if (session && agent && encodedLimits) {
-              const allowSummary = !["title", "summary", "compaction"].includes(agent)
+              const allowSummary = !internalAgents.includes(agent)
               if (allowSummary && options.compaction !== false && !currentUser) {
                 throw new Error("KV guard: current user provenance was removed by another transform; cannot compact safely")
               }
@@ -342,7 +343,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       output.maxOutputTokens = Math.min(output.maxOutputTokens ?? maxOutputTokens, maxOutputTokens)
     },
     async "chat.headers"(input, output) {
-      if (!["title", "summary", "compaction"].includes(input.agent)) {
+      if (!internalAgents.includes(input.agent)) {
         if (activeProviders.has(input.model.providerID)) outputSessions.add(input.sessionID)
         else outputSessions.delete(input.sessionID)
       }

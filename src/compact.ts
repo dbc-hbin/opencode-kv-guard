@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { digest } from "./shared"
 
 // Exact provider() outputs from OpenCode 1.19.4, commit
 // 148842ef7cb1bc34192b3fff57d0f9721ab9c801, packages/opencode/src/session/prompt/.
@@ -41,7 +41,7 @@ export function compactSystem(system: string[]): { originalChars: number; replac
     // request.ts joins the complete builtin and live instructions with LF.
     // Refuse a matching prefix followed by anything other than that delimiter.
     if (header.length < length || (header.length !== length && header[length] !== "\n")) continue
-    if (createHash("sha256").update(header.slice(0, length)).digest("hex") !== hash) continue
+    if (digest(header.slice(0, length)) !== hash) continue
 
     system[0] = compactPrompt + header.slice(length)
     return { originalChars: length, replacementChars: compactPrompt.length }

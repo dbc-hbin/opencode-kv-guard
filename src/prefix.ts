@@ -1,5 +1,6 @@
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import type { Hooks } from "@opencode-ai/plugin"
+import { digest, isSha256 as sha256, record } from "./shared"
 
 type Messages = Parameters<NonNullable<Hooks["experimental.chat.messages.transform"]>>[1]["messages"]
 type Part = Messages[number]["parts"][number]
@@ -10,9 +11,6 @@ export function isGeneratedEnvironment(message: WireMessage) {
   return generatedEnvironments.has(message)
 }
 
-const digest = (value: string) => createHash("sha256").update(value).digest("hex")
-const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
-const sha256 = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)
 
 // The compatible wire format drops OpenCode message IDs and may add user-role
 // media messages. Carry the real user provenance through conversion in an

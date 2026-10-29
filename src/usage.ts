@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import type { ChatBody } from "./compaction"
 import type { WireMessage } from "./prefix"
+import { digest as hash, record } from "./shared"
 
 export type UsageRequest = { readonly startedAt: number }
 export type UsageReport = {
@@ -35,8 +35,6 @@ type Fingerprint = { policy: string; messages: string[] }
 type Anchor = Fingerprint & { promptTokens: number }
 type Lane = { latest: number; anchor?: Anchor }
 type Pending = { lane: string; state: Lane; sequence: number; fingerprint: Fingerprint }
-const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
-const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 
 function fingerprint(body: ChatBody): Fingerprint {
@@ -165,7 +163,6 @@ class Events {
     this.pending = this.pending.slice(start)
     return frames
   }
-
 }
 
 export function observeResponse(response: Response, options: ObserveResponseOptions): Response {

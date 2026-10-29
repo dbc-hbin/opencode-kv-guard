@@ -4,11 +4,11 @@ import { chmod, lstat, mkdir, open, unlink } from "node:fs/promises"
 import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { stripVTControlCharacters } from "node:util"
+import { record } from "./shared"
 
 export type ToolOutputOptions = false | { maxBytes?: number; maxLines?: number }
 type Options = Required<Exclude<ToolOutputOptions, false>>
 const tools: Record<string, true> = { bash: true, grep: true, glob: true, webfetch: true }
-const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value)
 
 function options(input: unknown): Options | false {
   if (input === false) return false

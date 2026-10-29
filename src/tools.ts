@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { digest as hash } from "./shared"
 
 // Exact builtin tool descriptions from OpenCode 1.19.4, commit
 // 148842ef7cb1bc34192b3fff57d0f9721ab9c801, packages/opencode/src/tool/.
@@ -6,7 +6,6 @@ import { createHash } from "node:crypto"
 // temp path, limits, year, agent list) are spliced out as \0name\0 before
 // hashing and carried into the compact text unchanged. Parameter schemas are
 // never modified; each compact text states the same parameter contract.
-const hash = (text: string) => createHash("sha256").update(text).digest("hex")
 
 const fixed: Record<string, { length: number; hash: string; compact: string }> = {
   read: {

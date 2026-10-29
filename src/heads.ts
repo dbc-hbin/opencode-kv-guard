@@ -1,11 +1,9 @@
 import { createHash, randomUUID } from "node:crypto"
 import type { ChatBody } from "./compaction"
 import { canonical, type WireMessage } from "./prefix"
+import { instruction, isSha256 as sha256, record as object, uuidV4 } from "./shared"
 
-const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex")
-const sha256 = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)
-const instruction = (message: WireMessage) => message.role === "system" || message.role === "developer"
 const exactKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
 const equal = (a: unknown, b: unknown) => hash(a) === hash(b)
 const key = (session: string, lane: string, model?: string) => hash([session, lane, model ?? null])
@@ -250,7 +248,7 @@ export function isPrefixGuardSnapshot(value: unknown, session: string): value is
   if (!object(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes)) return false
   const lanes = new Set<string>()
   return value.lanes.every((lane) => {
-    if (!object(lane) || !exactKeys(lane, ["lane", "receipt", "previous", "records"]) || typeof lane.lane !== "string" || !lane.lane || lanes.has(lane.lane) || typeof lane.receipt !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(lane.receipt) || !isRequestHashes(lane.previous) || !Array.isArray(lane.records)) return false
+    if (!object(lane) || !exactKeys(lane, ["lane", "receipt", "previous", "records"]) || typeof lane.lane !== "string" || !lane.lane || lanes.has(lane.lane) || typeof lane.receipt !== "string" || !uuidV4.test(lane.receipt) || !isRequestHashes(lane.previous) || !Array.isArray(lane.records)) return false
     lanes.add(lane.lane)
     const previous = lane.previous
     const fields = hash(previous.fields)
@@ -349,10 +347,8 @@ export class PrefixGuard {
     // A receipt binds this completion to one preparation, including ABA reverts
     // whose request bytes happen to equal an earlier request.
     if (!prior || context.receipt !== prior.receipt || !equal(prior.previous, request)) return false
-    const state = prior
     const entry = { request: { fields: hash(request.fields), length: request.messages.length, chain: structuralChain(request.messages).at(-1) ?? hash([]) }, assistant: structuredClone(assistant) }
-    if (!state.records.some((item) => equal(item, entry))) state.records.push(entry)
-    this.lanes.set(id, { session: context.session, state })
+    if (!prior.records.some((item) => equal(item, entry))) prior.records.push(entry)
     return true
   }
 

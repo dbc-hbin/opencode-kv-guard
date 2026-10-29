@@ -1,10 +1,11 @@
 import { Database } from "bun:sqlite"
 import { execFileSync } from "node:child_process"
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { mkdirSync, readFileSync, watch, type FSWatcher } from "node:fs"
 import { hostname } from "node:os"
 import { join, resolve } from "node:path"
 import { endpointKey, type AdmissionGate, type GateRelease } from "./transport"
+import { digest } from "./shared"
 
 type Lease = { id: string; pid: number; identity: string }
 type Owner = { identity: string; dead: boolean }
@@ -79,7 +80,7 @@ class ProcessGate implements AdmissionGate {
   private readonly host = hostname()
 
   constructor(readonly capacity: number, private readonly directory: string, key: string) {
-    this.file = join(directory, `${createHash("sha256").update(key).digest("hex")}.sqlite`)
+    this.file = join(directory, `${digest(key)}.sqlite`)
   }
 
   private transaction<T>(action: (db: Database) => T): T {

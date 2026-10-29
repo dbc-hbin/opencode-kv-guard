@@ -1,4 +1,5 @@
 import type { ChatBody } from "./compaction"
+import { record } from "./shared"
 
 export type ReasoningEffort = "low" | "high" | "max"
 export type GLMOptions = {
@@ -18,7 +19,6 @@ export type GLMPolicyReport = {
   conflicts: string[]
 }
 
-const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
 const effort = (value: unknown): value is ReasoningEffort => value === "low" || value === "high" || value === "max"
 
 export function parseGLMOptions(input: unknown): GLMOptions | false {
