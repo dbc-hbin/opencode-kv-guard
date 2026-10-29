@@ -79,7 +79,13 @@ async function admittedFetch(fetch, gate, input, init) {
     await release();
     return response;
   }
-  const reader = response.body.getReader();
+  let reader;
+  try {
+    reader = response.body.getReader();
+  } catch (error) {
+    await release();
+    throw error;
+  }
   let finished = false;
   let completion;
   let controller;
@@ -823,7 +829,7 @@ function groups(messages) {
 function completeRead(content) {
   if (typeof content !== "string")
     return false;
-  const match = /^<path>([^\n]+)<\/path>\n<type>file<\/type>\n<content>\n\n([\s\S]*)\n\n\(End of file - total (\d+) lines\)\n<\/content>$/.exec(content);
+  const match = /^<path>([^\n]+)<\/path>\n<type>file<\/type>\n<content>\n([\s\S]*)\n\n\(End of file - total (\d+) lines\)\n<\/content>$/.exec(content);
   if (!match || content.includes("... (line truncated to 2000 chars)"))
     return false;
   const count = Number(match[3]);
@@ -1248,14 +1254,13 @@ class RollingCompaction {
         ].sort((a, b) => a - b);
         const candidate = {
           ...summaryBase,
-          ...current.tools !== undefined ? { tools: current.tools } : {},
+          ...current.tools !== undefined ? { tools: current.tools, tool_choice: "auto" } : {},
           ...current.response_format !== undefined ? { response_format: current.response_format } : {},
           messages: [...current.messages, {
             role: "user",
             content: `${summaryPolicy}
 Produce the historical checkpoint using only the messages at these zero-based positions in the preceding conversation: ${JSON.stringify(selected)}. Include and merge the previous historical summary at those positions, if present. Other messages remain verbatim for continuation and must not be incorporated into this checkpoint. This is a summary handoff; do not execute the prior request or call tools.`
           }],
-          tool_choice: "auto",
           stream: false,
           ...body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }
         };
@@ -2097,20 +2102,28 @@ function observeResponse(response, options) {
         const target = calls.get(index) ?? { id: "", type: "function", function: { name: "", arguments: "" } };
         if (call.type !== undefined && call.type !== "function")
           replayable = false;
-        for (const key of ["id", "type"])
-          if (call[key] !== undefined) {
-            if (typeof call[key] !== "string")
-              replayable = false;
-            else if (key === "id")
-              target.id += call[key];
-          }
-        for (const key of ["name", "arguments"])
-          if (call.function[key] !== undefined) {
-            if (typeof call.function[key] !== "string")
-              replayable = false;
-            else
-              target.function[key] += call.function[key];
-          }
+        if (call.id !== undefined) {
+          if (typeof call.id !== "string")
+            replayable = false;
+          else if (!target.id)
+            target.id = call.id;
+          else if (call.id !== target.id)
+            replayable = false;
+        }
+        if (call.function.name !== undefined) {
+          if (typeof call.function.name !== "string")
+            replayable = false;
+          else if (!target.function.name)
+            target.function.name = call.function.name;
+          else if (call.function.name !== target.function.name)
+            replayable = false;
+        }
+        if (call.function.arguments !== undefined) {
+          if (typeof call.function.arguments !== "string")
+            replayable = false;
+          else
+            target.function.arguments += call.function.arguments;
+        }
         calls.set(index, target);
       }
     }
@@ -2250,8 +2263,7 @@ function observeResponse(response, options) {
     if (stopped)
       return;
     stopped = true;
-    controller?.error(signal.reason);
-    reader?.cancel(signal.reason).catch(() => {});
+    Promise.resolve(reader?.cancel(signal.reason)).then(() => controller?.error(signal.reason), (error) => controller?.error(error));
     finish("aborted");
   };
   if (!reader) {
@@ -2509,11 +2521,12 @@ function createGLMChunkAdapter(model, options) {
         delete normalized.reasoning_text;
       } else if (delta !== text)
         normalized = { ...normalized, [alias]: delta };
-      if (normalized !== message) {
-        for (const other of reasoningAliases) {
-          if (other !== alias && other !== "reasoning_content" && normalized[other] === text)
-            delete normalized[other];
-        }
+      const redundant = reasoningAliases.filter((other) => other !== alias && other !== "reasoning_content" && (normalized[other] === text || normalized[other] === ""));
+      if (redundant.length) {
+        if (normalized === message)
+          normalized = { ...normalized };
+        for (const other of redundant)
+          delete normalized[other];
       }
       return normalized === message ? choice : { ...choice, [key]: normalized };
     });

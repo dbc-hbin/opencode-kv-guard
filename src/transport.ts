@@ -80,7 +80,13 @@ export async function admittedFetch(fetch: Fetch, gate: AdmissionGate, input: Re
     return response
   }
 
-  const reader = response.body.getReader()
+  let reader: ReadableStreamDefaultReader<Uint8Array>
+  try {
+    reader = response.body.getReader()
+  } catch (error) {
+    await release()
+    throw error
+  }
   let finished = false
   let completion: Promise<void> | undefined
   let controller: ReadableStreamDefaultController<Uint8Array>

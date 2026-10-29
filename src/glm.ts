@@ -168,12 +168,13 @@ export function createGLMChunkAdapter(model: string, options: GLMOptions | false
         normalized = { ...normalized, reasoning_content: delta }
         delete normalized.reasoning_text
       } else if (delta !== text) normalized = { ...normalized, [alias]: delta }
-      // Do not manufacture a second copy when a gateway mirrors the same text.
-      // Other aliases can carry distinct data and remain byte-for-byte intact.
-      if (normalized !== message) {
-        for (const other of reasoningAliases) {
-          if (other !== alias && other !== "reasoning_content" && normalized[other] === text) delete normalized[other]
-        }
+      // Do not manufacture a second copy when a gateway mirrors the same text,
+      // and drop empty aliases that would read as conflicting reasoning. Other
+      // aliases can carry distinct data and remain byte-for-byte intact.
+      const redundant = reasoningAliases.filter((other) => other !== alias && other !== "reasoning_content" && (normalized[other] === text || normalized[other] === ""))
+      if (redundant.length) {
+        if (normalized === message) normalized = { ...normalized }
+        for (const other of redundant) delete normalized[other]
       }
       return normalized === message ? choice : { ...choice, [key]: normalized }
     })

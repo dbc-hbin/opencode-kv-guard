@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { ChatBody } from "../src/compaction"
 import { observeResponse, UsageTracker, type ObserveResponseOptions, type UsageReport } from "../src/usage"
 import { createGLMChunkAdapter, parseGLMOptions } from "../src/glm"
+import { admittedFetch, type AdmissionGate } from "../src/transport"
 
 const encoder = new TextEncoder()
 
@@ -26,6 +27,27 @@ test("response replay records transformed fragments only after a complete succes
       tool_calls: [{ id: "call", type: "function", function: { name: "read", arguments: '{"filePath":"a"}' } }],
     }] : [])
   }
+})
+
+test("repeated tool-call id and name deltas are recorded once, like the SDK", async () => {
+  const values = [
+    { choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "read", arguments: '{"file' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "read", arguments: 'Path":"a"}' } }] }, finish_reason: "tool_calls" }] },
+  ]
+  const recorded: unknown[] = []
+  const response = observeResponse(stream([encoder.encode(values.map((value) => event(value)).join("") + "data: [DONE]\n\n")]), {
+    body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { recorded.push(assistant) },
+  })
+  await response.text()
+  expect(recorded).toEqual([{ role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"filePath":"a"}' } }] }])
+  // A different id for the same index is ambiguous and must not be recorded.
+  const conflicting = structuredClone(values)
+  conflicting[1]!.choices[0]!.delta.tool_calls![0]!.id = "call_2"
+  const rejected: unknown[] = []
+  await observeResponse(stream([encoder.encode(conflicting.map((value) => event(value)).join("") + "data: [DONE]\n\n")]), {
+    body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { rejected.push(assistant) },
+  }).text()
+  expect(rejected).toEqual([])
 })
 
 test("truncated, opaque and multi-choice completions cannot become replay records", async () => {
@@ -338,6 +360,30 @@ describe("streaming usage observation", () => {
     await expect(pending).rejects.toBe(reason)
     expect(await cancelled.promise).toBe(reason)
     expect(await observed.report).toMatchObject({ outcome: "aborted", anchorRecorded: false })
+  })
+
+  test("abort waits for upstream release and surfaces its failure", async () => {
+    const releasing = Promise.withResolvers<void>()
+    const permission = Promise.withResolvers<void>()
+    const gate: AdmissionGate = {
+      capacity: 1,
+      async acquire() {
+        return async () => {
+          releasing.resolve()
+          await permission.promise
+          throw new Error("release-failed")
+        }
+      },
+    }
+    const signal = new AbortController()
+    const admitted = await admittedFetch(async () => new Response(new ReadableStream(), { headers: { "content-type": "text/event-stream" } }), gate, "http://endpoint.test")
+    const observed = watch(admitted, { body: body(), lane, tracker: new UsageTracker(), signal: signal.signal })
+    const pending = observed.response.text()
+    signal.abort(new Error("aborted"))
+    await releasing.promise
+    permission.resolve()
+    await expect(pending).rejects.toThrow("release-failed")
+    expect((await observed.report).outcome).toBe("aborted")
   })
 
   test("already-aborted signals cancel immediately, and stream errors remain errors", async () => {

@@ -317,7 +317,7 @@ test("pre-aborted admission creates no state, and a repeated release preserves i
   }
 })
 
-test.each(["eof", "cancel", "abort", "acquire-abort", "fetch-error", "no-body", "body-error"])("%s completion awaits asynchronous lease release", async (mode) => {
+test.each(["eof", "cancel", "abort", "acquire-abort", "fetch-error", "no-body", "body-error", "locked-body"])("%s completion awaits asynchronous lease release", async (mode) => {
   const releasing = Promise.withResolvers<void>()
   const permission = Promise.withResolvers<void>()
   const gate: AdmissionGate = {
@@ -336,11 +336,16 @@ test.each(["eof", "cancel", "abort", "acquire-abort", "fetch-error", "no-body", 
     if (mode === "fetch-error") throw new Error("fetch-failed")
     if (mode === "no-body") return new Response(null, { status: 204 })
     if (mode === "body-error") return new Response(new ReadableStream({ pull(controller) { controller.error(new Error("body-failed")) } }))
+    if (mode === "locked-body") {
+      const locked = new Response("proof")
+      locked.body!.getReader()
+      return locked
+    }
     if (mode === "abort" || mode === "cancel") return new Response(new ReadableStream())
     return new Response("proof")
   }, gate, "http://endpoint.test", { signal: abort.signal })
   let terminal: Promise<unknown>
-  if (mode === "fetch-error" || mode === "no-body" || mode === "acquire-abort") terminal = response
+  if (mode === "fetch-error" || mode === "no-body" || mode === "acquire-abort" || mode === "locked-body") terminal = response
   else {
     const value = await response
     if (mode === "cancel") terminal = value.body!.cancel("stop")

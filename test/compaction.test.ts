@@ -55,7 +55,7 @@ function batch(index: number, size = 350): WireMessage[] {
 }
 
 function readOutput(size = 300) {
-  return `<path>/project/file.ts</path>\n<type>file</type>\n<content>\n\n${Array.from({ length: 5 }, (_, index) => `${index + 1}: ${"x".repeat(size)}`).join("\n")}\n\n(End of file - total 5 lines)\n</content>`
+  return `<path>/project/file.ts</path>\n<type>file</type>\n<content>\n${Array.from({ length: 5 }, (_, index) => `${index + 1}: ${"x".repeat(size)}`).join("\n")}\n\n(End of file - total 5 lines)\n</content>`
 }
 
 function readBatch(id: string, content = readOutput(), args = JSON.stringify({ filePath: "/project/file.ts" })): WireMessage[] {
@@ -309,6 +309,19 @@ describe("prefix-sharing summary handoff", () => {
     const restored = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
     expect(await restored.restore("session", compaction.snapshot("session"))).toBe(true)
     expect(forwarded(await restored.prepare(original, handoffContext(original, async () => { throw new Error("Unexpected inference") })))).toEqual(body)
+  })
+
+  test("tool-free handoff omits tool_choice, which servers reject without tools", async () => {
+    const original = fixture()
+    delete original.tools
+    const requests: ChatBody[] = []
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const result = await compaction.prepare(original, handoffContext(original, async (body) => { requests.push(body); return success("handoff-summary") }))
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.messages.slice(0, -1)).toEqual(original.messages)
+    expect(requests[0]!.tools).toBeUndefined()
+    expect(requests[0]!.tool_choice).toBeUndefined()
+    expect("report" in result && result.report?.prefixHandoff).toBe(true)
   })
 
   test("handoff preserves the previous frozen effective prefix when extending a checkpoint", async () => {

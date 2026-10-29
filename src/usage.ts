@@ -209,13 +209,21 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
         if (!count(index)) { replayable = false; continue }
         const target = calls.get(index) ?? { id: "", type: "function", function: { name: "", arguments: "" } }
         if (call.type !== undefined && call.type !== "function") replayable = false
-        for (const key of ["id", "type"]) if (call[key] !== undefined) {
-          if (typeof call[key] !== "string") replayable = false
-          else if (key === "id") target.id += call[key]
+        // SDK 2.0.41 takes id and name from the first delta and only appends
+        // arguments; repeated metadata must not be concatenated.
+        if (call.id !== undefined) {
+          if (typeof call.id !== "string") replayable = false
+          else if (!target.id) target.id = call.id
+          else if (call.id !== target.id) replayable = false
         }
-        for (const key of ["name", "arguments"] as const) if (call.function[key] !== undefined) {
-          if (typeof call.function[key] !== "string") replayable = false
-          else target.function[key] += call.function[key]
+        if (call.function.name !== undefined) {
+          if (typeof call.function.name !== "string") replayable = false
+          else if (!target.function.name) target.function.name = call.function.name
+          else if (call.function.name !== target.function.name) replayable = false
+        }
+        if (call.function.arguments !== undefined) {
+          if (typeof call.function.arguments !== "string") replayable = false
+          else target.function.arguments += call.function.arguments
         }
         calls.set(index, target)
       }
@@ -314,8 +322,12 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
   const abort = () => {
     if (stopped) return
     stopped = true
-    controller?.error(signal!.reason)
-    void reader?.cancel(signal!.reason).catch(() => {})
+    // Settle upstream cancellation (which releases admission) before failing
+    // the consumer, so a release failure is reported instead of discarded.
+    void Promise.resolve(reader?.cancel(signal!.reason)).then(
+      () => controller?.error(signal!.reason),
+      (error) => controller?.error(error),
+    )
     finish("aborted")
   }
   if (!reader) {

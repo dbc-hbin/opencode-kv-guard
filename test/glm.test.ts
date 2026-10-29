@@ -111,13 +111,14 @@ describe("GLM parsed-response adapter", () => {
     expect((adapt(input) as Chunk).choices[0]!.delta.reasoning_text).toBeUndefined()
     expect(input.choices[0]!.delta.reasoning_text).toBe(" exact\nreasoning  ")
     for (const delta of [
-      { reasoning_content: "native", reasoning_text: "native" },
       { reasoning: "native", reasoning_text: "other" },
       { reasoning_content: "", reasoning: "", reasoning_text: "" },
     ]) {
       const native = chunk(delta)
       expect(adapt(native)).toBe(native)
     }
+    // A mirrored copy would make the recorded response look like conflicting reasoning.
+    expect((adapt(chunk({ reasoning_content: "native", reasoning_text: "native" })) as Chunk).choices[0]!.delta).toEqual({ reasoning_content: "native" })
   })
 
   test("repairs SDK empty-primary masking without adding a mirrored fallback", () => {
@@ -128,6 +129,7 @@ describe("GLM parsed-response adapter", () => {
     const textOnly = adapt(chunk({ reasoning_content: null, reasoning: "", reasoning_text: "text-only" })) as Chunk
     expect(textOnly.choices[0]!.delta.reasoning_content).toBe("text-only")
     expect(textOnly.choices[0]!.delta.reasoning_text).toBeUndefined()
+    expect(textOnly.choices[0]!.delta.reasoning).toBeUndefined()
   })
 
   test("non-target, signed, opaque, multipart and non-assistant data remain exact", () => {

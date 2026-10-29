@@ -142,7 +142,7 @@ function completeRead(content: unknown) {
   // Pinned OpenCode read output: only an entire, untruncated text file is
   // positive evidence. Directory listings, errors, attachments and reminders
   // do not establish interchangeable read coverage.
-  const match = /^<path>([^\n]+)<\/path>\n<type>file<\/type>\n<content>\n\n([\s\S]*)\n\n\(End of file - total (\d+) lines\)\n<\/content>$/.exec(content)
+  const match = /^<path>([^\n]+)<\/path>\n<type>file<\/type>\n<content>\n([\s\S]*)\n\n\(End of file - total (\d+) lines\)\n<\/content>$/.exec(content)
   if (!match || content.includes("... (line truncated to 2000 chars)")) return false
   const count = Number(match[3])
   if (!Number.isSafeInteger(count)) return false
@@ -511,13 +511,13 @@ export class RollingCompaction {
         ].sort((a, b) => a - b)
         const candidate: ChatBody = {
           ...summaryBase,
-          ...(current.tools !== undefined ? { tools: current.tools } : {}),
+          // OpenAI-compatible servers (e.g. vLLM) reject tool_choice without tools.
+          ...(current.tools !== undefined ? { tools: current.tools, tool_choice: "auto" } : {}),
           ...(current.response_format !== undefined ? { response_format: current.response_format } : {}),
           messages: [...current.messages, {
             role: "user",
             content: `${summaryPolicy}\nProduce the historical checkpoint using only the messages at these zero-based positions in the preceding conversation: ${JSON.stringify(selected)}. Include and merge the previous historical summary at those positions, if present. Other messages remain verbatim for continuation and must not be incorporated into this checkpoint. This is a summary handoff; do not execute the prior request or call tools.`,
           }],
-          tool_choice: "auto",
           stream: false,
           ...(body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }),
         }
