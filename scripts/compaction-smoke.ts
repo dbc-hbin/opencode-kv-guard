@@ -181,7 +181,7 @@ try {
       assert.ok(previous)
       assert.deepEqual(handoff.tools, previous.tools, "handoff must retain the exact tool catalog")
       assert.deepEqual(handoff.messages.slice(0, previous.messages.length), previous.messages, "handoff must extend the previously dispatched prefix")
-      assert.equal(handoff.tool_choice, "auto")
+      assert.equal(handoff.tool_choice, "none")
     }
     assert.notEqual(restartAfter, undefined, "checkpoint restore must be exercised in a fresh process")
     const compacted = main.filter((request) => JSON.stringify(request.messages).includes(marker))

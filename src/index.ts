@@ -5,7 +5,7 @@ import { admittedFetch, endpointGate, type AdmissionGate, type Fetch } from "./t
 import { processEndpointGate } from "./process-gate"
 import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDate, UserTurns } from "./prefix"
 import { compactSystem } from "./compact"
-import { RollingCompaction, constrainedOutput, readSummary, summaryRequestBase, type ChatBody, type SummaryResult } from "./compaction"
+import { ContextOverflowError, RollingCompaction, constrainedOutput, overflowPromptTokens, providerError, readSummary, summaryRequestBase, type ChatBody, type ProviderError, type SummaryResult } from "./compaction"
 import { CheckpointStore, type CheckpointSnapshot } from "./checkpoints"
 import { UsageTracker, observeResponse } from "./usage"
 import { parseGLMOptions, normalizeGLMRequest, createGLMChunkAdapter } from "./glm"
@@ -29,7 +29,7 @@ const nativeConversationEnd = "\n</conversation>\n\n"
 type Exchange = { target: string; headScope: string; lane: string; userID: string; body: ChatBody; assistant: ChatBody["messages"][number] }
 
 const plugin: Plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs"]
+  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated"]
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key)) throw new Error(`KV guard: unknown option ${key}`)
   }
@@ -46,7 +46,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
     throw new Error("KV guard: maxOutputTokens must be a positive integer")
   }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff"]) {
+  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated"]) {
     if (options[key] !== undefined && typeof options[key] !== "boolean") throw new Error(`KV guard: ${key} must be boolean`)
   }
   if (options.stateDirectory !== undefined && (typeof options.stateDirectory !== "string" || !isAbsolute(options.stateDirectory))) {
@@ -75,6 +75,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   // Last completed main request per session, kept so a manual /compact can
   // summarize by extending that exact prefix instead of a fresh transcript.
   const lastExchanges = new Map<string, Exchange>()
+  // Provider targets observed rejecting tool_choice "none" on a summary.
+  const toolChoiceNoneRejected = new Set<string>()
   const manualHandoff = options.compaction !== false && options.prefixHandoff !== false
   const disposed = new AbortController()
   let store: CheckpointStore | undefined
@@ -100,6 +102,61 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       finished(report?: Record<string, unknown>) {
         if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0) show("Session compacted", "success")
       },
+    }
+  }
+  // OpenCode ends the loop silently when a response stops at the output
+  // limit without a tool call, which leaves reasoning-only or cut-off turns
+  // unfinished. Continue such a turn with a synthetic (model-only) prompt,
+  // at most three times in a row, as current harnesses do.
+  const truncatedHandled = new Map<string, { assistant: string; count: number }>()
+  const truncatedLimit = 3
+  const truncatedReminder = "<system-reminder>\nThe previous response stopped at the output token limit before finishing. Continue the task from where it stopped. Keep reasoning brief and split large outputs or edits into smaller steps.\n</system-reminder>"
+  const truncatedPending = new Set<string>()
+  const continueTruncated = async (session: string) => {
+    // One check per session at a time; a second idle event during it would
+    // otherwise see the same truncated response and continue it twice.
+    if (options.continueTruncated === false || deleted.has(session) || truncatedPending.has(session)) return
+    truncatedPending.add(session)
+    try {
+      const messages = (await client.session.messages({ path: { id: session } })).data ?? []
+      const last = messages.at(-1)?.info
+      const prior = truncatedHandled.get(session)
+      if (last?.role !== "assistant" || last.finish !== "length" || last.error || last.summary || !activeProviders.has(last.providerID) || internalAgents.includes(last.mode)) {
+        truncatedHandled.delete(session)
+        return
+      }
+      if (prior?.assistant === last.id) return
+      // A subagent's result was already returned to its parent task.
+      if ((await client.session.get({ path: { id: session } })).data?.parentID) return
+      // Count consecutive continuations only; a real user turn starts over.
+      const parent = messages.find((message) => message.info.id === last.parentID)
+      const continued = !!parent?.parts.length && parent.parts.every((part) => part.type === "text" && part.synthetic && part.text === truncatedReminder)
+      const count = (continued ? prior?.count ?? 0 : 0) + 1
+      truncatedHandled.set(session, { assistant: last.id, count })
+      if (count > truncatedLimit) {
+        await client.tui.showToast({ body: { message: `Response hit the output limit ${truncatedLimit} times in a row; not continuing automatically`, variant: "warning" } }).catch(() => {})
+        return
+      }
+      // Repeat the turn's own settings: an omitted variant is stored as the
+      // session default, and a different system prompt breaks the prefix.
+      // The 1.19.4 v1 SDK types omit variant/format, which the server accepts.
+      const user = parent?.info.role === "user" ? parent.info as typeof parent.info & { model: { variant?: string }; format?: unknown } : undefined
+      await client.session.promptAsync({
+        path: { id: session },
+        body: {
+          agent: user?.agent ?? last.mode,
+          model: { providerID: last.providerID, modelID: last.modelID },
+          ...(user?.system !== undefined ? { system: user.system } : {}),
+          ...(user?.model.variant !== undefined ? { variant: user.model.variant } : {}),
+          ...(user?.format !== undefined ? { format: user.format } : {}),
+          parts: [{ type: "text", synthetic: true, text: truncatedReminder }],
+        } as NonNullable<Parameters<typeof client.session.promptAsync>[0]["body"]>,
+      })
+      await log("Continued a response truncated at the output limit", { attempt: count })
+    } catch (error) {
+      await client.app.log({ body: { service: "kv-guard", level: "warn", message: "Truncated response continuation failed", extra: { error: error instanceof Error ? error.message : String(error) } } }).catch(() => {})
+    } finally {
+      truncatedPending.delete(session)
     }
   }
   // A manual /compact may reuse the recorded exchange only when nothing was
@@ -288,6 +345,22 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             if (compacted.report) await log("Skill catalog compression", { ...compacted.report })
           }
           let replayReceipt: string | undefined
+          // Summary handoffs keep the cached tools and ask for no tool calls.
+          // A server that rejects tool_choice "none" (other than as overflow)
+          // gets "auto" plus the summary instruction, and is remembered so
+          // later summaries do not repeat the failing request.
+          const sendSummary = async (outgoing: ChatBody) => {
+            if (outgoing.tool_choice !== "none") return send(outgoing, "summary")
+            if (toolChoiceNoneRejected.has(target.id)) return send({ ...outgoing, tool_choice: "auto" }, "summary")
+            const response = await send(outgoing, "summary")
+            if (response.ok) return response
+            const error = await providerError(response)
+            if (!error) return response
+            if (error.overflow) return error.response()
+            toolChoiceNoneRejected.add(target.id)
+            await log("Summary tool_choice none was rejected; using auto", { status: response.status })
+            return send({ ...outgoing, tool_choice: "auto" }, "summary")
+          }
           const send = async (outgoing: ChatBody, label: "main" | "summary") => {
             const requestLane = label === "summary" ? `${lane}:summary` : lane
             const ticket = usage.begin(outgoing, requestLane)
@@ -351,7 +424,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             if (!record(limits) || typeof limits.context !== "number" || output === undefined) return undefined
             const handoff: ChatBody = {
               ...summaryRequestBase(prior),
-              ...(prior.tools !== undefined ? { tools: prior.tools, tool_choice: "auto" } : {}),
+              ...(prior.tools !== undefined ? { tools: prior.tools, tool_choice: "none" } : {}),
               messages: [...prior.messages, exchange.assistant, {
                 role: "user",
                 content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.\n\n${instructions}`,
@@ -367,8 +440,17 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               return undefined
             }
             const notice = compactionNotice(sessionID)
-            const response = await notice.summary(() => send(handoff, "summary"))
-            if (!response.ok) return response
+            const response = await notice.summary(() => sendSummary(handoff))
+            if (!response.ok) {
+              const error = await providerError(response)
+              // The handoff is longer than OpenCode's own serialized request;
+              // an overflow here does not mean the native request overflows.
+              if (error?.overflow) {
+                await log("Manual compaction kept the native request", { reason: "handoff context overflow" })
+                return undefined
+              }
+              return error ? error.response() : response
+            }
             let summary: SummaryResult
             try { summary = await readSummary(response, signal) } catch (error) {
               await log("Manual compaction kept the native request", { reason: "summary rejected", error: error instanceof Error ? error.message : String(error) })
@@ -395,7 +477,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             const handled = await manualCompaction(session)
             if (handled) return handled
           }
-          const prepare = async () => {
+          const prepare = async (overflow?: { promptTokens?: number }) => {
             const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined
             const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined }
             const replacements = new Map<ChatBody["messages"][number], ChatBody["messages"][number]>()
@@ -447,7 +529,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
                 allowSummary, currentUser, prefixHandoff: options.prefixHandoff !== false,
                 restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
-                completeSummary: (summary) => notice.summary(() => send(summary, "summary")),
+                overflow,
+                completeSummary: (summary) => notice.summary(() => sendSummary(summary)),
               })
               if ("response" in prepared) return prepared.response
               notice.finished(prepared.report)
@@ -461,14 +544,51 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               await log("Prefix guard comparison", { ...guarded.report })
             }
           }
-          const failed = session && agent ? await checkpoint(session, prepare) : await prepare()
-          if (failed) return failed
-          if (session && agent && options.diagnostics === true) {
+          // Preparation rewrites the body and splices its messages; keep the
+          // incoming list so an overflow retry prepares the same history again.
+          const incoming = { ...body, messages: [...body.messages] }
+          const observePrefix = async () => {
+            if (!session || !agent || options.diagnostics !== true) return
             const report = audit.observe(body, session, lane)
             // Only hashes/count comparisons; no prompts, credentials, paths, or tool arguments.
             await client.app.log({ body: { service: "kv-guard", level: "info", message: "Request prefix comparison (not a token-cache hit measurement)", extra: report } })
           }
-          return send(body, "main")
+          const canRecover = !!session && !!agent && !!encodedLimits && options.compaction !== false && !internalAgents.includes(agent)
+          // Overflow recovery prepares the same history once more with the
+          // provider's report applied, then resends. Used when either the main
+          // request or a summary handoff that extends it overflows.
+          const recover = async (error: ProviderError) => {
+            const overflow = { promptTokens: overflowPromptTokens(error.text) }
+            body = { ...incoming, messages: [...incoming.messages] }
+            try {
+              const retried = await checkpoint(session!, () => prepare(overflow))
+              if (retried) return retried
+            } catch (cause) {
+              if (signal.aborted) throw cause
+              await log("Context overflow recovery failed", { error: cause instanceof Error ? cause.message : String(cause) })
+              return error.response()
+            }
+            await log("Context overflow recovery", { reportedPromptTokens: overflow.promptTokens ?? null })
+            await observePrefix()
+            return send(body, "main")
+          }
+          let failed: Response | undefined
+          try {
+            failed = session && agent ? await checkpoint(session, () => prepare()) : await prepare()
+          } catch (error) {
+            if (!(error instanceof ContextOverflowError) || !canRecover) throw error
+            return recover(error.error)
+          }
+          if (failed) return failed
+          await observePrefix()
+          const response = await send(body, "main")
+          // The byte estimate can undercount. When the provider rejects the
+          // request as too long, compact below its reported size and resend
+          // once, as current harnesses do, instead of failing the turn.
+          if (response.ok || !canRecover) return response
+          const error = await providerError(response)
+          if (!error?.overflow) return error ? error.response() : response
+          return recover(error)
         }
         activeProviders.add(target.id)
       }
@@ -518,11 +638,13 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       if (options.compaction !== false) userTurns.mark(output.messages, activeProviders)
     },
     async event({ event }) {
+      if (event.type === "session.idle") return continueTruncated(event.properties.sessionID)
       if (event.type !== "session.deleted") return
       const session = event.properties.info.id
       const pending = pendingDeletions.get(session)
       if (pending) return pending
       deleted.add(session)
+      truncatedHandled.delete(session)
       outputSessions.delete(session)
       outputCalls.delete(session)
       lastExchanges.delete(session)
@@ -569,6 +691,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       outputSessions.clear()
       outputCalls.clear()
       lastExchanges.clear()
+      truncatedHandled.clear()
+      toolChoiceNoneRejected.clear()
       if (deletionFailures.length) throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion")
     },
   }

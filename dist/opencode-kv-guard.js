@@ -975,6 +975,69 @@ function constrainedOutput(body) {
     "audio"
   ].some((key) => body[key] !== undefined) || body.tool_choice !== undefined && body.tool_choice !== "auto" || body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type"));
 }
+var overflowPatterns = [
+  /prompt is too long/i,
+  /request_too_large/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
+  /input token count.*exceeds the maximum/i,
+  /tokens in request more than max tokens allowed/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /request entity too large/i,
+  /context length is only \d+ tokens/i,
+  /input length.*exceeds.*context length/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /too large for model with \d+ maximum context length/i,
+  /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
+  /model_context_window_exceeded/i,
+  /too many tokens/i,
+  /token limit exceeded/i
+];
+var overflowExclusions = [/^(throttling error|service unavailable):/i, /rate limit/i, /too many requests/i];
+function isContextOverflow(message) {
+  return !overflowExclusions.some((pattern) => pattern.test(message)) && overflowPatterns.some((pattern) => pattern.test(message));
+}
+function overflowPromptTokens(message) {
+  const match = /(\d[\d,]*) (?:tokens )?(?:in|from) the (?:input )?messages|prompt has (\d[\d,]*) tokens?|input \((\d[\d,]*) tokens\)/i.exec(message);
+  const value = match?.slice(1).find((group) => group !== undefined);
+  return value === undefined ? undefined : Number(value.replaceAll(",", ""));
+}
+async function providerError(response) {
+  if (![400, 413, 422].includes(response.status))
+    return;
+  const text = await response.text();
+  let message = text;
+  try {
+    const value = JSON.parse(text);
+    const error = record(value) ? value.error ?? value.message : undefined;
+    message = typeof error === "string" ? error : record(error) && typeof error.message === "string" ? `${error.message} ${typeof error.code === "string" ? error.code : ""}` : text;
+  } catch {}
+  return {
+    overflow: response.status === 413 || response.status === 400 && (!text.trim() || isContextOverflow(message)),
+    text: message,
+    response: () => new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers })
+  };
+}
+
+class ContextOverflowError extends Error {
+  error;
+  constructor(error) {
+    super(`Provider rejected the summary handoff as too long: ${error.text}`);
+    this.error = error;
+  }
+}
+var toolCallText = /^<tool_call>|<\/tool_call>$/;
 async function readSummary(response, signal) {
   let value;
   const reader = response.body?.getReader();
@@ -999,7 +1062,7 @@ async function readSummary(response, signal) {
   }
   const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined;
   const message = record(choice) && record(choice.message) ? choice.message : undefined;
-  if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0) || message.function_call !== undefined) {
+  if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || toolCallText.test(message.content.trim()) || message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0) || message.function_call !== undefined) {
     throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed");
   }
   return { content: message.content, completion: value };
@@ -1109,8 +1172,10 @@ class RollingCompaction {
     }
     const bytesEstimate = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / config.bytesPerToken);
     let correction = 1;
+    let overflowScale = 1;
     const fallback = (value) => Math.ceil(bytesEstimate(value) * correction);
-    const estimate = (value) => context.estimate && record(value) && typeof value.model === "string" && Array.isArray(value.messages) ? context.estimate(value, fallback) : fallback(value);
+    const measured = (value) => context.estimate && record(value) && typeof value.model === "string" && Array.isArray(value.messages) ? context.estimate(value, fallback) : fallback(value);
+    const estimate = (value) => Math.ceil(measured(value) * overflowScale);
     const budget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - context.outputLimit) - config.marginTokens);
     if (budget < 1)
       throw new Error("Compaction has no input budget after the actual output reserve and margin");
@@ -1154,10 +1219,12 @@ class RollingCompaction {
     body = reduced(source, reductions);
     const effectiveBody = rewritten(body, segments, positions);
     const current = context.restoreReasoning?.(effectiveBody) ?? effectiveBody;
+    if (context.overflow)
+      overflowScale = Math.max(1, Math.max(context.overflow.promptTokens ?? 0, budget + 1) / Math.max(1, measured(current)));
     const currentSize = estimate(current);
     if (currentSize <= trigger)
       return { body: current, report: report(currentSize, false, !!state, 0, archived.size) };
-    correction = Math.max(1, currentSize / Math.max(1, bytesEstimate(current)));
+    correction = Math.max(1, measured(current) / Math.max(1, bytesEstimate(current)));
     let workingSource = source;
     if (current !== effectiveBody) {
       const restored = new Map(effectiveBody.messages.flatMap((message, index) => current.messages[index] !== message ? [[message, current.messages[index]]] : []));
@@ -1283,14 +1350,14 @@ class RollingCompaction {
         ...body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }
       });
       let handoff;
-      if (context.prefixHandoff && !constrained) {
+      if (context.prefixHandoff && !constrained && !context.overflow) {
         const selected = [
           ...plan.previous ? [positions.get(plan.previous.archived[0])] : [],
           ...plan.additions.map((index) => positions.get(index))
         ].sort((a, b) => a - b);
         const candidate = {
           ...summaryBase,
-          ...current.tools !== undefined ? { tools: current.tools, tool_choice: "auto" } : {},
+          ...current.tools !== undefined ? { tools: current.tools, tool_choice: "none" } : {},
           ...current.response_format !== undefined ? { response_format: current.response_format } : {},
           messages: [...current.messages, {
             role: "user",
@@ -1328,8 +1395,12 @@ Produce the historical checkpoint using only the messages at these zero-based po
           await response.body?.cancel(error).catch(() => {});
           throw error;
         }
-        if (!response.ok)
-          return { response };
+        if (!response.ok) {
+          const error = await providerError(response);
+          if (handoff && error?.overflow)
+            throw new ContextOverflowError(error);
+          return { response: error ? error.response() : response };
+        }
         let content;
         try {
           content = (await readSummary(response, context.signal)).content;
@@ -1339,7 +1410,7 @@ Produce the historical checkpoint using only the messages at these zero-based po
         }
         active();
         summary = content;
-        if (estimate(summary) > summaryCap)
+        if (measured(summary) > summaryCap)
           throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`);
         offset += low;
         calls++;
@@ -2918,7 +2989,7 @@ var nativeConversationEnd = `
 
 `;
 var plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs"];
+  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated"];
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key))
       throw new Error(`KV guard: unknown option ${key}`);
@@ -2936,7 +3007,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
     throw new Error("KV guard: maxOutputTokens must be a positive integer");
   }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff"]) {
+  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated"]) {
     if (options[key] !== undefined && typeof options[key] !== "boolean")
       throw new Error(`KV guard: ${key} must be boolean`);
   }
@@ -2963,6 +3034,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   const deletionFailures = [];
   const deleted = new Set;
   const lastExchanges = new Map;
+  const toolChoiceNoneRejected = new Set;
   const manualHandoff = options.compaction !== false && options.prefixHandoff !== false;
   const disposed = new AbortController;
   let store;
@@ -2990,6 +3062,55 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
           show("Session compacted", "success");
       }
     };
+  };
+  const truncatedHandled = new Map;
+  const truncatedLimit = 3;
+  const truncatedReminder = `<system-reminder>
+The previous response stopped at the output token limit before finishing. Continue the task from where it stopped. Keep reasoning brief and split large outputs or edits into smaller steps.
+</system-reminder>`;
+  const truncatedPending = new Set;
+  const continueTruncated = async (session) => {
+    if (options.continueTruncated === false || deleted.has(session) || truncatedPending.has(session))
+      return;
+    truncatedPending.add(session);
+    try {
+      const messages = (await client.session.messages({ path: { id: session } })).data ?? [];
+      const last = messages.at(-1)?.info;
+      const prior = truncatedHandled.get(session);
+      if (last?.role !== "assistant" || last.finish !== "length" || last.error || last.summary || !activeProviders.has(last.providerID) || internalAgents.includes(last.mode)) {
+        truncatedHandled.delete(session);
+        return;
+      }
+      if (prior?.assistant === last.id)
+        return;
+      if ((await client.session.get({ path: { id: session } })).data?.parentID)
+        return;
+      const parent = messages.find((message) => message.info.id === last.parentID);
+      const continued = !!parent?.parts.length && parent.parts.every((part) => part.type === "text" && part.synthetic && part.text === truncatedReminder);
+      const count = (continued ? prior?.count ?? 0 : 0) + 1;
+      truncatedHandled.set(session, { assistant: last.id, count });
+      if (count > truncatedLimit) {
+        await client.tui.showToast({ body: { message: `Response hit the output limit ${truncatedLimit} times in a row; not continuing automatically`, variant: "warning" } }).catch(() => {});
+        return;
+      }
+      const user = parent?.info.role === "user" ? parent.info : undefined;
+      await client.session.promptAsync({
+        path: { id: session },
+        body: {
+          agent: user?.agent ?? last.mode,
+          model: { providerID: last.providerID, modelID: last.modelID },
+          ...user?.system !== undefined ? { system: user.system } : {},
+          ...user?.model.variant !== undefined ? { variant: user.model.variant } : {},
+          ...user?.format !== undefined ? { format: user.format } : {},
+          parts: [{ type: "text", synthetic: true, text: truncatedReminder }]
+        }
+      });
+      await log("Continued a response truncated at the output limit", { attempt: count });
+    } catch (error) {
+      await client.app.log({ body: { service: "kv-guard", level: "warn", message: "Truncated response continuation failed", extra: { error: error instanceof Error ? error.message : String(error) } } }).catch(() => {});
+    } finally {
+      truncatedPending.delete(session);
+    }
   };
   const manualExchange = async (session, targetID, headScope, model) => {
     const exchange = lastExchanges.get(session);
@@ -3207,6 +3328,23 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
               await log("Skill catalog compression", { ...compacted.report });
           }
           let replayReceipt;
+          const sendSummary = async (outgoing) => {
+            if (outgoing.tool_choice !== "none")
+              return send(outgoing, "summary");
+            if (toolChoiceNoneRejected.has(target.id))
+              return send({ ...outgoing, tool_choice: "auto" }, "summary");
+            const response = await send(outgoing, "summary");
+            if (response.ok)
+              return response;
+            const error = await providerError(response);
+            if (!error)
+              return response;
+            if (error.overflow)
+              return error.response();
+            toolChoiceNoneRejected.add(target.id);
+            await log("Summary tool_choice none was rejected; using auto", { status: response.status });
+            return send({ ...outgoing, tool_choice: "auto" }, "summary");
+          };
           const send = async (outgoing, label) => {
             const requestLane = label === "summary" ? `${lane}:summary` : lane;
             const ticket = usage.begin(outgoing, requestLane);
@@ -3270,7 +3408,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
               return;
             const handoff = {
               ...summaryRequestBase(prior),
-              ...prior.tools !== undefined ? { tools: prior.tools, tool_choice: "auto" } : {},
+              ...prior.tools !== undefined ? { tools: prior.tools, tool_choice: "none" } : {},
               messages: [...prior.messages, exchange.assistant, {
                 role: "user",
                 content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.
@@ -3288,9 +3426,15 @@ ${instructions}`
               return;
             }
             const notice = compactionNotice(sessionID);
-            const response = await notice.summary(() => send(handoff, "summary"));
-            if (!response.ok)
-              return response;
+            const response = await notice.summary(() => sendSummary(handoff));
+            if (!response.ok) {
+              const error = await providerError(response);
+              if (error?.overflow) {
+                await log("Manual compaction kept the native request", { reason: "handoff context overflow" });
+                return;
+              }
+              return error ? error.response() : response;
+            }
             let summary;
             try {
               summary = await readSummary(response, signal);
@@ -3323,7 +3467,7 @@ ${instructions}`
             if (handled)
               return handled;
           }
-          const prepare = async () => {
+          const prepare = async (overflow) => {
             const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
             const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined };
             const replacements = new Map;
@@ -3384,7 +3528,8 @@ ${instructions}`
                 prefixHandoff: options.prefixHandoff !== false,
                 restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
-                completeSummary: (summary) => notice.summary(() => send(summary, "summary"))
+                overflow,
+                completeSummary: (summary) => notice.summary(() => sendSummary(summary))
               });
               if ("response" in prepared)
                 return prepared.response;
@@ -3400,14 +3545,49 @@ ${instructions}`
               await log("Prefix guard comparison", { ...guarded.report });
             }
           };
-          const failed = session && agent ? await checkpoint(session, prepare) : await prepare();
-          if (failed)
-            return failed;
-          if (session && agent && options.diagnostics === true) {
+          const incoming = { ...body, messages: [...body.messages] };
+          const observePrefix = async () => {
+            if (!session || !agent || options.diagnostics !== true)
+              return;
             const report = audit.observe(body, session, lane);
             await client.app.log({ body: { service: "kv-guard", level: "info", message: "Request prefix comparison (not a token-cache hit measurement)", extra: report } });
+          };
+          const canRecover = !!session && !!agent && !!encodedLimits && options.compaction !== false && !internalAgents.includes(agent);
+          const recover = async (error) => {
+            const overflow = { promptTokens: overflowPromptTokens(error.text) };
+            body = { ...incoming, messages: [...incoming.messages] };
+            try {
+              const retried = await checkpoint(session, () => prepare(overflow));
+              if (retried)
+                return retried;
+            } catch (cause) {
+              if (signal.aborted)
+                throw cause;
+              await log("Context overflow recovery failed", { error: cause instanceof Error ? cause.message : String(cause) });
+              return error.response();
+            }
+            await log("Context overflow recovery", { reportedPromptTokens: overflow.promptTokens ?? null });
+            await observePrefix();
+            return send(body, "main");
+          };
+          let failed;
+          try {
+            failed = session && agent ? await checkpoint(session, () => prepare()) : await prepare();
+          } catch (error) {
+            if (!(error instanceof ContextOverflowError) || !canRecover)
+              throw error;
+            return recover(error.error);
           }
-          return send(body, "main");
+          if (failed)
+            return failed;
+          await observePrefix();
+          const response = await send(body, "main");
+          if (response.ok || !canRecover)
+            return response;
+          const error = await providerError(response);
+          if (!error?.overflow)
+            return error ? error.response() : response;
+          return recover(error);
         };
         activeProviders.add(target.id);
       }
@@ -3469,6 +3649,8 @@ ${instructions}`
         userTurns.mark(output.messages, activeProviders);
     },
     async event({ event }) {
+      if (event.type === "session.idle")
+        return continueTruncated(event.properties.sessionID);
       if (event.type !== "session.deleted")
         return;
       const session = event.properties.info.id;
@@ -3476,6 +3658,7 @@ ${instructions}`
       if (pending)
         return pending;
       deleted.add(session);
+      truncatedHandled.delete(session);
       outputSessions.delete(session);
       outputCalls.delete(session);
       lastExchanges.delete(session);
@@ -3523,6 +3706,8 @@ ${instructions}`
       outputSessions.clear();
       outputCalls.clear();
       lastExchanges.clear();
+      truncatedHandled.clear();
+      toolChoiceNoneRejected.clear();
       if (deletionFailures.length)
         throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion");
     }

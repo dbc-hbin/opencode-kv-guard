@@ -442,7 +442,7 @@ test("manual compaction reuses the cached main prefix only when history still ma
   expect(handoff.stream).toBe(false)
   expect((handoff.messages as unknown[]).slice(0, 2)).toEqual(sent[0]!.messages as unknown[])
   expect(handoff.tools).toEqual(sent[0]!.tools)
-  expect(handoff.tool_choice).toBe("auto")
+  expect(handoff.tool_choice).toBe("none")
   const instruction = String((handoff.messages as { content: unknown }[]).at(-1)!.content)
   expect(instruction).toContain("Create a new anchored summary.")
   expect(instruction).not.toContain("[User]: Task")
@@ -453,5 +453,58 @@ test("manual compaction reuses the cached main prefix only when history still ma
   await (await post("compaction", "msg_compact", native)).text()
   expect(sent).toHaveLength(4)
   expect(sent[3]!.messages).toEqual(native.messages)
+  await hooks.dispose!()
+})
+
+test("a summary handoff overflow recovers by folding once; a rejected tool_choice none is remembered", async () => {
+  const sent: Record<string, unknown>[] = []
+  let handoffs = 0
+  const overflow = () => Response.json({ object: "error", message: "This model's maximum context length is 8000 tokens. However, you requested 9000 tokens (8500 in the messages, 500 in the completion)." }, { status: 400 })
+  const summary = () => Response.json({ id: "summary", object: "chat.completion", created: 1, model: "fixture", choices: [{ index: 0, message: { role: "assistant", content: "FOLDED" }, finish_reason: "stop" }] })
+  let mode: "overflow" | "reject-none" = "overflow"
+  const fetch: Fetch = async (input, init) => {
+    const body = await new Request(input, init).json() as Record<string, unknown>
+    sent.push(body)
+    if (body.stream === false) {
+      if (body.tools === undefined) return summary()
+      handoffs++
+      if (mode === "overflow") return overflow()
+      return body.tool_choice === "none" ? Response.json({ error: { message: "tool_choice none unsupported" } }, { status: 400 }) : summary()
+    }
+    return new Response(`data: ${JSON.stringify({ id: "main", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://recover.test/v1", fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], compaction: { bytesPerToken: 1, summaryOutputTokens: 200 } })
+  await hooks.config!(config)
+  const post = async (session: string, userID: string, history: Record<string, unknown>[]) => {
+    const turn: Messages = [{ ...user(userID, "Task"), info: { ...user(userID, "Task").info, sessionID: session } }]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const body = { model: "fixture", stream: true, max_tokens: 500, tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }], messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
+    const headers = { "x-opencode-session-id": session, "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context: 12000, output: 500 }), "x-opencode-kv-guard-user": userID }
+    return config.provider.proxy.options.fetch("http://recover.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })
+  }
+  // About 10,300 bytes: over the 9,775 trigger while the handoff still fits its summary budget.
+  const history = Array.from({ length: 14 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(320) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(320) }]).flat()
+
+  const recovered = await post("overflow-session", "msg_a", history)
+  expect(await recovered.text()).toContain("Answer")
+  const summaries = sent.filter((body) => body.stream === false)
+  expect(handoffs).toBe(1)
+  expect(summaries.at(-1)!.tools).toBeUndefined()
+  const main = sent.filter((body) => body.stream === true)
+  expect(main).toHaveLength(1)
+  expect(JSON.stringify(main[0]!.messages)).toContain("FOLDED")
+
+  mode = "reject-none"
+  sent.length = 0
+  handoffs = 0
+  await (await post("none-a", "msg_b", history)).text()
+  expect(sent.filter((body) => body.stream === false).map((body) => body.tool_choice)).toEqual(["none", "auto"])
+  sent.length = 0
+  await (await post("none-b", "msg_c", history)).text()
+  expect(sent.filter((body) => body.stream === false).map((body) => body.tool_choice)).toEqual(["auto"])
   await hooks.dispose!()
 })

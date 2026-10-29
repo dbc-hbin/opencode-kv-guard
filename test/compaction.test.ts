@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { RollingCompaction, isCompactionSnapshot, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
+import { ContextOverflowError, RollingCompaction, isCompactionSnapshot, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
 import { Environments, type WireMessage } from "../src/prefix"
 import { UsageTracker } from "../src/usage"
 
@@ -294,7 +294,7 @@ describe("prefix-sharing summary handoff", () => {
     expect(request.tools).toBe(original.tools)
     expect(request.messages[0]).toBe(original.messages[0])
     expect(request.messages.at(-1)!.role).toBe("user")
-    expect(request.tool_choice).toBe("auto")
+    expect(request.tool_choice).toBe("none")
     expect(request.stream).toBe(false)
     expect(request.stream_options).toBeUndefined()
     expect(request.max_tokens).toBe(100)
@@ -322,6 +322,39 @@ describe("prefix-sharing summary handoff", () => {
     expect(requests[0]!.tools).toBeUndefined()
     expect(requests[0]!.tool_choice).toBeUndefined()
     expect("report" in result && result.report?.prefixHandoff).toBe(true)
+  })
+
+  test("a handoff overflow throws for overflow recovery; other errors and tool-call text are not committed", async () => {
+    const original = fixture()
+    const overflowing = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const thrown = overflowing.prepare(original, handoffContext(original, async () => Response.json({ error: { message: "This model's maximum context length is 4000 tokens." } }, { status: 400 })))
+    await expect(thrown).rejects.toBeInstanceOf(ContextOverflowError)
+    expect(overflowing.snapshot("session").lanes).toEqual([])
+
+    const rejected = await new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 }).prepare(original, handoffContext(original, async () => Response.json({ error: { message: "bad request" } }, { status: 400 })))
+    expect("response" in rejected && rejected.response.status).toBe(400)
+    expect("response" in rejected && await rejected.response.json()).toEqual({ error: { message: "bad request" } })
+
+    // tool_choice "none" can return template tool-call markup as plain text.
+    const markup = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    await expect(markup.prepare(original, handoffContext(original, async () => success("<tool_call>read<arg_key>path</arg_key></tool_call>")))).rejects.toThrow("no tool calls")
+    expect(markup.snapshot("session").lanes).toEqual([])
+  })
+
+  test("a provider overflow forces compaction below the reported size without extending the overflowed prefix", async () => {
+    const original = fixture()
+    const requests: ChatBody[] = []
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    // The window fits the local estimate, so only the provider's report triggers compaction.
+    const result = await compaction.prepare(original, context(async (body) => { requests.push(body); return success("overflow-summary") }, {
+      prefixHandoff: true, contextWindow: bytes(original) * 2, outputLimit: 4000, currentUser: original.messages.at(-1),
+      overflow: { promptTokens: bytes(original) * 3 },
+    }))
+    expect(requests.length).toBeGreaterThan(0)
+    expect(requests.every((request) => request.tools === undefined && request.messages[0]!.content !== original.messages[0]!.content)).toBe(true)
+    expect("report" in result && result.report?.compacted).toBe(true)
+    expect("report" in result && result.report?.prefixHandoff).toBe(false)
+    expect(forwarded(result).messages).toContain(original.messages.at(-1)!)
   })
 
   test("handoff preserves the previous frozen effective prefix when extending a checkpoint", async () => {

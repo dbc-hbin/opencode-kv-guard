@@ -23,6 +23,9 @@ export type CompactionContext = {
   restoreReasoning?: (body: ChatBody) => ChatBody
   currentUser?: WireMessage
   estimate?: (body: ChatBody, fallback: (value: unknown) => number) => number
+  // The provider rejected this history as too long. Compaction treats the
+  // request as over budget, scaled to the reported prompt size when known.
+  overflow?: { promptTokens?: number }
   completeSummary: (body: ChatBody) => Promise<Response>
 }
 export type CompactionResult = { body: ChatBody; report?: Record<string, number | boolean> } | { response: Response }
@@ -248,6 +251,63 @@ export function constrainedOutput(body: ChatBody) {
     || (body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type")))
 }
 
+// OpenCode 1.19.4's own context-overflow classifier (packages/llm/src/
+// provider-error.ts), so the plugin retries exactly what OpenCode would treat
+// as overflow.
+const overflowPatterns = [
+  /prompt is too long/i, /request_too_large/i, /input is too long for requested model/i, /exceeds the context window/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i, /input token count.*exceeds the maximum/i,
+  /tokens in request more than max tokens allowed/i, /maximum prompt length is \d+/i, /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i, /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i, /exceeds the limit of \d+/i,
+  /exceeds the available context size/i, /greater than the context length/i, /context window exceeds limit/i,
+  /exceeded model token limit/i, /context[_ ]length[_ ]exceeded/i, /request entity too large/i, /context length is only \d+ tokens/i,
+  /input length.*exceeds.*context length/i, /prompt too long; exceeded (?:max )?context length/i,
+  /too large for model with \d+ maximum context length/i, /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
+  /model_context_window_exceeded/i, /too many tokens/i, /token limit exceeded/i,
+]
+const overflowExclusions = [/^(throttling error|service unavailable):/i, /rate limit/i, /too many requests/i]
+export function isContextOverflow(message: string) {
+  return !overflowExclusions.some((pattern) => pattern.test(message)) && overflowPatterns.some((pattern) => pattern.test(message))
+}
+
+// Prompt tokens a provider reported in its overflow error, when it states them.
+export function overflowPromptTokens(message: string) {
+  const match = /(\d[\d,]*) (?:tokens )?(?:in|from) the (?:input )?messages|prompt has (\d[\d,]*) tokens?|input \((\d[\d,]*) tokens\)/i.exec(message)
+  const value = match?.slice(1).find((group) => group !== undefined)
+  return value === undefined ? undefined : Number(value.replaceAll(",", ""))
+}
+
+// A provider error response read once. `response()` rebuilds it unchanged.
+export type ProviderError = { overflow: boolean; text: string; response: () => Response }
+export async function providerError(response: Response): Promise<ProviderError | undefined> {
+  if (![400, 413, 422].includes(response.status)) return undefined
+  const text = await response.text()
+  let message = text
+  try {
+    const value: unknown = JSON.parse(text)
+    const error = record(value) ? value.error ?? value.message : undefined
+    message = typeof error === "string" ? error : record(error) && typeof error.message === "string" ? `${error.message} ${typeof error.code === "string" ? error.code : ""}` : text
+  } catch {}
+  return {
+    // OpenCode also classifies a body-less 400/413 as overflow.
+    overflow: response.status === 413 || response.status === 400 && (!text.trim() || isContextOverflow(message)),
+    text: message,
+    response: () => new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers }),
+  }
+}
+
+// A summary handoff extends the current prefix, so a provider overflow there
+// means the main request would overflow too. The caller prepares again with
+// the overflow applied instead of returning this error.
+export class ContextOverflowError extends Error {
+  constructor(readonly error: ProviderError) { super(`Provider rejected the summary handoff as too long: ${error.text}`) }
+}
+
+// Tool-call markup a template-level tool parser would have extracted. With
+// tool_choice "none" the server may return it as plain text instead.
+const toolCallText = /^<tool_call>|<\/tool_call>$/
+
 // Read one non-streaming summary completion; returns its validated text and the
 // parsed completion so callers can forward usage.
 export type SummaryResult = { content: string; completion: Record<string, unknown> }
@@ -273,7 +333,7 @@ export async function readSummary(response: Response, signal?: AbortSignal): Pro
   }
   const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined
   const message = record(choice) && record(choice.message) ? choice.message : undefined
-  if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)) || message.function_call !== undefined) {
+  if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || toolCallText.test(message.content.trim()) || (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)) || message.function_call !== undefined) {
     throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed")
   }
   return { content: message.content, completion: value as Record<string, unknown> }
@@ -375,10 +435,14 @@ export class RollingCompaction {
     // usage. Count every body field, including tools and response_format.
     const bytesEstimate = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / config.bytesPerToken)
     let correction = 1
+    // After a provider overflow every estimate is scaled so the rejected
+    // request counts as at least the reported size, or just over budget.
+    let overflowScale = 1
     const fallback = (value: unknown) => Math.ceil(bytesEstimate(value) * correction)
-    const estimate = (value: unknown) => context.estimate && record(value) && typeof value.model === "string" && Array.isArray(value.messages)
+    const measured = (value: unknown) => context.estimate && record(value) && typeof value.model === "string" && Array.isArray(value.messages)
       ? context.estimate(value as ChatBody, fallback)
       : fallback(value)
+    const estimate = (value: unknown) => Math.ceil(measured(value) * overflowScale)
     const budget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - context.outputLimit) - config.marginTokens)
     if (budget < 1) throw new Error("Compaction has no input budget after the actual output reserve and margin")
     const trigger = Math.floor(budget * config.triggerRatio)
@@ -417,12 +481,13 @@ export class RollingCompaction {
     // original stored transcript. Include restored suffix reasoning in budget
     // checks, before deciding whether a new compaction boundary is necessary.
     const current = context.restoreReasoning?.(effectiveBody) ?? effectiveBody
+    if (context.overflow) overflowScale = Math.max(1, Math.max(context.overflow.promptTokens ?? 0, budget + 1) / Math.max(1, measured(current)))
     const currentSize = estimate(current)
     if (currentSize <= trigger) return { body: current, report: report(currentSize, false, !!state, 0, archived.size) }
     // A rewrite loses the exact usage anchor. Carry its observed underestimate
     // into this preparation's fallback instead of mistaking a different counter
     // for recovered space. This is a conservative estimate, not tokenizer proof.
-    correction = Math.max(1, currentSize / Math.max(1, bytesEstimate(current)))
+    correction = Math.max(1, measured(current) / Math.max(1, bytesEstimate(current)))
 
     // A recovered assistant may belong to the protected current tool batch.
     // Carry its proven fields into pressure processing as well, while keeping
@@ -545,7 +610,8 @@ export class RollingCompaction {
         ...(body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }),
       })
       let handoff: ChatBody | undefined
-      if (context.prefixHandoff && !constrained) {
+      // An overflowed prefix cannot be extended into a summary request.
+      if (context.prefixHandoff && !constrained && !context.overflow) {
         const selected = [
           ...(plan.previous ? [positions.get(plan.previous.archived[0]!)!] : []),
           ...plan.additions.map((index) => positions.get(index)!),
@@ -553,7 +619,7 @@ export class RollingCompaction {
         const candidate: ChatBody = {
           ...summaryBase,
           // OpenAI-compatible servers (e.g. vLLM) reject tool_choice without tools.
-          ...(current.tools !== undefined ? { tools: current.tools, tool_choice: "auto" } : {}),
+          ...(current.tools !== undefined ? { tools: current.tools, tool_choice: "none" } : {}),
           ...(current.response_format !== undefined ? { response_format: current.response_format } : {}),
           messages: [...current.messages, {
             role: "user",
@@ -587,7 +653,11 @@ export class RollingCompaction {
           await response.body?.cancel(error).catch(() => {})
           throw error
         }
-        if (!response.ok) return { response }
+        if (!response.ok) {
+          const error = await providerError(response)
+          if (handoff && error?.overflow) throw new ContextOverflowError(error)
+          return { response: error ? error.response() : response }
+        }
         let content: string
         try {
           content = (await readSummary(response, context.signal)).content
@@ -597,7 +667,8 @@ export class RollingCompaction {
         }
         active()
         summary = content
-        if (estimate(summary) > summaryCap) throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`)
+        // The server enforces max_tokens; overflow scaling applies to input only.
+        if (measured(summary) > summaryCap) throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`)
         offset += low
         calls++
         prefixHandoff ||= !!handoff
