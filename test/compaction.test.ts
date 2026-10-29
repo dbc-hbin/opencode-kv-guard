@@ -1219,3 +1219,84 @@ describe("rolling semantic compaction", () => {
     }
   })
 })
+
+describe("speculative compaction", () => {
+  // The fixture estimates 1 token per byte; pick a window that puts the
+  // request inside the speculation band, just below the trigger.
+  function banded(body: ChatBody, overrides: Partial<CompactionContext> = {}) {
+    const size = bytes(body)
+    // trigger = floor((window - output) * 0.85); place size at 95% of it.
+    const window = Math.ceil(size / 0.95 / 0.85) + 500
+    return { contextWindow: window, outputLimit: 500, currentUser: body.messages.at(-1), speculate: true, ...overrides }
+  }
+
+  test("a request in the band below the trigger reports speculate and compacts nothing", async () => {
+    const body = history(6, 220)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const result = await compaction.prepare(body, context(async () => { throw new Error("Unexpected summary") }, banded(body)))
+    expect("report" in result && result.report?.compacted).toBe(false)
+    expect("report" in result && result.report?.speculate).toBe(true)
+    const quiet = await compaction.prepare(body, context(async () => { throw new Error("Unexpected summary") }, { ...banded(body), speculate: false }))
+    expect("report" in quiet && quiet.report?.speculate).toBeUndefined()
+  })
+
+  test("a staged speculation is adopted once the trigger is crossed, without another summary", async () => {
+    const body = history(6, 220)
+    const limits = banded(body)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    expect("report" in await compaction.prepare(body, context(async () => success(), limits)) ? true : false).toBe(true)
+    let summaries = 0
+    let finish!: () => void
+    const released = new Promise<void>((resolve) => { finish = resolve })
+    compaction.speculate(body, context(async () => { summaries++; await released; return success("speculative-summary") }, limits))
+    finish()
+    // Grown history crosses the trigger; the next prepare must adopt the
+    // staged checkpoint and send no summary of its own.
+    const grown = { ...body, messages: [...body.messages.slice(0, -1), { role: "assistant", content: "tool step " + "t".repeat(900) }, { role: "user", content: "next" }] }
+    const next = await compaction.prepare(grown, context(async () => { throw new Error("Adoption must not resummarize") }, { ...limits, currentUser: grown.messages.at(-1) }))
+    expect(summaries).toBeGreaterThan(0)
+    expect("report" in next && next.report?.speculative).toBe(true)
+    expect(JSON.stringify(forwarded(next).messages)).toContain("speculative-summary")
+    expect(forwarded(next).messages).toContain(grown.messages.at(-1)!)
+  })
+
+  test("a speculation is discarded when history no longer extends it", async () => {
+    const body = history(6, 220)
+    const limits = banded(body)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    await compaction.prepare(body, context(async () => success(), limits))
+    compaction.speculate(body, context(async () => success("stale-summary"), limits))
+    // A revert rewrote an early message: the staged fingerprint must not match.
+    const rewritten = structuredClone(body)
+    rewritten.messages[1] = { role: "user", content: "rewritten " + "r".repeat(900) }
+    rewritten.messages.push({ role: "assistant", content: "x".repeat(900) }, { role: "user", content: "after revert" })
+    let fresh = 0
+    const next = await compaction.prepare(rewritten, context(async () => { fresh++; return success("fresh-summary") }, { ...limits, currentUser: rewritten.messages.at(-1) }))
+    expect(fresh).toBeGreaterThan(0)
+    expect(JSON.stringify(forwarded(next).messages)).not.toContain("stale-summary")
+    expect("report" in next && next.report?.speculative).toBeUndefined()
+  })
+
+  test("a failed or cancelled speculation commits nothing and leaves the next compaction intact", async () => {
+    const body = history(6, 220)
+    const limits = banded(body)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    await compaction.prepare(body, context(async () => success(), limits))
+    compaction.speculate(body, context(async () => Response.json({ error: { message: "upstream" } }, { status: 500 }), limits))
+    const before = compaction.snapshot("session")
+    const grown = { ...body, messages: [...body.messages.slice(0, -1), { role: "assistant", content: "t".repeat(900) }, { role: "user", content: "next" }] }
+    const next = await compaction.prepare(grown, context(async () => success("normal-summary"), { ...limits, currentUser: grown.messages.at(-1) }))
+    expect(before.lanes).toEqual([])
+    expect(JSON.stringify(forwarded(next).messages)).toContain("normal-summary")
+
+    const cancelled = new RollingCompaction({ bytesPerToken: 1 })
+    await cancelled.prepare(body, context(async () => success(), limits))
+    let aborted = false
+    cancelled.speculate(body, context(async (_request, signal) => new Promise<Response>((_resolve, reject) => {
+      signal?.addEventListener("abort", () => { aborted = true; reject(signal.reason) }, { once: true })
+    }), limits))
+    cancelled.delete("session")
+    expect(aborted).toBe(true)
+    expect(cancelled.snapshot("session").lanes).toEqual([])
+  })
+})

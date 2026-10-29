@@ -26,14 +26,22 @@ export type CompactionContext = {
   // The provider rejected this history as too long. Compaction treats the
   // request as over budget, scaled to the reported prompt size when known.
   overflow?: { promptTokens?: number }
-  completeSummary: (body: ChatBody) => Promise<Response>
+  // Report `speculate` when the request is in the band just below the
+  // trigger, so the caller can start speculative compaction afterwards.
+  speculate?: boolean
+  // Compact now even below the trigger (speculative runs only).
+  force?: boolean
+  completeSummary: (body: ChatBody, signal?: AbortSignal) => Promise<Response>
 }
 export type CompactionResult = { body: ChatBody; report?: Record<string, number | boolean> } | { response: Response }
 type Options = Required<Omit<Exclude<CompactionOptions, false>, "summaryOutputTokens">> & { summaryOutputTokens?: number }
 type Reduction = { index: number; kind: "reasoning" } | { index: number; kind: "read"; proof: number }
 type Segment = { summary: string; archived: number[] }
 type State = { segments: Segment[]; covered: number; fingerprint: string; signature: string; reductions?: Reduction[] }
-type Lane = { session: string; tail: Promise<void>; state?: State }
+// A background compaction prepared before the trigger is crossed. `base` is
+// the committed state it extends; `staged` is set only once it succeeded.
+type Speculation = { base: string; abort: AbortController; promise: Promise<void>; staged?: State }
+type Lane = { session: string; tail: Promise<void>; state?: State; speculation?: Speculation }
 type Group = { start: number; end: number; plain: boolean }
 export type CompactionSnapshot = { lanes: { key: string; state: State }[] }
 
@@ -424,7 +432,35 @@ export class RollingCompaction {
     return abortable(pending, context.signal)
   }
 
-  private async compact(body: ChatBody, context: CompactionContext, lane: Lane, active: () => void): Promise<CompactionResult> {
+  // Start compacting `body` in the background, as if it had crossed the
+  // trigger, without committing. A later prepare that does cross the trigger
+  // adopts the result when the committed state and history still match it.
+  speculate(body: ChatBody, context: CompactionContext) {
+    if (this.options === false) return
+    const key = hash(JSON.stringify([context.session, context.lane, body.model]))
+    const lane = this.lanes.get(key)
+    if (!lane || lane.speculation) return
+    const abort = new AbortController()
+    const signal = context.signal ? AbortSignal.any([context.signal, abort.signal]) : abort.signal
+    const base = JSON.stringify(lane.state ?? null)
+    const scratch: Lane = { session: lane.session, tail: Promise.resolve(), state: lane.state && structuredClone(lane.state) }
+    const entry: Speculation = { base, abort, promise: Promise.resolve() }
+    const active = () => {
+      signal.throwIfAborted()
+      if (this.lanes.get(key) !== lane || lane.speculation !== entry) throw new Error("Speculative compaction was superseded")
+    }
+    lane.speculation = entry
+    entry.promise = (async () => {
+      try {
+        const result = await this.compact(body, { ...context, signal, force: true, speculate: false }, scratch, active)
+        active()
+        if ("body" in result && result.report?.compacted && scratch.state && JSON.stringify(lane.state ?? null) === base) entry.staged = scratch.state
+      } catch {}
+      if (!entry.staged && lane.speculation === entry) lane.speculation = undefined
+    })()
+  }
+
+  private async compact(body: ChatBody, context: CompactionContext, lane: Lane, active: () => void, adopted = false): Promise<CompactionResult> {
     const config = this.options
     if (config === false) return { body }
     for (const [name, value] of [["contextWindow", context.contextWindow], ["outputLimit", context.outputLimit], ["inputLimit", context.inputLimit]] as const) {
@@ -483,7 +519,35 @@ export class RollingCompaction {
     const current = context.restoreReasoning?.(effectiveBody) ?? effectiveBody
     if (context.overflow) overflowScale = Math.max(1, Math.max(context.overflow.promptTokens ?? 0, budget + 1) / Math.max(1, measured(current)))
     const currentSize = estimate(current)
-    if (currentSize <= trigger) return { body: current, report: report(currentSize, false, !!state, 0, archived.size) }
+    if (currentSize <= trigger && !context.force) {
+      // An unfinished background summary keeps running. It extends this
+      // request's cached prefix, so with one endpoint slot this request waits
+      // only for its decode, and the result is ready when the trigger is hit.
+      const lead = Math.min(Math.max(Math.floor(trigger * 0.125), 1), trigger - target)
+      const speculate = context.speculate === true && currentSize >= trigger - lead
+      return { body: current, report: { ...report(currentSize, false, !!state, 0, archived.size), ...(speculate ? { speculate: true } : {}) } }
+    }
+    const speculation = lane.speculation
+    if (speculation && context.overflow) {
+      speculation.abort.abort(new Error("Speculative compaction was superseded by overflow recovery"))
+      lane.speculation = undefined
+    } else if (speculation && !adopted) {
+      // Wait while it is still current, then detach it: a cleared entry
+      // makes an unfinished run stop at its next check.
+      await abortable(speculation.promise, context.signal)
+      if (lane.speculation === speculation) lane.speculation = undefined
+      active()
+      if (speculation.staged && speculation.base === JSON.stringify(lane.state ?? null)) {
+        const committed = lane.state
+        lane.state = speculation.staged
+        if (this.retained(body, context).state) {
+          const result = await this.compact(body, context, lane, active, true)
+          if ("body" in result) return { body: result.body, report: { ...result.report, compacted: true, speculative: true } }
+          return result
+        }
+        lane.state = committed
+      }
+    }
     // A rewrite loses the exact usage anchor. Carry its observed underestimate
     // into this preparation's fallback instead of mistaking a different counter
     // for recovered space. This is a conservative estimate, not tokenizer proof.
@@ -648,7 +712,7 @@ export class RollingCompaction {
         if (low && offset + low < transcript.length && /[\uD800-\uDBFF]/.test(transcript[offset + low - 1]!)) low--
         if (!low) throw new Error(`Compaction summarizer has no room for the next transcript fragment within input budget ${summaryBudget}; reduce fixed overhead or summaryOutputTokens`)
         const summaryBody = handoff ?? request(transcript.slice(offset, offset + low))
-        const response = await context.completeSummary(summaryBody)
+        const response = await context.completeSummary(summaryBody, context.signal)
         try { active() } catch (error) {
           await response.body?.cancel(error).catch(() => {})
           throw error
@@ -702,8 +766,14 @@ export class RollingCompaction {
   }
 
   delete(session: string) {
-    for (const [key, lane] of this.lanes) if (lane.session === session) this.lanes.delete(key)
+    for (const [key, lane] of this.lanes) if (lane.session === session) {
+      lane.speculation?.abort.abort(new Error("Compaction session was deleted"))
+      this.lanes.delete(key)
+    }
   }
 
-  clear() { this.lanes.clear() }
+  clear() {
+    for (const lane of this.lanes.values()) lane.speculation?.abort.abort(new Error("Compaction state was cleared"))
+    this.lanes.clear()
+  }
 }

@@ -1160,7 +1160,36 @@ class RollingCompaction {
     entry.tail = pending.then(() => {}, () => {});
     return abortable(pending, context.signal);
   }
-  async compact(body, context, lane, active) {
+  speculate(body, context) {
+    if (this.options === false)
+      return;
+    const key = digest(JSON.stringify([context.session, context.lane, body.model]));
+    const lane = this.lanes.get(key);
+    if (!lane || lane.speculation)
+      return;
+    const abort = new AbortController;
+    const signal = context.signal ? AbortSignal.any([context.signal, abort.signal]) : abort.signal;
+    const base = JSON.stringify(lane.state ?? null);
+    const scratch = { session: lane.session, tail: Promise.resolve(), state: lane.state && structuredClone(lane.state) };
+    const entry = { base, abort, promise: Promise.resolve() };
+    const active = () => {
+      signal.throwIfAborted();
+      if (this.lanes.get(key) !== lane || lane.speculation !== entry)
+        throw new Error("Speculative compaction was superseded");
+    };
+    lane.speculation = entry;
+    entry.promise = (async () => {
+      try {
+        const result = await this.compact(body, { ...context, signal, force: true, speculate: false }, scratch, active);
+        active();
+        if ("body" in result && result.report?.compacted && scratch.state && JSON.stringify(lane.state ?? null) === base)
+          entry.staged = scratch.state;
+      } catch {}
+      if (!entry.staged && lane.speculation === entry)
+        lane.speculation = undefined;
+    })();
+  }
+  async compact(body, context, lane, active, adopted = false) {
     const config = this.options;
     if (config === false)
       return { body };
@@ -1222,8 +1251,32 @@ class RollingCompaction {
     if (context.overflow)
       overflowScale = Math.max(1, Math.max(context.overflow.promptTokens ?? 0, budget + 1) / Math.max(1, measured(current)));
     const currentSize = estimate(current);
-    if (currentSize <= trigger)
-      return { body: current, report: report(currentSize, false, !!state, 0, archived.size) };
+    if (currentSize <= trigger && !context.force) {
+      const lead = Math.min(Math.max(Math.floor(trigger * 0.125), 1), trigger - target);
+      const speculate = context.speculate === true && currentSize >= trigger - lead;
+      return { body: current, report: { ...report(currentSize, false, !!state, 0, archived.size), ...speculate ? { speculate: true } : {} } };
+    }
+    const speculation = lane.speculation;
+    if (speculation && context.overflow) {
+      speculation.abort.abort(new Error("Speculative compaction was superseded by overflow recovery"));
+      lane.speculation = undefined;
+    } else if (speculation && !adopted) {
+      await abortable(speculation.promise, context.signal);
+      if (lane.speculation === speculation)
+        lane.speculation = undefined;
+      active();
+      if (speculation.staged && speculation.base === JSON.stringify(lane.state ?? null)) {
+        const committed = lane.state;
+        lane.state = speculation.staged;
+        if (this.retained(body, context).state) {
+          const result = await this.compact(body, context, lane, active, true);
+          if ("body" in result)
+            return { body: result.body, report: { ...result.report, compacted: true, speculative: true } };
+          return result;
+        }
+        lane.state = committed;
+      }
+    }
     correction = Math.max(1, measured(current) / Math.max(1, bytesEstimate(current)));
     let workingSource = source;
     if (current !== effectiveBody) {
@@ -1388,7 +1441,7 @@ Produce the historical checkpoint using only the messages at these zero-based po
         if (!low)
           throw new Error(`Compaction summarizer has no room for the next transcript fragment within input budget ${summaryBudget}; reduce fixed overhead or summaryOutputTokens`);
         const summaryBody = handoff ?? request(transcript.slice(offset, offset + low));
-        const response = await context.completeSummary(summaryBody);
+        const response = await context.completeSummary(summaryBody, context.signal);
         try {
           active();
         } catch (error) {
@@ -1449,10 +1502,14 @@ Produce the historical checkpoint using only the messages at these zero-based po
   }
   delete(session) {
     for (const [key, lane] of this.lanes)
-      if (lane.session === session)
+      if (lane.session === session) {
+        lane.speculation?.abort.abort(new Error("Compaction session was deleted"));
         this.lanes.delete(key);
+      }
   }
   clear() {
+    for (const lane of this.lanes.values())
+      lane.speculation?.abort.abort(new Error("Compaction state was cleared"));
     this.lanes.clear();
   }
 }
@@ -2989,7 +3046,7 @@ var nativeConversationEnd = `
 
 `;
 var plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated"];
+  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated", "speculativeCompaction"];
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key))
       throw new Error(`KV guard: unknown option ${key}`);
@@ -3007,7 +3064,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
     throw new Error("KV guard: maxOutputTokens must be a positive integer");
   }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated"]) {
+  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated", "speculativeCompaction"]) {
     if (options[key] !== undefined && typeof options[key] !== "boolean")
       throw new Error(`KV guard: ${key} must be boolean`);
   }
@@ -3058,7 +3115,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
         return run();
       },
       finished(report) {
-        if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0)
+        if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0 || report?.speculative === true)
           show("Session compacted", "success");
       }
     };
@@ -3328,12 +3385,12 @@ The previous response stopped at the output token limit before finishing. Contin
               await log("Skill catalog compression", { ...compacted.report });
           }
           let replayReceipt;
-          const sendSummary = async (outgoing) => {
+          const sendSummary = async (outgoing, summarySignal = signal) => {
             if (outgoing.tool_choice !== "none")
-              return send(outgoing, "summary");
+              return send(outgoing, "summary", summarySignal);
             if (toolChoiceNoneRejected.has(target.id))
-              return send({ ...outgoing, tool_choice: "auto" }, "summary");
-            const response = await send(outgoing, "summary");
+              return send({ ...outgoing, tool_choice: "auto" }, "summary", summarySignal);
+            const response = await send(outgoing, "summary", summarySignal);
             if (response.ok)
               return response;
             const error = await providerError(response);
@@ -3343,9 +3400,10 @@ The previous response stopped at the output token limit before finishing. Contin
               return error.response();
             toolChoiceNoneRejected.add(target.id);
             await log("Summary tool_choice none was rejected; using auto", { status: response.status });
-            return send({ ...outgoing, tool_choice: "auto" }, "summary");
+            return send({ ...outgoing, tool_choice: "auto" }, "summary", summarySignal);
           };
-          const send = async (outgoing, label) => {
+          let afterMain;
+          const send = async (outgoing, label, requestSignal = signal) => {
             const requestLane = label === "summary" ? `${lane}:summary` : lane;
             const ticket = usage.begin(outgoing, requestLane);
             let admissionWaitMs = 0;
@@ -3358,13 +3416,13 @@ The previous response stopped at the output token limit before finishing. Contin
                 return release;
               }
             };
-            const response = await admittedFetch(target.fetch, gate, input, { ...init, headers, body: JSON.stringify(outgoing), signal });
+            const response = await admittedFetch(target.fetch, gate, input, { ...init, headers, body: JSON.stringify(outgoing), signal: requestSignal });
             return observeResponse(response, {
               body: outgoing,
               lane: requestLane,
               tracker: usage,
               request: ticket,
-              signal,
+              signal: requestSignal,
               label,
               transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
               onAssistant: session && agent && label === "main" && (options.prefixGuard !== false || manualHandoff && !internalAgents.includes(agent)) ? (assistant) => {
@@ -3374,7 +3432,11 @@ The previous response stopped at the output token limit before finishing. Contin
                   return;
                 checkpoint(session, () => prefixGuard.record(outgoing, assistant, { session, lane, outcome: "success", finishReason: assistant.tool_calls ? "tool_calls" : "stop", receipt: replayReceipt }), true).catch(() => log("Response replay checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}));
               } : undefined,
-              onReport: (report) => log("Request usage and lifecycle", { ...report, admissionWaitMs, upstreamHeaderMs: Math.max(0, report.headerMs - admissionWaitMs) })
+              onReport: (report) => {
+                if (label === "main" && report.outcome === "complete")
+                  afterMain?.();
+                return log("Request usage and lifecycle", { ...report, admissionWaitMs, upstreamHeaderMs: Math.max(0, report.headerMs - admissionWaitMs) });
+              }
             });
           };
           const manualCompaction = async (sessionID) => {
@@ -3516,7 +3578,7 @@ ${instructions}`
               if (typeof output !== "number")
                 throw new Error("KV guard: an actual completion token limit is required");
               const notice = compactionNotice(session);
-              const prepared = await compaction.prepare(body, {
+              const compactionContext = {
                 session,
                 lane,
                 contextWindow: limits.context,
@@ -3529,11 +3591,26 @@ ${instructions}`
                 restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
                 overflow,
+                speculate: options.speculativeCompaction === true && allowSummary,
                 completeSummary: (summary) => notice.summary(() => sendSummary(summary))
-              });
+              };
+              const history = body;
+              const prepared = await compaction.prepare(body, compactionContext);
               if ("response" in prepared)
                 return prepared.response;
               notice.finished(prepared.report);
+              if (prepared.report?.speculate) {
+                afterMain = () => {
+                  afterMain = undefined;
+                  compaction.speculate(history, {
+                    ...compactionContext,
+                    signal: disposed.signal,
+                    overflow: undefined,
+                    completeSummary: (summary, summarySignal) => sendSummary(summary, summarySignal)
+                  });
+                  log("Speculative compaction started", { estimated: prepared.report?.estimatedAfter ?? null });
+                };
+              }
               body = prepared.body;
               if (prepared.report)
                 await log("Preflight budget (usage-anchored when available; otherwise estimated)", prepared.report);

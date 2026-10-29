@@ -12,7 +12,8 @@
     "smoke": "bun run scripts/smoke.ts",
     "smoke:compaction": "bun run scripts/compaction-smoke.ts",
     "smoke:manual-compaction": "bun run scripts/manual-compaction-smoke.ts",
-    "smoke:recovery": "bun run scripts/recovery-smoke.ts"
+    "smoke:recovery": "bun run scripts/recovery-smoke.ts",
+    "smoke:speculative": "bun run scripts/speculative-compaction-smoke.ts"
   },
   "devDependencies": {
     "@ai-sdk/openai-compatible": "2.0.41",
