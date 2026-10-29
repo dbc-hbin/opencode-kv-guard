@@ -33,6 +33,18 @@ The selected providers must explicitly have `npm: "@ai-sdk/openai-compatible"` a
 
 `agent.title.disable` is OpenCode's native setting. It removes the extra title inference entirely; the session keeps its default/manual title. If you want model-generated titles, omit that setting: the plugin still serializes their inference with the main request on the same endpoint. An explicitly configured title model on another endpoint is outside that endpoint's gate.
 
+### Cache hit-rate sidebar
+
+OpenCode stores each response's reported cached prompt tokens but does not show a hit rate. Copy `dist/opencode-kv-guard-tui.tsx` beside the bundle and add it to `tui.json` (a separate file from `opencode.json`; OpenCode loads server and TUI plugins separately):
+
+```json
+{
+  "plugin": ["file:///absolute/path/to/opencode-kv-guard-tui.tsx"]
+}
+```
+
+The session sidebar then shows a **Cache** block below Context: the last request's rate, the session rate and the cached/total prompt tokens. The rate is `cache.read / (input + cache.read + cache.write)` over assistant messages, using the server's `prompt_tokens_details.cached_tokens`. It is independent of the server plugin and works for any provider. Keep the file as `.tsx` outside `node_modules`: OpenCode compiles TUI plugin JSX against its own Solid runtime only there. A server that does not report cached tokens shows 0%; enable SGLang `--enable-cache-report` or vLLM `--enable-prompt-tokens-details`, and make sure the proxy forwards the field. The sidebar appears automatically when the terminal is wider than 120 columns, or through the sidebar toggle.
+
 ## Implemented behavior
 
 - **Short builtin prompt.** Recognizes all 11 exact provider prompt outputs in 1.19.4 using source-derived SHA-256 and lengths. Replaces only that initial builtin text with a concise 1,887-character coding prompt. Appended project, MCP, skill, environment and user instructions remain; unknown/custom agent prompts are not replaced. Provider-specific personality, lengthy examples and repetitive workflow prose become a shared concise workflow.
