@@ -47,7 +47,7 @@ function preview(text: string, path: string, limits: Options): string | undefine
 }
 
 export class ToolOutputShrinker {
-  private readonly limits: Options | false
+  readonly limits: Readonly<Options> | false
   private readonly directory: string
 
   // dataDirectory is the XDG data base, not the plugin's checkpoint directory.

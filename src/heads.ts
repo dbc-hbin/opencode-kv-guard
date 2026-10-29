@@ -34,12 +34,18 @@ function tools(value: unknown): HeadTool[] | null | false {
   })) as HeadTool[]
 }
 
-function chain(messages: WireMessage[]) {
+function chain(messages: WireMessage[], prior?: string[], replacements?: ReadonlyMap<WireMessage, WireMessage>) {
   let previous = hash([])
-  return messages.map((message) => previous = hash([previous, message]))
+  return messages.map((message, index) => {
+    const source = hash([previous, message])
+    const replacement = replacements?.get(message)
+    const repaired = replacement && hash([previous, replacement])
+    previous = repaired && source !== prior?.[index] && repaired === prior?.[index] ? repaired : source
+    return previous
+  })
 }
 
-export type HeadContext = { session: string; lane: string; currentUser?: WireMessage; parentSession?: string; parentLane?: string }
+export type HeadContext = { session: string; lane: string; currentUser?: WireMessage; parentSession?: string; parentLane?: string; reconstruct?: boolean; replacements?: ReadonlyMap<WireMessage, WireMessage> }
 export type HeadResetReason = "tools-added" | "tools-removed" | "tools-replaced" | "tools-schema-changed" | "tools-availability-changed" | "system-contract-changed" | "unanchored-system-addition" | "history-edited" | "history-reverted"
 export type HeadReport = {
   status: "initialized" | "stable" | "appended" | "reset" | "unsupported"
@@ -92,15 +98,16 @@ export class SessionHeads {
     const id = key(context.session, context.lane, body.model)
     const normalizedTools = tools(body.tools)
     if (normalizedTools === false) {
-      this.lanes.delete(id)
+      if (!context.reconstruct) this.lanes.delete(id)
       return { body, report: { status: "unsupported", reason: "unsupported-tools", notices: 0 } }
     }
     let count = 0
     while (count < body.messages.length && instruction(body.messages[count]!)) count++
     const system = body.messages.slice(0, count)
     const conversation = body.messages.slice(count)
-    const anchors = chain(conversation)
     const previous = this.lanes.get(id)?.state
+    const sourceAnchors = chain(conversation)
+    const anchors = chain(conversation, previous?.chain, context.replacements)
     let state: HeadLane
     const report: HeadReport = { status: previous ? "stable" : "initialized", notices: 0 }
     const fresh = (): HeadLane => ({ lane: context.lane, model: body.model, system: structuredClone(system), tools: structuredClone(normalizedTools), chain: anchors, notices: [] })
@@ -124,7 +131,8 @@ export class SessionHeads {
       let shared = 0
       while (shared < previous.chain.length && previous.chain[shared] === anchors[shared]) shared++
       let reason = toolReset(previous.tools, normalizedTools)
-      if (!reason && shared < previous.chain.length) reason = shared === anchors.length ? "history-reverted" : "history-edited"
+      if (!reason && shared < previous.chain.length && !context.reconstruct) reason = shared === anchors.length ? "history-reverted" : "history-edited"
+      if (!reason && context.reconstruct && anchors.length < previous.chain.length) reason = "history-reverted"
       const compatible = system.length >= effective.length && effective.every((message, index) => equal(message, system[index]))
       if (!reason && !compatible) reason = "system-contract-changed"
       // Moving an instruction across another original instruction can change
@@ -137,6 +145,11 @@ export class SessionHeads {
         report.reason = reason
       } else {
         state = structuredClone(previous)
+        if (context.reconstruct) {
+          state.notices = state.notices.map((notice) => ({
+            ...notice, anchor: anchors[previous.chain.indexOf(notice.anchor)]!,
+          }))
+        }
         state.chain = anchors
         if (system.length > effective.length) {
           state.notices.push({ anchor: anchors.at(-1)!, system: structuredClone(system.slice(effective.length)) })
@@ -144,12 +157,16 @@ export class SessionHeads {
         }
       }
     }
-    this.lanes.set(id, { session: context.session, state })
+    // Once continuity is proven, retain the actual source basis. Later pressure
+    // reductions may retire the wire proof that authenticated a missing field.
+    state.notices = state.notices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)]! }))
+    state.chain = sourceAnchors
+    if (!context.reconstruct) this.lanes.set(id, { session: context.session, state })
     report.notices = state.notices.reduce((total, notice) => total + notice.system.length, 0)
     const messages = [...structuredClone(state.system)]
     for (let index = 0; index < conversation.length; index++) {
       messages.push(conversation[index]!)
-      for (const notice of state.notices) if (notice.anchor === anchors[index]) messages.push(...structuredClone(notice.system))
+      for (const notice of state.notices) if (notice.anchor === sourceAnchors[index]) messages.push(...structuredClone(notice.system))
     }
     const result: ChatBody = { ...body, messages }
     if (state.tools !== null) result.tools = structuredClone(state.tools)

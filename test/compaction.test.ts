@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { RollingCompaction, isCompactionSnapshot, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
 import { Environments, type WireMessage } from "../src/prefix"
+import { UsageTracker } from "../src/usage"
 
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8")
 
@@ -72,6 +73,32 @@ function repeatedReads(): ChatBody {
 }
 
 describe("staged pressure reductions", () => {
+  test("removing tiny measured reasoning cannot masquerade as a large token reduction", async () => {
+    const original: ChatBody = {
+      model: "fixture", max_tokens: 1000, stream: true,
+      messages: [
+        { role: "system", content: "Policy" },
+        { role: "user", content: "0123456789abcdef".repeat(1125) },
+        { role: "assistant", content: "Earlier answer", reasoning_content: "x" },
+        { role: "user", content: "Second question" },
+      ],
+    }
+    const tracker = new UsageTracker()
+    tracker.record(tracker.begin(original, "budget"), original, "budget", 8000)
+    const current = { role: "user", content: "Continue" }
+    const next = { ...original, messages: [...original.messages, { role: "assistant", content: "Done" }, current] }
+    let calls = 0
+    const result = await new RollingCompaction().prepare(next, {
+      session: "budget", lane: "budget", contextWindow: 10000, outputLimit: 1000, currentUser: current,
+      estimate: (candidate, fallback) => tracker.estimate(candidate, "budget", fallback),
+      completeSummary: async () => { calls++; return success("Retained goals") },
+    })
+    expect(calls).toBeGreaterThan(0)
+    expect(forwarded(result).messages).toContain(current)
+    expect("report" in result && result.report?.compacted).toBe(true)
+    expect(forwarded(result).messages.some((message) => message.content === original.messages[1]!.content)).toBe(false)
+  })
+
   test("recovered reasoning in the current tool batch remains protected under pressure", async () => {
     const original = history()
     const currentUser = original.messages.at(-1)!
@@ -122,8 +149,7 @@ describe("staged pressure reductions", () => {
     const first = forwarded(await compaction.prepare(original, context(async () => { throw new Error("Unexpected summary") })))
     const snapshot = compaction.snapshot("session")
     expect(isCompactionSnapshot(snapshot)).toBe(true)
-    expect(snapshot.lanes[0]!.state.archived).toEqual([])
-    expect(snapshot.lanes[0]!.state.summary).toBe("")
+    expect(snapshot.lanes[0]!.state.segments).toEqual([])
     const restored = new RollingCompaction({ bytesPerToken: 1 })
     expect(await restored.restore("session", snapshot)).toBe(true)
     const extension = { ...original, messages: [...original.messages, { role: "assistant", content: "Done", reasoning_content: "newly historical, not yet reduced" }, { role: "user", content: "Continue" }] }
@@ -396,6 +422,283 @@ describe("prefix-sharing summary handoff", () => {
     expect(await cancelled.promise).toBeInstanceOf(Error)
     expect(compaction.snapshot("session")).toEqual({ lanes: [] })
   }, 5000)
+})
+
+describe("policy-local summary segments", () => {
+  function fixture(size = 1600): ChatBody {
+    const original = history(0)
+    original.messages.splice(1, 0,
+      { role: "user", content: "first-user:" + "a".repeat(size) },
+      { role: "assistant", content: "first-answer:" + "b".repeat(size) },
+      { role: "developer", content: "Policy for the second interval" },
+      { role: "user", content: "second-user:" + "c".repeat(size) },
+      { role: "assistant", content: "second-answer:" + "d".repeat(size) },
+    )
+    return original
+  }
+
+  test("pressure can archive history after later system and developer policies", async () => {
+    for (const role of ["system", "developer"]) {
+      const original = history(0)
+      const policy = { role, content: "SessionHeads policy notice" }
+      original.messages.splice(1, 0,
+        { role: "user", content: "Small earlier question" },
+        { role: "assistant", content: "Small earlier answer" },
+        policy,
+        ...history(4, 600, "later").messages.slice(1, -1),
+      )
+      const current = original.messages.at(-1)!
+      const newest = batch(19, 20)
+      original.messages.push(...newest)
+      const requests: ChatBody[] = []
+      const result = await new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 }).prepare(original, context(async (body) => {
+        requests.push(body)
+        return success("later-summary")
+      }, { currentUser: current }))
+      const body = forwarded(result)
+      expect(archived(requests).every((entry) => entry.source_index > original.messages.indexOf(policy))).toBe(true)
+      expect(body.messages).toContain(policy)
+      expect(body.messages).toContain(current)
+      for (const message of newest) expect(body.messages).toContain(message)
+      expect(body.messages.indexOf(policy)).toBeLessThan(body.messages.findIndex((message) => !original.messages.includes(message)))
+      expect(bytes(body)).toBeLessThanOrEqual("report" in result ? Number(result.report?.target) : 0)
+    }
+  })
+
+  test("two intervals fold independently with one output reserve each", async () => {
+    const original = fixture()
+    const opaque: WireMessage = { role: "assistant", content: "opaque", signature: "signed" }
+    original.messages.splice(2, 0, opaque)
+    const policy = original.messages[4]!
+    const requests: ChatBody[] = []
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const result = await compaction.prepare(original, context(async (body) => {
+      requests.push(body)
+      return success(`independent-${requests.length}`)
+    }))
+    expect(requests).toHaveLength(2)
+    for (const request of requests) {
+      expect(payload(request).previous_summary).toBeNull()
+      expect(payload(request).fragment_offset).toBe(0)
+      expect(payload(request).total_length).toBe(payload(request).archived_text.length)
+    }
+    expect(archived([requests[0]!]).every((entry) => entry.source_index < original.messages.indexOf(policy))).toBe(true)
+    expect(archived([requests[1]!]).every((entry) => entry.source_index > original.messages.indexOf(policy))).toBe(true)
+    const snapshot = compaction.snapshot("session")
+    const segments = snapshot.lanes[0]!.state.segments
+    expect(segments.map((segment) => segment.summary)).toEqual(["independent-1", "independent-2"])
+    const planning = forwarded(result)
+    const wrappers = planning.messages.filter((message) => !original.messages.includes(message))
+    expect(wrappers).toHaveLength(2)
+    expect(planning.messages).toContain(opaque)
+    expect(planning.messages).toContain(original.messages.at(-1)!)
+    expect(planning.messages.indexOf(wrappers[0]!)).toBeLessThan(planning.messages.indexOf(policy))
+    expect(planning.messages.indexOf(wrappers[1]!)).toBeGreaterThan(planning.messages.indexOf(policy))
+    const reserved = { ...planning, messages: planning.messages.map((message) => wrappers.includes(message) ? { ...message, content: (message.content as string).slice(0, -(segments[wrappers.indexOf(message)]!.summary.length)) } : message) }
+    expect(bytes(reserved) + 200).toBeLessThanOrEqual("report" in result ? Number(result.report?.target) : 0)
+    expect(isCompactionSnapshot(snapshot)).toBe(true)
+  })
+
+  test("appended policy preserves frozen segments on restart and pure reconstruction", async () => {
+    const original = fixture()
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    let calls = 0
+    const first = forwarded(await compaction.prepare(original, context(async () => success(`frozen-${++calls}`))))
+    const snapshot = compaction.snapshot("session")
+    expect(snapshot.lanes[0]!.state.segments).toHaveLength(2)
+    const restored = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    expect(await restored.restore("session", snapshot)).toBe(true)
+    const policy = { role: "system", content: "Appended policy outside prior coverage" }
+    const current = { role: "user", content: "Continue under the appended policy" }
+    const extension = [policy, { role: "assistant", content: "Ready" }, current]
+    const next = { ...original, messages: [...original.messages, ...extension] }
+    const expected = { ...next, messages: [...first.messages, ...extension] }
+    const replay = restored.reconstruct(next, { session: "session", lane: "provider/endpoint/build", currentUser: current })
+    expect(replay).toEqual(expected)
+    expect(replay.messages.at(-1)).toBe(current)
+    expect(replay.messages).toContain(policy)
+    expect(restored.snapshot("session")).toEqual(snapshot)
+    const prepared = forwarded(await restored.prepare(next, context(async () => { throw new Error("Unexpected inference") }, { contextWindow: 50000, currentUser: current })))
+    expect(prepared).toEqual(expected)
+    expect(restored.snapshot("session")).toEqual(snapshot)
+    const edited = structuredClone(next)
+    edited.messages[3]!.content = "Edited covered policy"
+    expect(restored.reconstruct(edited, { session: "session", lane: "provider/endpoint/build" })).toBe(edited)
+    expect(restored.snapshot("session")).toEqual(snapshot)
+  })
+
+  test("tiny earlier intervals do not consume reserves needed by a later interval", async () => {
+    const original = history(0)
+    const small: WireMessage[] = []
+    for (let index = 0; index < 10; index++) small.push(
+      { role: "user", content: `tiny-${index}` },
+      { role: "assistant", content: "ok" },
+      { role: index % 2 ? "system" : "developer", content: `policy-${index}` },
+    )
+    original.messages.splice(1, 0, ...small, ...history(5, 800, "profitable").messages.slice(1, -1))
+    const requests: ChatBody[] = []
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const result = await compaction.prepare(original, context(async (body) => { requests.push(body); return success("profitable") }))
+    expect(archived(requests).every((entry) => entry.source_index > small.length)).toBe(true)
+    for (const message of small) expect(forwarded(result).messages).toContain(message)
+    expect(compaction.snapshot("session").lanes[0]!.state.segments).toHaveLength(1)
+    expect(bytes(forwarded(result))).toBeLessThanOrEqual("report" in result ? Number(result.report?.target) : 0)
+  })
+
+  test("handoffs share one frozen prefix and select only their own collapsed summary", async () => {
+    const original = fixture()
+    delete original.response_format
+    original.max_tokens = 4000
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    const requests: ChatBody[] = []
+    const first = forwarded(await compaction.prepare(original, context(async (body) => {
+      requests.push(body)
+      return success(`handoff-${requests.length}`)
+    }, { prefixHandoff: true, outputLimit: 4000, contextWindow: bytes(original) + 2500 })))
+    expect(requests).toHaveLength(2)
+    for (const request of requests) expect(request.messages.slice(0, -1)).toEqual(original.messages)
+    const snapshot = compaction.snapshot("session")
+    expect(snapshot.lanes[0]!.state.segments).toHaveLength(2)
+    const firstSelected = requests.map((request) => JSON.parse((request.messages.at(-1)!.content as string).match(/\[[0-9,]*\]/)![0]) as number[])
+    expect(firstSelected[0]!.every((position) => position < 3)).toBe(true)
+    expect(firstSelected[1]!.every((position) => position > 3)).toBe(true)
+
+    const extension = [
+      { role: "assistant", content: "extension:" + "e".repeat(2500) },
+      { role: "user", content: "Continue" },
+    ]
+    const extended = { ...original, messages: [...original.messages, ...extension] }
+    const expectedPrefix = [...first.messages, ...extension]
+    const nextRequests: ChatBody[] = []
+    const result = await compaction.prepare(extended, context(async (body) => {
+      nextRequests.push(body)
+      return success("updated-second")
+    }, { prefixHandoff: true, outputLimit: 4000, contextWindow: bytes({ ...extended, messages: expectedPrefix }) + 2500 }))
+    expect(nextRequests).toHaveLength(1)
+    expect(nextRequests[0]!.messages.slice(0, -1)).toEqual(expectedPrefix)
+    const nextSegments = compaction.snapshot("session").lanes[0]!.state.segments
+    expect(nextSegments[0]).toEqual(snapshot.lanes[0]!.state.segments[0])
+    expect(nextSegments[1]!.summary).toBe("updated-second")
+    const oldSecond = new Set(snapshot.lanes[0]!.state.segments[1]!.archived)
+    const additions = nextSegments[1]!.archived.filter((index) => !oldSecond.has(index))
+    const expectedPositions = [3, ...additions.map((index) => expectedPrefix.indexOf(extended.messages[index]!))].sort((a, b) => a - b)
+    expect(expectedPositions.every((position) => position >= 3)).toBe(true)
+    const selected = JSON.parse((nextRequests[0]!.messages.at(-1)!.content as string).match(/\[[0-9,]*\]/)![0])
+    expect(selected).toEqual(expectedPositions)
+    expect(selected).not.toContain(1)
+    expect("report" in result && result.report?.prefixHandoff).toBe(true)
+  })
+
+  test("second-interval failure leaves all committed segments and reductions intact", async () => {
+    const original = fixture()
+    original.messages[2]!.reasoning_content = "r".repeat(5000)
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    await compaction.prepare(original, context(async () => success("committed")))
+    const snapshot = compaction.snapshot("session")
+    expect(snapshot.lanes[0]!.state.reductions).toContainEqual({ index: 2, kind: "reasoning" })
+    expect(snapshot.lanes[0]!.state.segments).toHaveLength(2)
+    const extended = { ...original, messages: [
+      ...original.messages,
+      { role: "assistant", content: "New history in second interval " + "x".repeat(6500), reasoning_content: "new reasoning" },
+      { role: "system", content: "Third interval" },
+      { role: "user", content: "Third question " + "y".repeat(6500) },
+      { role: "assistant", content: "Third answer " + "z".repeat(2000) },
+      { role: "user", content: "Continue" },
+    ] }
+    const failure = new Response("second segment unavailable", { status: 429, headers: { "retry-after": "3" } })
+    const requests: ChatBody[] = []
+    let interval = 0
+    const result = await compaction.prepare(extended, context(async (body) => {
+      requests.push(body)
+      if (payload(body).fragment_offset === 0) interval++
+      return interval === 2 ? failure : success("uncommitted")
+    }))
+    expect(interval).toBe(2)
+    expect("response" in result && result.response).toBe(failure)
+    expect(failure.bodyUsed).toBe(false)
+    expect(compaction.snapshot("session")).toEqual(snapshot)
+    expect(payload(requests[0]!).previous_summary).toBe(snapshot.lanes[0]!.state.segments[1]!.summary)
+    expect(payload(requests.at(-1)!).previous_summary).toBeNull()
+  })
+
+  test("snapshot shape rejects singleton, malformed, overlapping and interleaved archives", async () => {
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    await compaction.prepare(fixture(), context(async () => success("valid")))
+    const snapshot = compaction.snapshot("session")
+    const old = { lanes: snapshot.lanes.map(({ key, state }) => {
+      const { segments, ...metadata } = state
+      return { key, state: { ...metadata, summary: "legacy", archived: segments.flatMap((segment) => segment.archived) } }
+    }) }
+    expect(isCompactionSnapshot(old)).toBe(false)
+    for (const segments of [
+      [{ summary: " ", archived: [1] }],
+      [{ summary: "valid", archived: [] }],
+      [{ summary: "valid", archived: [-1] }],
+      [{ summary: "valid", archived: [1.5] }],
+      [{ summary: "valid", archived: [1, 1] }],
+      [{ summary: "valid", archived: [2, 1] }],
+      [{ summary: "valid", archived: [1, 4] }, { summary: "other", archived: [2, 5] }],
+      [{ summary: "valid", archived: [1, 2] }, { summary: "other", archived: [2, 4] }],
+      [{ summary: "valid", archived: [1], extra: true }],
+      [{ summary: "valid", archived: [snapshot.lanes[0]!.state.covered] }],
+    ]) {
+      const invalid = structuredClone(snapshot)
+      Object.assign(invalid.lanes[0]!.state, { segments })
+      expect(isCompactionSnapshot(invalid)).toBe(false)
+      expect(await new RollingCompaction().restore("session", invalid)).toBe(false)
+    }
+  })
+
+  test("replay rejects cross-policy, partial-batch and duplicate-interval segments", async () => {
+    const original = fixture()
+    original.messages.splice(2, 0, ...batch(31, 20))
+    const compaction = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    await compaction.prepare(original, context(async () => success("valid")))
+    const snapshot = compaction.snapshot("session")
+    const covered = snapshot.lanes[0]!.state.covered
+    for (const segments of [
+      [{ summary: "cross-policy", archived: [1, covered - 1] }],
+      [{ summary: "partial-batch", archived: [2] }, { summary: "later", archived: [covered - 1] }],
+      [{ summary: "first", archived: [1] }, { summary: "same-interval", archived: [2, 3, 4] }, { summary: "later", archived: [covered - 1] }],
+    ]) {
+      const invalid = structuredClone(snapshot)
+      Object.assign(invalid.lanes[0]!.state, { segments })
+      expect(isCompactionSnapshot(invalid)).toBe(true)
+      const restored = new RollingCompaction({ bytesPerToken: 1 })
+      expect(await restored.restore("session", invalid)).toBe(true)
+      expect(restored.reconstruct(original, { session: "session", lane: "provider/endpoint/build" })).toBe(original)
+      expect(forwarded(await restored.prepare(original, context(async () => { throw new Error("Unexpected inference") }, { contextWindow: 50000 })))).toBe(original)
+    }
+  })
+
+  test("read supersession and replay proofs cannot cross a policy boundary", async () => {
+    const original = repeatedReads()
+    original.messages.splice(4, 0, { role: "developer", content: "New read policy" })
+    const requests: ChatBody[] = []
+    const result = await new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 }).prepare(original, context(async (body) => {
+      requests.push(body)
+      return success("read-summary")
+    }, { currentUser: original.messages[5]! }))
+    expect("report" in result && result.report?.supersededReads).toBe(0)
+    expect(archived(requests).find((entry) => entry.source_index === 3)!.message.content).toBe(original.messages[3]!.content)
+    expect(forwarded(result).messages.at(-1)).toBe(original.messages.at(-1))
+    const sameInterval = repeatedReads()
+    const reductions = new RollingCompaction({ bytesPerToken: 1 })
+    await reductions.prepare(sameInterval, context(async () => { throw new Error("Unexpected inference") }, { currentUser: sameInterval.messages[4]! }))
+    expect(reductions.snapshot("session").lanes[0]!.state.reductions).toContainEqual({ index: 3, kind: "read", proof: 6 })
+    const forged = repeatedReads()
+    forged.messages.splice(4, 0, { role: "developer", content: "New read policy" })
+    forged.messages[2]!.reasoning_content = "r".repeat(6000)
+    forged.messages.push({ role: "user", content: "Continue" })
+    const committed = new RollingCompaction({ bytesPerToken: 1, summaryOutputTokens: 100 })
+    await committed.prepare(forged, context(async () => success("valid")))
+    const snapshot = committed.snapshot("session")
+    snapshot.lanes[0]!.state.reductions = [{ index: 3, kind: "read", proof: 7 }]
+    expect(isCompactionSnapshot(snapshot)).toBe(true)
+    const restored = new RollingCompaction({ bytesPerToken: 1 })
+    expect(await restored.restore("session", snapshot)).toBe(true)
+    expect(restored.reconstruct(forged, { session: "session", lane: "provider/endpoint/build" })).toBe(forged)
+  })
 })
 
 describe("rolling semantic compaction", () => {

@@ -499,14 +499,18 @@ function isEnvironmentsSnapshot(value) {
     return false;
   const lanes = new Set;
   return value.lanes.every((lane) => {
-    if (!record(lane) || Object.keys(lane).some((key) => !["key", "checkpoints"].includes(key)) || !sha256(lane.key) || lanes.has(lane.key) || !Array.isArray(lane.checkpoints) || !lane.checkpoints.length)
+    if (!record(lane) || Object.keys(lane).some((key) => !["key", "chain", "checkpoints"].includes(key)) || !sha256(lane.key) || lanes.has(lane.key) || !Array.isArray(lane.chain) || !lane.chain.every(sha256) || !Array.isArray(lane.checkpoints) || !lane.checkpoints.length)
       return false;
     lanes.add(lane.key);
     const anchors = new Set;
+    let position = 0;
     return lane.checkpoints.every((checkpoint) => {
-      if (!record(checkpoint) || Object.keys(checkpoint).some((key) => key !== "anchor" && key !== "environment") || !sha256(checkpoint.anchor) || anchors.has(checkpoint.anchor) || typeof checkpoint.environment !== "string" || !environmentBlock.test(checkpoint.environment))
+      if (!record(checkpoint) || Object.keys(checkpoint).some((key) => !["anchor", "position", "environment"].includes(key)) || !sha256(checkpoint.anchor) || anchors.has(checkpoint.anchor) || !Number.isSafeInteger(checkpoint.position) || checkpoint.position < position || checkpoint.position < 1 || typeof checkpoint.environment !== "string" || !environmentBlock.test(checkpoint.environment))
+        return false;
+      if (lane.chain[checkpoint.position - 1] !== checkpoint.anchor)
         return false;
       anchors.add(checkpoint.anchor);
+      position = checkpoint.position;
       return true;
     });
   });
@@ -519,7 +523,7 @@ function stripEnvironmentDate(system) {
 
 class Environments {
   lanes = new Map;
-  apply(messages, session, lane) {
+  apply(messages, session, lane, options = {}) {
     const system = messages[0];
     if (system?.role !== "system" || typeof system.content !== "string")
       return;
@@ -528,29 +532,40 @@ class Environments {
       return;
     if (messages.slice(1).some((message) => message.role === "system" || message.role === "developer"))
       return;
+    const key = digest(JSON.stringify([session, lane]));
+    const prior = this.lanes.get(key);
+    let sourcePrefix = "";
+    const sourceAnchors = messages.slice(1).map((message) => sourcePrefix = digest(sourcePrefix + `
+` + JSON.stringify(message)));
     let prefix = "";
-    const anchors = messages.slice(1).map((message) => {
-      prefix = digest(prefix + `
+    const anchors = messages.slice(1).map((message, index) => {
+      const source = digest(prefix + `
 ` + JSON.stringify(message));
+      const replacement = options.replacements?.get(message);
+      const repaired = replacement && digest(prefix + `
+` + JSON.stringify(replacement));
+      prefix = repaired && source !== prior?.chain[index] && repaired === prior?.chain[index] ? repaired : source;
       return prefix;
     });
     if (!anchors.length)
       return;
-    const key = digest(JSON.stringify([session, lane]));
-    const prior = this.lanes.get(key);
     const present = new Set(anchors);
-    const checkpoints = (prior?.checkpoints ?? []).filter((checkpoint) => present.has(checkpoint.anchor));
+    const checkpoints = (prior?.checkpoints ?? []).filter((checkpoint) => options.reconstruct ? checkpoint.position < messages.length : present.has(checkpoint.anchor)).map((checkpoint) => ({
+      ...checkpoint,
+      anchor: sourceAnchors[checkpoint.position - 1]
+    }));
     const current = match[2].replace(/\n  Today's date: [^\n]+/, "");
     if (checkpoints.at(-1)?.environment !== current) {
-      checkpoints.push({ anchor: anchors.at(-1), environment: current });
+      checkpoints.push({ anchor: sourceAnchors.at(-1), position: messages.length - 1, environment: current });
     }
-    this.lanes.set(key, { session, checkpoints });
-    system.content = system.content.replace(environment, "$1");
-    const result = [system];
+    if (!options.reconstruct)
+      this.lanes.set(key, { session, chain: sourceAnchors, checkpoints });
+    const leading = { ...system, content: system.content.replace(environment, "$1") };
+    const result = [leading];
     for (let index = 1;index < messages.length; index++) {
       result.push(messages[index]);
       for (const checkpoint of checkpoints) {
-        if (checkpoint.anchor !== anchors[index - 1])
+        if (checkpoint.position !== index)
           continue;
         const reminder = {
           role: "user",
@@ -565,7 +580,7 @@ ${checkpoint.environment}
     messages.splice(0, messages.length, ...result);
   }
   snapshot(session) {
-    return { lanes: [...this.lanes].flatMap(([key, lane]) => lane.session === session ? [{ key, checkpoints: structuredClone(lane.checkpoints) }] : []) };
+    return { lanes: [...this.lanes].flatMap(([key, lane]) => lane.session === session ? [{ key, chain: [...lane.chain], checkpoints: structuredClone(lane.checkpoints) }] : []) };
   }
   restore(session, value) {
     if (!isEnvironmentsSnapshot(value))
@@ -573,7 +588,7 @@ ${checkpoint.environment}
     this.delete(session);
     for (const lane of value.lanes) {
       if (!this.lanes.has(lane.key))
-        this.lanes.set(lane.key, { session, checkpoints: structuredClone(lane.checkpoints) });
+        this.lanes.set(lane.key, { session, chain: [...lane.chain], checkpoints: structuredClone(lane.checkpoints) });
     }
     return true;
   }
@@ -688,14 +703,22 @@ function isCompactionSnapshot(value) {
       return false;
     keys.add(lane.key);
     const state = lane.state;
-    if (Object.keys(state).some((key) => !["summary", "archived", "covered", "fingerprint", "signature", "reductions"].includes(key)) || typeof state.summary !== "string" || !Array.isArray(state.archived) || !Number.isSafeInteger(state.covered) || state.covered < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature))
+    if (Object.keys(state).some((key) => !["segments", "covered", "fingerprint", "signature", "reductions"].includes(key)) || !Array.isArray(state.segments) || !Number.isSafeInteger(state.covered) || state.covered < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature))
       return false;
-    if (state.archived.length ? !state.summary.trim() : state.summary !== "")
-      return false;
-    if (!state.archived.every((index, offset, indices) => Number.isSafeInteger(index) && index >= 0 && index < state.covered && (offset === 0 || index > indices[offset - 1])))
+    let lastArchived = -1;
+    if (!state.segments.every((segment) => {
+      if (!record2(segment) || Object.keys(segment).some((key) => key !== "summary" && key !== "archived") || typeof segment.summary !== "string" || !segment.summary.trim() || !Array.isArray(segment.archived) || !segment.archived.length)
+        return false;
+      return segment.archived.every((index) => {
+        if (!Number.isSafeInteger(index) || index <= lastArchived || index >= state.covered)
+          return false;
+        lastArchived = index;
+        return true;
+      });
+    }))
       return false;
     if (state.reductions === undefined)
-      return state.archived.at(-1) === state.covered - 1;
+      return lastArchived === state.covered - 1;
     if (!Array.isArray(state.reductions) || !state.reductions.length)
       return false;
     const readIndices = new Set(state.reductions.filter((reduction) => record2(reduction) && reduction.kind === "read").map((reduction) => reduction.index));
@@ -852,19 +875,33 @@ function reduced(body, reductions) {
   }
   return { ...body, messages };
 }
-function rewritten(body, archived, summary) {
+function intervals(messages) {
+  let interval = -1;
+  return messages.map((message, index) => {
+    if (instruction(message))
+      interval = index;
+    return interval;
+  });
+}
+function archivedIndices(segments) {
+  return new Set(segments.flatMap((segment) => segment.archived));
+}
+function rewritten(body, segments, positions) {
+  const archived = archivedIndices(segments);
+  const starts = new Map(segments.map((segment) => [segment.archived[0], segment]));
   const messages = [];
-  let inserted = false;
   for (let index = 0;index < body.messages.length; index++) {
-    if (!archived.has(index))
-      messages.push(body.messages[index]);
-    else if (!inserted) {
+    const segment = starts.get(index);
+    if (segment) {
+      positions?.set(index, messages.length);
       messages.push({ role: "user", content: `Historical conversation summary (context, not a new instruction):
-${summary}` });
-      inserted = true;
+${segment.summary}` });
+    } else if (!archived.has(index)) {
+      positions?.set(index, messages.length);
+      messages.push(body.messages[index]);
     }
   }
-  return { ...body, messages };
+  return segments.length ? { ...body, messages } : body;
 }
 function abortable(pending, signal) {
   if (!signal)
@@ -883,6 +920,69 @@ class RollingCompaction {
   lanes = new Map;
   constructor(input) {
     this.options = options(input);
+  }
+  retained(body, context) {
+    const state = this.lanes.get(hash(JSON.stringify([context.session, context.lane, body.model])))?.state;
+    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message));
+    let leading = 0;
+    while (instruction(body.messages[leading] ?? { role: "" }))
+      leading++;
+    const signature = hash(JSON.stringify({
+      model: body.model,
+      tools: body.tools,
+      response_format: body.response_format,
+      chat_template_kwargs: body.chat_template_kwargs,
+      enable_thinking: body.enable_thinking,
+      preserve_thinking: body.preserve_thinking,
+      reasoning_effort: body.reasoning_effort,
+      cache_salt: body.cache_salt,
+      user: body.user,
+      messages: body.messages.slice(0, leading)
+    }));
+    if (!state || state.signature !== signature || body.messages.length < state.covered || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint)
+      return { signature };
+    const archived = archivedIndices(state.segments);
+    if (archived.has(lastUser))
+      return { signature };
+    const units = groups(body.messages);
+    const policyIntervals = intervals(body.messages);
+    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]));
+    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start].tool_calls) && body.messages[group.start].tool_calls.length > 0);
+    const seenIntervals = new Set;
+    for (const segment of state.segments) {
+      const interval = policyIntervals[segment.archived[0]];
+      if (seenIntervals.has(interval) || segment.archived.some((index) => policyIntervals[index] !== interval))
+        return { signature };
+      seenIntervals.add(interval);
+      const indices = new Set(segment.archived);
+      if (units.some((group) => {
+        const count = Array.from({ length: group.end - group.start }, (_, offset) => group.start + offset).filter((index) => indices.has(index)).length;
+        return count > 0 && (!group.plain || group === lastGroup || group === newestToolGroup || count !== group.end - group.start);
+      }))
+        return { signature };
+    }
+    const reads = state.reductions ? readResults(body.messages, units) : undefined;
+    if (state.reductions?.some((reduction) => {
+      if (reduction.index >= lastUser)
+        return true;
+      const message = body.messages[reduction.index];
+      if (reduction.kind === "reasoning")
+        return !message || message.role !== "assistant" || !plain(message);
+      const earlier = reads?.get(reduction.index);
+      const later = reads?.get(reduction.proof);
+      return !earlier || !later || earlier.key !== later.key || earlier.content !== later.content || policyIntervals[reduction.index] !== policyIntervals[reduction.proof] || archived.has(reduction.proof) && !archived.has(reduction.index);
+    }))
+      return { signature };
+    return { signature, state, units, reads };
+  }
+  reconstruct(body, context) {
+    if (this.options === false)
+      return body;
+    const { state } = this.retained(body, context);
+    if (!state)
+      return body;
+    const result = reduced(body, state.reductions ?? []);
+    return rewritten(result, state.segments);
   }
   prepare(body, context) {
     if (this.options === false)
@@ -917,7 +1017,9 @@ class RollingCompaction {
       if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1)
         throw new Error(`Compaction requires an actual positive integer ${name}; no model limits are guessed`);
     }
-    const fallback = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / config.bytesPerToken);
+    const bytesEstimate = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / config.bytesPerToken);
+    let correction = 1;
+    const fallback = (value) => Math.ceil(bytesEstimate(value) * correction);
     const estimate = (value) => context.estimate && record2(value) && typeof value.model === "string" && Array.isArray(value.messages) ? context.estimate(value, fallback) : fallback(value);
     const budget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - context.outputLimit) - config.marginTokens);
     if (budget < 1)
@@ -950,46 +1052,22 @@ class RollingCompaction {
     const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message));
     if (context.currentUser && lastUser < 0)
       throw new Error("Cannot compact without the exact current user instruction object in the outgoing history");
-    const signature = hash(JSON.stringify({
-      model: body.model,
-      tools: body.tools,
-      response_format: body.response_format,
-      chat_template_kwargs: body.chat_template_kwargs,
-      enable_thinking: body.enable_thinking,
-      preserve_thinking: body.preserve_thinking,
-      reasoning_effort: body.reasoning_effort,
-      cache_salt: body.cache_salt,
-      user: body.user,
-      messages: body.messages.flatMap((message, index) => instruction(message) ? [{ index, message }] : [])
-    }));
-    let state = lane.state;
-    let units;
-    let reads;
-    if (state?.reductions) {
-      units = groups(body.messages);
-      reads = readResults(body.messages, units);
-    }
-    if (state && (state.signature !== signature || body.messages.length < state.covered || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint || state.archived.includes(lastUser) || state.reductions?.some((reduction) => {
-      if (reduction.index >= lastUser)
-        return true;
-      const message = body.messages[reduction.index];
-      if (reduction.kind === "reasoning")
-        return !message || message.role !== "assistant" || !plain(message);
-      const earlier = reads?.get(reduction.index);
-      const later = reads?.get(reduction.proof);
-      return !earlier || !later || earlier.key !== later.key || earlier.content !== later.content || state.archived.includes(reduction.proof) && !state.archived.includes(reduction.index);
-    }))) {
+    const retained = this.retained(body, context);
+    const { signature, state } = retained;
+    let { units, reads } = retained;
+    if (!state)
       lane.state = undefined;
-      state = undefined;
-    }
     reductions = [...state?.reductions ?? []];
-    const archived = new Set(state?.archived ?? []);
+    const segments = state?.segments.map((segment) => ({ summary: segment.summary, archived: [...segment.archived] })) ?? [];
+    const archived = archivedIndices(segments);
+    const positions = new Map;
     body = reduced(source, reductions);
-    const effectiveBody = state?.summary ? rewritten(body, archived, state.summary) : body;
+    const effectiveBody = rewritten(body, segments, positions);
     const current = context.restoreReasoning?.(effectiveBody) ?? effectiveBody;
     const currentSize = estimate(current);
     if (currentSize <= trigger)
       return { body: current, report: report(currentSize, false, !!state, 0, archived.size) };
+    correction = Math.max(1, currentSize / Math.max(1, bytesEstimate(current)));
     let workingSource = source;
     if (current !== effectiveBody) {
       const restored = new Map(effectiveBody.messages.flatMap((message, index) => current.messages[index] !== message ? [[message, current.messages[index]]] : []));
@@ -1006,7 +1084,8 @@ class RollingCompaction {
       }
     }
     body = reduced(workingSource, reductions);
-    const effective = () => state?.summary ? rewritten(body, new Set(state.archived), state.summary) : body;
+    const effective = () => rewritten(body, state?.segments ?? []);
+    const policyIntervals = intervals(source.messages);
     if (estimate(effective()) > target) {
       reads ??= readResults(source.messages, units);
       const latest = new Map;
@@ -1014,7 +1093,7 @@ class RollingCompaction {
       for (const [index, read] of [...reads].reverse()) {
         if (archived.has(index) || existingReductions.has(index))
           continue;
-        const key = JSON.stringify([read.key, read.content]);
+        const key = JSON.stringify([policyIntervals[index], read.key, read.content]);
         const proof = latest.get(key);
         if (proof !== undefined && index < lastUser && !proofs.has(index))
           reductions.push({ index, kind: "read", proof });
@@ -1024,49 +1103,76 @@ class RollingCompaction {
       body = reduced(workingSource, reductions);
     }
     reductions.sort((a, b) => a.index - b.index);
-    const checkpoint = (summary, indices) => {
+    const checkpoint = (segments) => {
+      const indices = [...archivedIndices(segments)].sort((a, b) => a - b);
       const covered = Math.max(indices.at(-1) ?? -1, ...reductions.flatMap((reduction) => reduction.kind === "read" ? [reduction.index, reduction.proof, lastUser] : [reduction.index, lastUser])) + 1;
-      return { summary, archived: indices, covered, fingerprint: hash(JSON.stringify(source.messages.slice(0, covered))), signature, ...reductions.length ? { reductions } : {} };
+      return { segments, covered, fingerprint: hash(JSON.stringify(source.messages.slice(0, covered))), signature, ...reductions.length ? { reductions } : {} };
     };
     const reducedCurrent = effective();
     const reducedSize = estimate(reducedCurrent);
     if (reductions.length > (state?.reductions?.length ?? 0) && reducedSize <= target) {
       active();
-      lane.state = checkpoint(state?.summary ?? "", [...archived].sort((a, b) => a - b));
+      lane.state = checkpoint(segments);
       return { body: reducedCurrent, report: report(reducedSize, true, !!state, 0, archived.size) };
     }
     const users = body.messages.flatMap((message, index) => index <= lastUser && message.role === "user" && !isGeneratedEnvironment(message) ? [index] : []);
     const recent = users[Math.max(0, users.length - config.keepRecentTurns)];
     const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]));
     const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start].tool_calls) && body.messages[group.start].tool_calls.length > 0);
-    let leading = 0;
-    while (instruction(body.messages[leading] ?? { role: "" }))
-      leading++;
-    const barrier = body.messages.findIndex((message, index) => index >= leading && instruction(message));
-    const eligible = units.filter((group) => group !== lastGroup && group !== newestToolGroup && group.plain && (barrier < 0 || group.end <= barrier) && !(group.start <= lastUser && lastUser < group.end) && !archived.has(group.start));
+    const eligible = units.filter((group) => group !== lastGroup && group !== newestToolGroup && group.plain && !(group.start <= lastUser && lastUser < group.end) && !archived.has(group.start));
     const candidates = [...eligible.filter((group) => group.end <= recent), ...eligible.filter((group) => group.end > recent)];
     const derivedCap = Math.min(context.outputLimit, Math.max(1, trigger - target));
     const summaryCap = Math.min(context.outputLimit, config.summaryOutputTokens ?? derivedCap);
-    const newlyArchived = [];
+    const touched = new Map;
+    let plannedSize = reducedSize;
     for (const group of candidates) {
-      for (let index = group.start;index < group.end; index++) {
-        if (!archived.has(index))
-          newlyArchived.push(index);
-        archived.add(index);
+      if (archived.has(group.start))
+        continue;
+      const interval = policyIntervals[group.start];
+      let plan = touched.get(interval);
+      if (!plan) {
+        const previous = segments.find((segment) => policyIntervals[segment.archived[0]] === interval);
+        const additions = [];
+        for (const candidate of candidates) {
+          if (policyIntervals[candidate.start] !== interval || archived.has(candidate.start))
+            continue;
+          for (let index = candidate.start;index < candidate.end; index++)
+            additions.push(index);
+          const segment = { summary: "", archived: [...previous?.archived ?? [], ...additions].sort((a, b) => a - b) };
+          const trial = [...segments.filter((entry) => entry !== previous), segment].sort((a, b) => a.archived[0] - b.archived[0]);
+          const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryCap;
+          if (size >= plannedSize)
+            continue;
+          plan = { segment, previous, additions };
+          touched.set(interval, plan);
+          if (previous)
+            segments.splice(segments.indexOf(previous), 1);
+          segments.push(segment);
+          segments.sort((a, b) => a.archived[0] - b.archived[0]);
+          for (const index of additions)
+            archived.add(index);
+          plannedSize = size;
+          break;
+        }
+        if (!plan)
+          continue;
+      } else {
+        for (let index = group.start;index < group.end; index++) {
+          plan.additions.push(index);
+          plan.segment.archived.push(index);
+          archived.add(index);
+        }
+        plan.segment.archived.sort((a, b) => a - b);
+        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryCap;
       }
-      if (estimate(rewritten(body, archived, "")) + summaryCap <= target)
+      if (plannedSize <= target)
         break;
     }
-    const mandatorySize = estimate(rewritten(body, archived, ""));
-    if (!newlyArchived.length || mandatorySize + summaryCap > target) {
+    const mandatorySize = estimate(rewritten(body, segments));
+    if (!touched.size || plannedSize > target) {
       const opaque = units.some((group) => !group.plain && !instruction(body.messages[group.start]));
-      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""}${barrier >= 0 ? ", and later system/developer boundary" : ""} require about ${mandatorySize} input tokens plus summary reserve ${summaryCap}. Reduce the mandatory input or supply larger actual model limits`);
+      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""} require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryCap}. Reduce the mandatory input or supply larger actual model limits`);
     }
-    newlyArchived.sort((a, b) => a - b);
-    const transcript = newlyArchived.map((index) => JSON.stringify({ source_index: index, message: body.messages[index] })).join(`
-`);
-    let summary = state?.summary ?? "";
-    let offset = 0;
     let calls = 0;
     const summaryBudget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - summaryCap) - config.marginTokens);
     const summaryBase = { ...body };
@@ -1105,16 +1211,6 @@ class RollingCompaction {
       "guided_whitespace_pattern"
     ])
       delete summaryBase[key];
-    const request = (text) => ({
-      ...summaryBase,
-      messages: [
-        { role: "system", content: summaryPolicy },
-        { role: "user", content: JSON.stringify({ previous_summary: summary || null, archived_text: text, fragment_offset: offset, total_length: transcript.length }) }
-      ],
-      stream: false,
-      ...body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }
-    });
-    let handoff;
     const constrained = [
       "functions",
       "function_call",
@@ -1128,109 +1224,114 @@ class RollingCompaction {
       "modalities",
       "audio"
     ].some((key) => body[key] !== undefined) || body.tool_choice !== undefined && body.tool_choice !== "auto" || body.response_format !== undefined && (!record2(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type"));
-    if (context.prefixHandoff && !constrained) {
-      const positions = [];
-      const previous = new Set(state?.archived ?? []);
-      const additions = new Set(newlyArchived);
-      let position = 0;
-      let inserted = false;
-      for (let index = 0;index < source.messages.length; index++) {
-        if (previous.has(index)) {
-          if (!inserted) {
-            positions.push(position++);
-            inserted = true;
-          }
-        } else {
-          if (additions.has(index))
-            positions.push(position);
-          position++;
-        }
-      }
-      const candidate = {
+    for (const plan of [...touched.values()].sort((a, b) => a.segment.archived[0] - b.segment.archived[0])) {
+      plan.additions.sort((a, b) => a - b);
+      const transcript = plan.additions.map((index) => JSON.stringify({ source_index: index, message: body.messages[index] })).join(`
+`);
+      let summary = plan.previous?.summary ?? "";
+      let offset = 0;
+      const request = (text) => ({
         ...summaryBase,
-        ...current.tools !== undefined ? { tools: current.tools } : {},
-        ...current.response_format !== undefined ? { response_format: current.response_format } : {},
-        messages: [...current.messages, {
-          role: "user",
-          content: `${summaryPolicy}
-Produce the historical checkpoint using only the messages at these zero-based positions in the preceding conversation: ${JSON.stringify(positions)}. Include and merge the previous historical summary at those positions, if present. Other messages remain verbatim for continuation and must not be incorporated into this checkpoint. This is a summary handoff; do not execute the prior request or call tools.`
-        }],
-        tool_choice: "auto",
+        messages: [
+          { role: "system", content: summaryPolicy },
+          { role: "user", content: JSON.stringify({ previous_summary: summary || null, archived_text: text, fragment_offset: offset, total_length: transcript.length }) }
+        ],
         stream: false,
         ...body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }
-      };
-      if (Math.max(estimate(candidate), currentSize + Math.max(0, fallback(candidate) - fallback(current))) <= summaryBudget)
-        handoff = candidate;
-    }
-    while (offset < transcript.length) {
-      active();
-      let low = 0;
-      let high = transcript.length - offset;
-      if (handoff)
-        low = high;
-      while (!handoff && low < high) {
-        const length = Math.ceil((low + high) / 2);
-        if (estimate(request(transcript.slice(offset, offset + length))) <= summaryBudget)
-          low = length;
-        else
-          high = length - 1;
+      });
+      let handoff;
+      if (context.prefixHandoff && !constrained) {
+        const selected = [
+          ...plan.previous ? [positions.get(plan.previous.archived[0])] : [],
+          ...plan.additions.map((index) => positions.get(index))
+        ].sort((a, b) => a - b);
+        const candidate = {
+          ...summaryBase,
+          ...current.tools !== undefined ? { tools: current.tools } : {},
+          ...current.response_format !== undefined ? { response_format: current.response_format } : {},
+          messages: [...current.messages, {
+            role: "user",
+            content: `${summaryPolicy}
+Produce the historical checkpoint using only the messages at these zero-based positions in the preceding conversation: ${JSON.stringify(selected)}. Include and merge the previous historical summary at those positions, if present. Other messages remain verbatim for continuation and must not be incorporated into this checkpoint. This is a summary handoff; do not execute the prior request or call tools.`
+          }],
+          tool_choice: "auto",
+          stream: false,
+          ...body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }
+        };
+        if (Math.max(estimate(candidate), currentSize + Math.max(0, fallback(candidate) - fallback(current))) <= summaryBudget)
+          handoff = candidate;
       }
-      if (low && offset + low < transcript.length && /[\uD800-\uDBFF]/.test(transcript[offset + low - 1]))
-        low--;
-      if (!low)
-        throw new Error(`Compaction summarizer has no room for the next transcript fragment within input budget ${summaryBudget}; reduce fixed overhead or summaryOutputTokens`);
-      const summaryBody = handoff ?? request(transcript.slice(offset, offset + low));
-      const response = await context.completeSummary(summaryBody);
-      try {
+      while (offset < transcript.length) {
         active();
-      } catch (error) {
-        await response.body?.cancel(error).catch(() => {});
-        throw error;
-      }
-      if (!response.ok)
-        return { response };
-      let value;
-      const reader = response.body?.getReader();
-      try {
-        if (!reader)
-          throw new Error("Empty summary response body");
-        const decoder = new TextDecoder;
-        let text = "";
-        while (true) {
-          const chunk = await abortable(reader.read(), context.signal);
-          if (chunk.done)
-            break;
-          text += decoder.decode(chunk.value, { stream: true });
+        let low = 0;
+        let high = transcript.length - offset;
+        if (handoff)
+          low = high;
+        while (!handoff && low < high) {
+          const length = Math.ceil((low + high) / 2);
+          if (estimate(request(transcript.slice(offset, offset + length))) <= summaryBudget)
+            low = length;
+          else
+            high = length - 1;
         }
-        text += decoder.decode();
-        value = JSON.parse(text);
-      } catch (error) {
-        await reader?.cancel(error).catch(() => {});
+        if (low && offset + low < transcript.length && /[\uD800-\uDBFF]/.test(transcript[offset + low - 1]))
+          low--;
+        if (!low)
+          throw new Error(`Compaction summarizer has no room for the next transcript fragment within input budget ${summaryBudget}; reduce fixed overhead or summaryOutputTokens`);
+        const summaryBody = handoff ?? request(transcript.slice(offset, offset + low));
+        const response = await context.completeSummary(summaryBody);
+        try {
+          active();
+        } catch (error) {
+          await response.body?.cancel(error).catch(() => {});
+          throw error;
+        }
+        if (!response.ok)
+          return { response };
+        let value;
+        const reader = response.body?.getReader();
+        try {
+          if (!reader)
+            throw new Error("Empty summary response body");
+          const decoder = new TextDecoder;
+          let text = "";
+          while (true) {
+            const chunk = await abortable(reader.read(), context.signal);
+            if (chunk.done)
+              break;
+            text += decoder.decode(chunk.value, { stream: true });
+          }
+          text += decoder.decode();
+          value = JSON.parse(text);
+        } catch (error) {
+          await reader?.cancel(error).catch(() => {});
+          active();
+          throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error });
+        } finally {
+          reader?.releaseLock();
+        }
         active();
-        throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error });
-      } finally {
-        reader?.releaseLock();
+        const choice = record2(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined;
+        const message = record2(choice) && record2(choice.message) ? choice.message : undefined;
+        if (!record2(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0) || message.function_call !== undefined) {
+          throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed");
+        }
+        summary = message.content;
+        if (estimate(summary) > summaryCap)
+          throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`);
+        offset += low;
+        calls++;
+        prefixHandoff ||= !!handoff;
       }
-      active();
-      const choice = record2(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined;
-      const message = record2(choice) && record2(choice.message) ? choice.message : undefined;
-      if (!record2(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0) || message.function_call !== undefined) {
-        throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed");
-      }
-      summary = message.content;
-      if (estimate(summary) > summaryCap)
-        throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`);
-      offset += low;
-      calls++;
-      prefixHandoff = !!handoff;
+      plan.segment.summary = summary;
     }
-    const result = rewritten(body, archived, summary);
+    const result = rewritten(body, segments);
     const after = estimate(result);
     if (after > target)
       throw new Error(`Compaction still estimates ${after} input tokens after folding, above recovery budget ${target}; no summary state was committed`);
     active();
     const indices = [...archived].sort((a, b) => a - b);
-    lane.state = checkpoint(summary, indices);
+    lane.state = checkpoint(segments);
     return { body: result, report: report(after, true, !!state, calls, indices.length) };
   }
   snapshot(session) {
@@ -1308,9 +1409,15 @@ function tools(value) {
     return left < right ? -1 : left > right ? 1 : 0;
   }));
 }
-function chain(messages) {
+function chain(messages, prior, replacements) {
   let previous = hash2([]);
-  return messages.map((message) => previous = hash2([previous, message]));
+  return messages.map((message, index) => {
+    const source = hash2([previous, message]);
+    const replacement = replacements?.get(message);
+    const repaired = replacement && hash2([previous, replacement]);
+    previous = repaired && source !== prior?.[index] && repaired === prior?.[index] ? repaired : source;
+    return previous;
+  });
 }
 function isSessionHeadsSnapshot(value, session) {
   if (!object(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes))
@@ -1357,7 +1464,8 @@ class SessionHeads {
     const id = key(context.session, context.lane, body.model);
     const normalizedTools = tools(body.tools);
     if (normalizedTools === false) {
-      this.lanes.delete(id);
+      if (!context.reconstruct)
+        this.lanes.delete(id);
       return { body, report: { status: "unsupported", reason: "unsupported-tools", notices: 0 } };
     }
     let count = 0;
@@ -1365,8 +1473,9 @@ class SessionHeads {
       count++;
     const system = body.messages.slice(0, count);
     const conversation = body.messages.slice(count);
-    const anchors = chain(conversation);
     const previous = this.lanes.get(id)?.state;
+    const sourceAnchors = chain(conversation);
+    const anchors = chain(conversation, previous?.chain, context.replacements);
     let state;
     const report = { status: previous ? "stable" : "initialized", notices: 0 };
     const fresh = () => ({ lane: context.lane, model: body.model, system: structuredClone(system), tools: structuredClone(normalizedTools), chain: anchors, notices: [] });
@@ -1392,8 +1501,10 @@ class SessionHeads {
       while (shared < previous.chain.length && previous.chain[shared] === anchors[shared])
         shared++;
       let reason = toolReset(previous.tools, normalizedTools);
-      if (!reason && shared < previous.chain.length)
+      if (!reason && shared < previous.chain.length && !context.reconstruct)
         reason = shared === anchors.length ? "history-reverted" : "history-edited";
+      if (!reason && context.reconstruct && anchors.length < previous.chain.length)
+        reason = "history-reverted";
       const compatible = system.length >= effective.length && effective.every((message, index) => equal(message, system[index]));
       if (!reason && !compatible)
         reason = "system-contract-changed";
@@ -1407,6 +1518,12 @@ class SessionHeads {
         report.reason = reason;
       } else {
         state = structuredClone(previous);
+        if (context.reconstruct) {
+          state.notices = state.notices.map((notice) => ({
+            ...notice,
+            anchor: anchors[previous.chain.indexOf(notice.anchor)]
+          }));
+        }
         state.chain = anchors;
         if (system.length > effective.length) {
           state.notices.push({ anchor: anchors.at(-1), system: structuredClone(system.slice(effective.length)) });
@@ -1414,13 +1531,16 @@ class SessionHeads {
         }
       }
     }
-    this.lanes.set(id, { session: context.session, state });
+    state.notices = state.notices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)] }));
+    state.chain = sourceAnchors;
+    if (!context.reconstruct)
+      this.lanes.set(id, { session: context.session, state });
     report.notices = state.notices.reduce((total, notice) => total + notice.system.length, 0);
     const messages = [...structuredClone(state.system)];
     for (let index = 0;index < conversation.length; index++) {
       messages.push(conversation[index]);
       for (const notice of state.notices)
-        if (notice.anchor === anchors[index])
+        if (notice.anchor === sourceAnchors[index])
           messages.push(...structuredClone(notice.system));
     }
     const result = { ...body, messages };
@@ -1635,7 +1755,7 @@ class PrefixGuard {
 }
 
 // src/checkpoints.ts
-var version = 1;
+var version = 2;
 var hash3 = (value) => createHash6("sha256").update(value).digest("hex");
 function isCheckpointSnapshot(value, session) {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -2913,22 +3033,22 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
         return { id, provider, baseURL, endpoint, gate, fetch: custom ?? globalThis.fetch };
       });
       if (options.persistence !== false)
-        store = new CheckpointStore(join4(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]), JSON.stringify({
+        store = new CheckpointStore(join4(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]), JSON.stringify(canonical({
           version: 1,
           providers: [...providers].sort(),
-          compaction: options.compaction,
+          compaction: compaction.options,
           compactPrompt: options.compactPrompt !== false,
           compactSkills: options.compactSkills !== false,
           compactTools: options.compactTools !== false,
           stabilizeEnvironment: options.stabilizeEnvironment !== false,
           retainModeReminders: options.retainModeReminders !== false,
           canonicalToolSchemas: options.canonicalToolSchemas !== false,
-          glm: options.glm,
+          glm,
           sessionHeads: options.sessionHeads !== false,
           prefixGuard: options.prefixGuard !== false,
           prefixHandoff: options.prefixHandoff !== false,
-          shrinkToolOutputs: options.shrinkToolOutputs
-        }));
+          shrinkToolOutputs: outputShrinker?.limits ?? false
+        })));
       for (const target of targets) {
         target.provider.options ??= {};
         target.provider.options.baseURL = target.baseURL;
@@ -2953,8 +3073,9 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
           headers.delete(systemSuffixHeader);
           headers.delete("content-length");
           const currentUser = userTurns.consume(body.messages, session && expectedUser ? userTurns.marker(session, expectedUser) : undefined);
-          const lane = hash6(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]));
-          const headScope = hash6(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]));
+          url.hash = "";
+          const lane = hash6(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]));
+          const headScope = hash6(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]));
           const headLane = hash6(JSON.stringify([headScope, agent]));
           if (session) {
             const lanes = sessionLanes.get(session) ?? new Set;
@@ -2989,7 +3110,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
           }
           if (options.promptCacheKey === true && session)
             body.prompt_cache_key ??= session;
-          if (options.usageAccounting !== false && body.stream === true && (body.stream_options === undefined || body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options))) {
+          if (options.usageAccounting !== false && target.provider.options?.includeUsage !== false && body.stream === true && (body.stream_options === undefined || body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options))) {
             body.stream_options = { include_usage: true, ...body.stream_options };
           }
           if (maxOutputTokens !== undefined) {
@@ -3046,11 +3167,29 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
             });
           };
           const prepare = async () => {
+            const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
+            const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined };
+            const replacements = new Map;
+            if (session && agent && options.prefixGuard !== false) {
+              const sources = new Set(body.messages);
+              let probe = { ...body, messages: [...body.messages] };
+              if (options.stabilizeEnvironment !== false)
+                environments.apply(probe.messages, session, lane, { reconstruct: true });
+              if (options.sessionHeads !== false)
+                probe = heads.apply(probe, { ...headContext, reconstruct: true }).body;
+              if (encodedLimits && options.compaction !== false)
+                probe = compaction.reconstruct(probe, { session, lane, currentUser });
+              const restored = prefixGuard.apply(probe, { session, lane, currentUser, observe: false });
+              for (const { index } of restored.report.replayed) {
+                const source = probe.messages[index];
+                if (sources.has(source))
+                  replacements.set(source, restored.body.messages[index]);
+              }
+            }
             if (session && agent && options.stabilizeEnvironment !== false)
-              environments.apply(body.messages, session, lane);
+              environments.apply(body.messages, session, lane, { replacements });
             if (session && agent && options.sessionHeads !== false) {
-              const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
-              const prepared = heads.apply(body, { session, lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined });
+              const prepared = heads.apply(body, { ...headContext, replacements });
               body = prepared.body;
               await log("Session head contract", { ...prepared.report });
               if (!["title", "summary", "compaction"].includes(agent)) {

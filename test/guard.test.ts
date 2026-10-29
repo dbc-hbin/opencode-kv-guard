@@ -8,6 +8,38 @@ import type { Fetch } from "../src/transport"
 
 const plugin: typeof createPlugin = (input, options) => createPlugin(input, { persistence: false, crossProcess: false, ...options })
 
+test.each([false, true, undefined])("streaming usage respects provider includeUsage=%s", async (includeUsage) => {
+  const requests: { stream_options?: { include_usage?: boolean } }[] = []
+  const hooks = await plugin({} as PluginInput, { providers: ["proxy"], compaction: false })
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
+    name: "fixture", baseURL: "http://usage-setting.test/v1", includeUsage,
+    fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)))
+      return new Response(`data: ${JSON.stringify({
+        id: "fixture", model: "fixture", created: 1,
+        choices: [{ index: 0, delta: { content: "Answer" }, finish_reason: "stop" }],
+      })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+    },
+  } } } }
+  await hooks.config!(config)
+  const provider = createOpenAICompatible({
+    ...config.provider.proxy.options, fetch: Object.assign(config.provider.proxy.options.fetch, { preconnect: globalThis.fetch.preconnect }),
+  })
+  const response = await provider.chatModel("fixture").doStream({
+    prompt: [{ role: "user", content: [{ type: "text", text: "Task" }] }],
+  })
+  const reader = response.stream.getReader()
+  try { while (!(await reader.read()).done) { /* Consume the real SDK stream to EOF. */ } }
+  finally { reader.releaseLock() }
+  expect(requests[0]!.stream_options?.include_usage).toBe(includeUsage === false ? undefined : true)
+  const explicit = await config.provider.proxy.options.fetch("http://usage-setting.test/v1/chat/completions", {
+    method: "POST", body: JSON.stringify({ model: "fixture", messages: [], stream: true, stream_options: { include_usage: false } }),
+  })
+  await explicit.text()
+  expect(requests[1]!.stream_options?.include_usage).toBe(false)
+  await hooks.dispose!()
+})
+
 function system(date: string, cwd = "/project") {
   return `Stable policy.\nYou are powered by the model named fixture. The exact model ID is proxy/fixture\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: ${cwd}\n  Workspace root folder: /project\n  Is directory a git repo: yes\n  Platform: linux\n  Today's date: ${date}\n</env>\nProject instructions: obey the current policy.`
 }

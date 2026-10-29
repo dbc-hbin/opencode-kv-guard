@@ -28,7 +28,8 @@ export type CompactionContext = {
 export type CompactionResult = { body: ChatBody; report?: Record<string, number | boolean> } | { response: Response }
 type Options = Required<Omit<Exclude<CompactionOptions, false>, "summaryOutputTokens">> & { summaryOutputTokens?: number }
 type Reduction = { index: number; kind: "reasoning" } | { index: number; kind: "read"; proof: number }
-type State = { summary: string; archived: number[]; covered: number; fingerprint: string; signature: string; reductions?: Reduction[] }
+type Segment = { summary: string; archived: number[] }
+type State = { segments: Segment[]; covered: number; fingerprint: string; signature: string; reductions?: Reduction[] }
 type Lane = { session: string; tail: Promise<void>; state?: State }
 type Group = { start: number; end: number; plain: boolean }
 export type CompactionSnapshot = { lanes: { key: string; state: State }[] }
@@ -45,10 +46,17 @@ export function isCompactionSnapshot(value: unknown): value is CompactionSnapsho
     if (!record(lane) || Object.keys(lane).some((key) => key !== "key" && key !== "state") || typeof lane.key !== "string" || !/^[a-f0-9]{64}$/.test(lane.key) || keys.has(lane.key) || !record(lane.state)) return false
     keys.add(lane.key)
     const state = lane.state
-    if (Object.keys(state).some((key) => !["summary", "archived", "covered", "fingerprint", "signature", "reductions"].includes(key)) || typeof state.summary !== "string" || !Array.isArray(state.archived) || !Number.isSafeInteger(state.covered) || (state.covered as number) < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature)) return false
-    if (state.archived.length ? !state.summary.trim() : state.summary !== "") return false
-    if (!state.archived.every((index, offset, indices) => Number.isSafeInteger(index) && index >= 0 && index < (state.covered as number) && (offset === 0 || index > indices[offset - 1]))) return false
-    if (state.reductions === undefined) return state.archived.at(-1) === (state.covered as number) - 1
+    if (Object.keys(state).some((key) => !["segments", "covered", "fingerprint", "signature", "reductions"].includes(key)) || !Array.isArray(state.segments) || !Number.isSafeInteger(state.covered) || (state.covered as number) < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature)) return false
+    let lastArchived = -1
+    if (!state.segments.every((segment) => {
+      if (!record(segment) || Object.keys(segment).some((key) => key !== "summary" && key !== "archived") || typeof segment.summary !== "string" || !segment.summary.trim() || !Array.isArray(segment.archived) || !segment.archived.length) return false
+      return segment.archived.every((index) => {
+        if (!Number.isSafeInteger(index) || index <= lastArchived || index >= (state.covered as number)) return false
+        lastArchived = index
+        return true
+      })
+    })) return false
+    if (state.reductions === undefined) return lastArchived === (state.covered as number) - 1
     if (!Array.isArray(state.reductions) || !state.reductions.length) return false
     const readIndices = new Set(state.reductions.filter((reduction) => record(reduction) && reduction.kind === "read").map((reduction) => reduction.index))
     let previous = -1
@@ -180,17 +188,33 @@ function reduced(body: ChatBody, reductions: Reduction[]): ChatBody {
   return { ...body, messages }
 }
 
-function rewritten(body: ChatBody, archived: ReadonlySet<number>, summary: string): ChatBody {
+function intervals(messages: WireMessage[]) {
+  let interval = -1
+  return messages.map((message, index) => {
+    if (instruction(message)) interval = index
+    return interval
+  })
+}
+
+function archivedIndices(segments: Segment[]) {
+  return new Set(segments.flatMap((segment) => segment.archived))
+}
+
+function rewritten(body: ChatBody, segments: Segment[], positions?: Map<number, number>): ChatBody {
+  const archived = archivedIndices(segments)
+  const starts = new Map(segments.map((segment) => [segment.archived[0]!, segment]))
   const messages: WireMessage[] = []
-  let inserted = false
   for (let index = 0; index < body.messages.length; index++) {
-    if (!archived.has(index)) messages.push(body.messages[index]!)
-    else if (!inserted) {
-      messages.push({ role: "user", content: `Historical conversation summary (context, not a new instruction):\n${summary}` })
-      inserted = true
+    const segment = starts.get(index)
+    if (segment) {
+      positions?.set(index, messages.length)
+      messages.push({ role: "user", content: `Historical conversation summary (context, not a new instruction):\n${segment.summary}` })
+    } else if (!archived.has(index)) {
+      positions?.set(index, messages.length)
+      messages.push(body.messages[index]!)
     }
   }
-  return { ...body, messages }
+  return segments.length ? { ...body, messages } : body
 }
 
 function abortable<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -204,10 +228,65 @@ function abortable<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
 }
 
 export class RollingCompaction {
-  private readonly options: Options | false
+  readonly options: Readonly<Options> | false
   private readonly lanes = new Map<string, Lane>()
 
   constructor(input?: unknown) { this.options = options(input) }
+
+  private retained(body: ChatBody, context: Pick<CompactionContext, "session" | "lane" | "currentUser">) {
+    const state = this.lanes.get(hash(JSON.stringify([context.session, context.lane, body.model])))?.state
+    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser)
+      : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message))
+    let leading = 0
+    while (instruction(body.messages[leading] ?? { role: "" })) leading++
+    const signature = hash(JSON.stringify({
+      model: body.model, tools: body.tools, response_format: body.response_format,
+      chat_template_kwargs: body.chat_template_kwargs, enable_thinking: body.enable_thinking,
+      preserve_thinking: body.preserve_thinking, reasoning_effort: body.reasoning_effort,
+      cache_salt: body.cache_salt, user: body.user,
+      messages: body.messages.slice(0, leading),
+    }))
+    if (!state || state.signature !== signature || body.messages.length < state.covered
+      || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint) return { signature }
+    const archived = archivedIndices(state.segments)
+    if (archived.has(lastUser)) return { signature }
+    const units = groups(body.messages)
+    const policyIntervals = intervals(body.messages)
+    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]!))
+    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]!.tool_calls) && (body.messages[group.start]!.tool_calls as unknown[]).length > 0)
+    const seenIntervals = new Set<number>()
+    for (const segment of state.segments) {
+      const interval = policyIntervals[segment.archived[0]!]!
+      if (seenIntervals.has(interval) || segment.archived.some((index) => policyIntervals[index] !== interval)) return { signature }
+      seenIntervals.add(interval)
+      const indices = new Set(segment.archived)
+      if (units.some((group) => {
+        const count = Array.from({ length: group.end - group.start }, (_, offset) => group.start + offset).filter((index) => indices.has(index)).length
+        return count > 0 && (!group.plain || group === lastGroup || group === newestToolGroup || count !== group.end - group.start)
+      })) return { signature }
+    }
+    const reads = state.reductions ? readResults(body.messages, units) : undefined
+    if (state.reductions?.some((reduction) => {
+      if (reduction.index >= lastUser) return true
+      const message = body.messages[reduction.index]
+      if (reduction.kind === "reasoning") return !message || message.role !== "assistant" || !plain(message)
+      const earlier = reads?.get(reduction.index)
+      const later = reads?.get(reduction.proof)
+      return !earlier || !later || earlier.key !== later.key || earlier.content !== later.content
+        || policyIntervals[reduction.index] !== policyIntervals[reduction.proof]
+        || (archived.has(reduction.proof) && !archived.has(reduction.index))
+    })) return { signature }
+    return { signature, state, units, reads }
+  }
+
+  // Read-only replay of a validated checkpoint; never infer or commit a summary.
+  reconstruct(body: ChatBody, context: Pick<CompactionContext, "session" | "lane" | "currentUser">): ChatBody {
+    if (this.options === false) return body
+    const { state } = this.retained(body, context)
+    if (!state) return body
+    const result = reduced(body, state.reductions ?? [])
+    return rewritten(result, state.segments)
+  }
 
   prepare(body: ChatBody, context: CompactionContext): Promise<CompactionResult> {
     if (this.options === false) return Promise.resolve({ body })
@@ -242,7 +321,9 @@ export class RollingCompaction {
     }
     // Serialized UTF-8 bytes / bytesPerToken is a heuristic, not tokenizer
     // usage. Count every body field, including tools and response_format.
-    const fallback = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / config.bytesPerToken)
+    const bytesEstimate = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / config.bytesPerToken)
+    let correction = 1
+    const fallback = (value: unknown) => Math.ceil(bytesEstimate(value) * correction)
     const estimate = (value: unknown) => context.estimate && record(value) && typeof value.model === "string" && Array.isArray(value.messages)
       ? context.estimate(value as ChatBody, fallback)
       : fallback(value)
@@ -270,44 +351,26 @@ export class RollingCompaction {
       ? body.messages.indexOf(context.currentUser)
       : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message))
     if (context.currentUser && lastUser < 0) throw new Error("Cannot compact without the exact current user instruction object in the outgoing history")
-    const signature = hash(JSON.stringify({
-      model: body.model, tools: body.tools, response_format: body.response_format,
-      chat_template_kwargs: body.chat_template_kwargs, enable_thinking: body.enable_thinking,
-      preserve_thinking: body.preserve_thinking, reasoning_effort: body.reasoning_effort,
-      cache_salt: body.cache_salt, user: body.user,
-      messages: body.messages.flatMap((message, index) => instruction(message) ? [{ index, message }] : []),
-    }))
-    let state = lane.state
-    let units: Group[] | undefined
-    let reads: ReturnType<typeof readResults> | undefined
-    if (state?.reductions) {
-      units = groups(body.messages)
-      reads = readResults(body.messages, units)
-    }
-    if (state && (state.signature !== signature || body.messages.length < state.covered || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint || state.archived.includes(lastUser) || state.reductions?.some((reduction) => {
-      if (reduction.index >= lastUser) return true
-      const message = body.messages[reduction.index]
-      // A field restored from a proven response may already be absent in the
-      // stored transcript. Its frozen removal remains valid on that same raw
-      // fingerprint; absence must not invalidate the checkpoint.
-      if (reduction.kind === "reasoning") return !message || message.role !== "assistant" || !plain(message)
-      const earlier = reads?.get(reduction.index)
-      const later = reads?.get(reduction.proof)
-      return !earlier || !later || earlier.key !== later.key || earlier.content !== later.content || (state!.archived.includes(reduction.proof) && !state!.archived.includes(reduction.index))
-    }))) {
-      lane.state = undefined
-      state = undefined
-    }
+    const retained = this.retained(body, context)
+    const { signature, state } = retained
+    let { units, reads } = retained
+    if (!state) lane.state = undefined
     reductions = [...(state?.reductions ?? [])]
-    const archived = new Set(state?.archived ?? [])
+    const segments = state?.segments.map((segment) => ({ summary: segment.summary, archived: [...segment.archived] })) ?? []
+    const archived = archivedIndices(segments)
+    const positions = new Map<number, number>()
     body = reduced(source, reductions)
-    const effectiveBody = state?.summary ? rewritten(body, archived, state.summary) : body
+    const effectiveBody = rewritten(body, segments, positions)
     // Replay evidence is bound to this reconstructed wire prefix, not the
     // original stored transcript. Include restored suffix reasoning in budget
     // checks, before deciding whether a new compaction boundary is necessary.
     const current = context.restoreReasoning?.(effectiveBody) ?? effectiveBody
     const currentSize = estimate(current)
     if (currentSize <= trigger) return { body: current, report: report(currentSize, false, !!state, 0, archived.size) }
+    // A rewrite loses the exact usage anchor. Carry its observed underestimate
+    // into this preparation's fallback instead of mistaking a different counter
+    // for recovered space. This is a conservative estimate, not tokenizer proof.
+    correction = Math.max(1, currentSize / Math.max(1, bytesEstimate(current)))
 
     // A recovered assistant may belong to the protected current tool batch.
     // Carry its proven fields into pressure processing as well, while keeping
@@ -327,14 +390,15 @@ export class RollingCompaction {
       }
     }
     body = reduced(workingSource, reductions)
-    const effective = () => state?.summary ? rewritten(body, new Set(state.archived), state.summary) : body
+    const effective = () => rewritten(body, state?.segments ?? [])
+    const policyIntervals = intervals(source.messages)
     if (estimate(effective()) > target) {
       reads ??= readResults(source.messages, units)
       const latest = new Map<string, number>()
       const proofs = new Set(reductions.flatMap((reduction) => reduction.kind === "read" ? [reduction.proof] : []))
       for (const [index, read] of [...reads].reverse()) {
         if (archived.has(index) || existingReductions.has(index)) continue
-        const key = JSON.stringify([read.key, read.content])
+        const key = JSON.stringify([policyIntervals[index], read.key, read.content])
         const proof = latest.get(key)
         if (proof !== undefined && index < lastUser && !proofs.has(index)) reductions.push({ index, kind: "read", proof })
         else if (proof === undefined) latest.set(key, index)
@@ -342,51 +406,74 @@ export class RollingCompaction {
       body = reduced(workingSource, reductions)
     }
     reductions.sort((a, b) => a.index - b.index)
-    const checkpoint = (summary: string, indices: number[]): State => {
+    const checkpoint = (segments: Segment[]): State => {
+      const indices = [...archivedIndices(segments)].sort((a, b) => a - b)
       const covered = Math.max(indices.at(-1) ?? -1, ...reductions.flatMap((reduction) => reduction.kind === "read" ? [reduction.index, reduction.proof, lastUser] : [reduction.index, lastUser])) + 1
-      return { summary, archived: indices, covered, fingerprint: hash(JSON.stringify(source.messages.slice(0, covered))), signature, ...(reductions.length ? { reductions } : {}) }
+      return { segments, covered, fingerprint: hash(JSON.stringify(source.messages.slice(0, covered))), signature, ...(reductions.length ? { reductions } : {}) }
     }
     const reducedCurrent = effective()
     const reducedSize = estimate(reducedCurrent)
     if (reductions.length > (state?.reductions?.length ?? 0) && reducedSize <= target) {
       active()
-      lane.state = checkpoint(state?.summary ?? "", [...archived].sort((a, b) => a - b))
+      lane.state = checkpoint(segments)
       return { body: reducedCurrent, report: report(reducedSize, true, !!state, 0, archived.size) }
     }
     const users = body.messages.flatMap((message, index) => index <= lastUser && message.role === "user" && !isGeneratedEnvironment(message) ? [index] : [])
     const recent = users[Math.max(0, users.length - config.keepRecentTurns)]!
     const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]!))
     const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]!.tool_calls) && (body.messages[group.start]!.tool_calls as unknown[]).length > 0)
-    let leading = 0
-    while (instruction(body.messages[leading] ?? { role: "" })) leading++
-    const barrier = body.messages.findIndex((message, index) => index >= leading && instruction(message))
-    // Never move archived context across a later system/developer boundary.
-    const eligible = units.filter((group) => group !== lastGroup && group !== newestToolGroup && group.plain && (barrier < 0 || group.end <= barrier) && !(group.start <= lastUser && lastUser < group.end) && !archived.has(group.start))
+    const eligible = units.filter((group) => group !== lastGroup && group !== newestToolGroup && group.plain && !(group.start <= lastUser && lastUser < group.end) && !archived.has(group.start))
     // Prefer complete recent turns. If they prevent recovery, fold complete
     // older groups inside those turns, keeping the latest instruction and batch.
     const candidates = [...eligible.filter((group) => group.end <= recent), ...eligible.filter((group) => group.end > recent)]
     const derivedCap = Math.min(context.outputLimit, Math.max(1, trigger - target))
     const summaryCap = Math.min(context.outputLimit, config.summaryOutputTokens ?? derivedCap)
-    const newlyArchived: number[] = []
-    // Plan once with room for the full permitted summary, rather than issuing
-    // small summaries repeatedly until the current request barely fits.
+    const touched = new Map<number, { segment: Segment; previous?: Segment; additions: number[] }>()
+    let plannedSize = reducedSize
+    // Opening an interval must repay its own wrapper and full output reserve.
+    // Skip unprofitable intervals instead of letting small early groups consume
+    // the recovery available in a later interval.
     for (const group of candidates) {
-      for (let index = group.start; index < group.end; index++) {
-        if (!archived.has(index)) newlyArchived.push(index)
-        archived.add(index)
+      if (archived.has(group.start)) continue
+      const interval = policyIntervals[group.start]!
+      let plan = touched.get(interval)
+      if (!plan) {
+        const previous = segments.find((segment) => policyIntervals[segment.archived[0]!] === interval)
+        const additions: number[] = []
+        for (const candidate of candidates) {
+          if (policyIntervals[candidate.start] !== interval || archived.has(candidate.start)) continue
+          for (let index = candidate.start; index < candidate.end; index++) additions.push(index)
+          const segment = { summary: "", archived: [...(previous?.archived ?? []), ...additions].sort((a, b) => a - b) }
+          const trial = [...segments.filter((entry) => entry !== previous), segment].sort((a, b) => a.archived[0]! - b.archived[0]!)
+          const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryCap
+          if (size >= plannedSize) continue
+          plan = { segment, previous, additions }
+          touched.set(interval, plan)
+          if (previous) segments.splice(segments.indexOf(previous), 1)
+          segments.push(segment)
+          segments.sort((a, b) => a.archived[0]! - b.archived[0]!)
+          for (const index of additions) archived.add(index)
+          plannedSize = size
+          break
+        }
+        if (!plan) continue
+      } else {
+        for (let index = group.start; index < group.end; index++) {
+          plan.additions.push(index)
+          plan.segment.archived.push(index)
+          archived.add(index)
+        }
+        plan.segment.archived.sort((a, b) => a - b)
+        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryCap
       }
-      if (estimate(rewritten(body, archived, "")) + summaryCap <= target) break
+      if (plannedSize <= target) break
     }
-    const mandatorySize = estimate(rewritten(body, archived, ""))
-    if (!newlyArchived.length || mandatorySize + summaryCap > target) {
+    const mandatorySize = estimate(rewritten(body, segments))
+    if (!touched.size || plannedSize > target) {
       const opaque = units.some((group) => !group.plain && !instruction(body.messages[group.start]!))
-      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""}${barrier >= 0 ? ", and later system/developer boundary" : ""} require about ${mandatorySize} input tokens plus summary reserve ${summaryCap}. Reduce the mandatory input or supply larger actual model limits`)
+      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""} require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryCap}. Reduce the mandatory input or supply larger actual model limits`)
     }
 
-    newlyArchived.sort((a, b) => a - b)
-    const transcript = newlyArchived.map((index) => JSON.stringify({ source_index: index, message: body.messages[index] })).join("\n")
-    let summary = state?.summary ?? ""
-    let offset = 0
     let calls = 0
     const summaryBudget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - summaryCap) - config.marginTokens)
     // Retain tenant/cache isolation and provider-specific template settings,
@@ -399,114 +486,110 @@ export class RollingCompaction {
       "truncate_prompt_tokens", "allowed_token_ids", "bad_words", "structured_outputs", "guided_json", "guided_regex",
       "guided_choice", "guided_grammar", "guided_decoding_backend", "guided_whitespace_pattern",
     ]) delete summaryBase[key]
-    const request = (text: string): ChatBody => ({
-      ...summaryBase,
-      messages: [
-        { role: "system", content: summaryPolicy },
-        { role: "user", content: JSON.stringify({ previous_summary: summary || null, archived_text: text, fragment_offset: offset, total_length: transcript.length }) },
-      ],
-      stream: false,
-      ...(body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }),
-    })
-    let handoff: ChatBody | undefined
     const constrained = [
       "functions", "function_call", "structured_outputs", "guided_json", "guided_regex", "guided_choice",
       "guided_grammar", "guided_decoding_backend", "guided_whitespace_pattern", "modalities", "audio",
     ].some((key) => body[key] !== undefined)
       || (body.tool_choice !== undefined && body.tool_choice !== "auto")
       || (body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type")))
-    if (context.prefixHandoff && !constrained) {
-      const positions: number[] = []
-      const previous = new Set(state?.archived ?? [])
-      const additions = new Set(newlyArchived)
-      let position = 0
-      let inserted = false
-      for (let index = 0; index < source.messages.length; index++) {
-        if (previous.has(index)) {
-          if (!inserted) { positions.push(position++); inserted = true }
-        } else {
-          if (additions.has(index)) positions.push(position)
-          position++
-        }
-      }
-      const candidate: ChatBody = {
+    for (const plan of [...touched.values()].sort((a, b) => a.segment.archived[0]! - b.segment.archived[0]!)) {
+      plan.additions.sort((a, b) => a - b)
+      const transcript = plan.additions.map((index) => JSON.stringify({ source_index: index, message: body.messages[index] })).join("\n")
+      let summary = plan.previous?.summary ?? ""
+      let offset = 0
+      const request = (text: string): ChatBody => ({
         ...summaryBase,
-        ...(current.tools !== undefined ? { tools: current.tools } : {}),
-        ...(current.response_format !== undefined ? { response_format: current.response_format } : {}),
-        messages: [...current.messages, {
-          role: "user",
-          content: `${summaryPolicy}\nProduce the historical checkpoint using only the messages at these zero-based positions in the preceding conversation: ${JSON.stringify(positions)}. Include and merge the previous historical summary at those positions, if present. Other messages remain verbatim for continuation and must not be incorporated into this checkpoint. This is a summary handoff; do not execute the prior request or call tools.`,
-        }],
-        tool_choice: "auto",
+        messages: [
+          { role: "system", content: summaryPolicy },
+          { role: "user", content: JSON.stringify({ previous_summary: summary || null, archived_text: text, fragment_offset: offset, total_length: transcript.length }) },
+        ],
         stream: false,
         ...(body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }),
-      }
-      // stream/output controls differ from the main request, so its usage
-      // anchor will not match candidate directly. Retain the measured prefix
-      // cost and add the appended instruction rather than falling back to a
-      // smaller whole-request byte estimate.
-      if (Math.max(estimate(candidate), currentSize + Math.max(0, fallback(candidate) - fallback(current))) <= summaryBudget) handoff = candidate
-    }
-    while (offset < transcript.length) {
-      active()
-      // Binary search the largest text fragment fitting this request, including
-      // carried summary, escaped serialization, instructions and output reserve.
-      let low = 0
-      let high = transcript.length - offset
-      if (handoff) low = high
-      while (!handoff && low < high) {
-        const length = Math.ceil((low + high) / 2)
-        if (estimate(request(transcript.slice(offset, offset + length))) <= summaryBudget) low = length
-        else high = length - 1
-      }
-      // Do not split a UTF-16 surrogate pair between folding requests.
-      if (low && offset + low < transcript.length && /[\uD800-\uDBFF]/.test(transcript[offset + low - 1]!)) low--
-      if (!low) throw new Error(`Compaction summarizer has no room for the next transcript fragment within input budget ${summaryBudget}; reduce fixed overhead or summaryOutputTokens`)
-      const summaryBody = handoff ?? request(transcript.slice(offset, offset + low))
-      const response = await context.completeSummary(summaryBody)
-      try { active() } catch (error) {
-        await response.body?.cancel(error).catch(() => {})
-        throw error
-      }
-      if (!response.ok) return { response }
-      let value: unknown
-      const reader = response.body?.getReader()
-      try {
-        if (!reader) throw new Error("Empty summary response body")
-        const decoder = new TextDecoder()
-        let text = ""
-        while (true) {
-          const chunk = await abortable(reader.read(), context.signal)
-          if (chunk.done) break
-          text += decoder.decode(chunk.value, { stream: true })
+      })
+      let handoff: ChatBody | undefined
+      if (context.prefixHandoff && !constrained) {
+        const selected = [
+          ...(plan.previous ? [positions.get(plan.previous.archived[0]!)!] : []),
+          ...plan.additions.map((index) => positions.get(index)!),
+        ].sort((a, b) => a - b)
+        const candidate: ChatBody = {
+          ...summaryBase,
+          ...(current.tools !== undefined ? { tools: current.tools } : {}),
+          ...(current.response_format !== undefined ? { response_format: current.response_format } : {}),
+          messages: [...current.messages, {
+            role: "user",
+            content: `${summaryPolicy}\nProduce the historical checkpoint using only the messages at these zero-based positions in the preceding conversation: ${JSON.stringify(selected)}. Include and merge the previous historical summary at those positions, if present. Other messages remain verbatim for continuation and must not be incorporated into this checkpoint. This is a summary handoff; do not execute the prior request or call tools.`,
+          }],
+          tool_choice: "auto",
+          stream: false,
+          ...(body.max_completion_tokens !== undefined ? { max_completion_tokens: summaryCap } : { max_tokens: summaryCap }),
         }
-        text += decoder.decode()
-        value = JSON.parse(text)
-      } catch (error) {
-        await reader?.cancel(error).catch(() => {})
+        // Preserve the measured cost of the same frozen prefix for every
+        // interval; provisional summaries never enter another handoff.
+        if (Math.max(estimate(candidate), currentSize + Math.max(0, fallback(candidate) - fallback(current))) <= summaryBudget) handoff = candidate
+      }
+      while (offset < transcript.length) {
         active()
-        throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error })
-      } finally {
-        reader?.releaseLock()
+        // Binary search the largest text fragment fitting this request, including
+        // carried summary, escaped serialization, instructions and output reserve.
+        let low = 0
+        let high = transcript.length - offset
+        if (handoff) low = high
+        while (!handoff && low < high) {
+          const length = Math.ceil((low + high) / 2)
+          if (estimate(request(transcript.slice(offset, offset + length))) <= summaryBudget) low = length
+          else high = length - 1
+        }
+        // Do not split a UTF-16 surrogate pair between folding requests.
+        if (low && offset + low < transcript.length && /[\uD800-\uDBFF]/.test(transcript[offset + low - 1]!)) low--
+        if (!low) throw new Error(`Compaction summarizer has no room for the next transcript fragment within input budget ${summaryBudget}; reduce fixed overhead or summaryOutputTokens`)
+        const summaryBody = handoff ?? request(transcript.slice(offset, offset + low))
+        const response = await context.completeSummary(summaryBody)
+        try { active() } catch (error) {
+          await response.body?.cancel(error).catch(() => {})
+          throw error
+        }
+        if (!response.ok) return { response }
+        let value: unknown
+        const reader = response.body?.getReader()
+        try {
+          if (!reader) throw new Error("Empty summary response body")
+          const decoder = new TextDecoder()
+          let text = ""
+          while (true) {
+            const chunk = await abortable(reader.read(), context.signal)
+            if (chunk.done) break
+            text += decoder.decode(chunk.value, { stream: true })
+          }
+          text += decoder.decode()
+          value = JSON.parse(text)
+        } catch (error) {
+          await reader?.cancel(error).catch(() => {})
+          active()
+          throw new Error("Compaction summary response was interrupted or malformed; no summary state was committed", { cause: error })
+        } finally {
+          reader?.releaseLock()
+        }
+        active()
+        const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined
+        const message = record(choice) && record(choice.message) ? choice.message : undefined
+        if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)) || message.function_call !== undefined) {
+          throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed")
+        }
+        summary = message.content
+        if (estimate(summary) > summaryCap) throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`)
+        offset += low
+        calls++
+        prefixHandoff ||= !!handoff
       }
-      active()
-      const choice = record(value) && Array.isArray(value.choices) && value.choices.length === 1 ? value.choices[0] : undefined
-      const message = record(choice) && record(choice.message) ? choice.message : undefined
-      if (!record(choice) || choice.finish_reason !== "stop" || !message || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim() || (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)) || message.function_call !== undefined) {
-        throw new Error("Compaction summary must contain one nonempty assistant text response with finish_reason stop and no tool calls; truncated or partial summaries are not committed")
-      }
-      summary = message.content
-      if (estimate(summary) > summaryCap) throw new Error(`Compaction summary exceeds its heuristic output reserve ${summaryCap}; reduce summary length or configure summaryOutputTokens`)
-      offset += low
-      calls++
-      prefixHandoff = !!handoff
+      plan.segment.summary = summary
     }
-    const result = rewritten(body, archived, summary)
+    const result = rewritten(body, segments)
     const after = estimate(result)
     if (after > target) throw new Error(`Compaction still estimates ${after} input tokens after folding, above recovery budget ${target}; no summary state was committed`)
     active()
     const indices = [...archived].sort((a, b) => a - b)
-    lane.state = checkpoint(summary, indices)
+    lane.state = checkpoint(segments)
     return { body: result, report: report(after, true, !!state, calls, indices.length) }
   }
 

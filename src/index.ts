@@ -140,14 +140,14 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       })
       if (options.persistence !== false) store = new CheckpointStore(
         join(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]),
-        JSON.stringify({
-          version: 1, providers: [...providers].sort(), compaction: options.compaction,
+        JSON.stringify(canonical({
+          version: 1, providers: [...providers].sort(), compaction: compaction.options,
           compactPrompt: options.compactPrompt !== false, compactSkills: options.compactSkills !== false, compactTools: options.compactTools !== false,
           stabilizeEnvironment: options.stabilizeEnvironment !== false, retainModeReminders: options.retainModeReminders !== false,
-          canonicalToolSchemas: options.canonicalToolSchemas !== false, glm: options.glm,
+          canonicalToolSchemas: options.canonicalToolSchemas !== false, glm,
           sessionHeads: options.sessionHeads !== false, prefixGuard: options.prefixGuard !== false,
-          prefixHandoff: options.prefixHandoff !== false, shrinkToolOutputs: options.shrinkToolOutputs,
-        }),
+          prefixHandoff: options.prefixHandoff !== false, shrinkToolOutputs: outputShrinker?.limits ?? false,
+        })),
       )
       for (const target of targets) {
         target.provider.options ??= {}
@@ -175,8 +175,9 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           const currentUser = userTurns.consume(body.messages, session && expectedUser ? userTurns.marker(session, expectedUser) : undefined)
           // Endpoint and credential identity isolate restored state and usage
           // even when provider aliases or session affinity headers are shared.
-          const lane = hash(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]))
-          const headScope = hash(JSON.stringify([target.id, target.endpoint.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]))
+          url.hash = ""
+          const lane = hash(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]))
+          const headScope = hash(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]))
           const headLane = hash(JSON.stringify([headScope, agent]))
           if (session) {
             const lanes = sessionLanes.get(session) ?? new Set<string>()
@@ -210,7 +211,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             delete body[camel]
           }
           if (options.promptCacheKey === true && session) body.prompt_cache_key ??= session
-          if (options.usageAccounting !== false && body.stream === true && (body.stream_options === undefined || body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options))) {
+          if (options.usageAccounting !== false && target.provider.options?.includeUsage !== false && body.stream === true && (body.stream_options === undefined || body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options))) {
             body.stream_options = { include_usage: true, ...body.stream_options as Record<string, unknown> | undefined }
           }
           if (maxOutputTokens !== undefined) {
@@ -261,10 +262,26 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             })
           }
           const prepare = async () => {
-            if (session && agent && options.stabilizeEnvironment !== false) environments.apply(body.messages, session, lane)
+            const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined
+            const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined }
+            const replacements = new Map<ChatBody["messages"][number], ChatBody["messages"][number]>()
+            if (session && agent && options.prefixGuard !== false) {
+              const sources = new Set(body.messages)
+              let probe = { ...body, messages: [...body.messages] }
+              if (options.stabilizeEnvironment !== false) environments.apply(probe.messages, session, lane, { reconstruct: true })
+              if (options.sessionHeads !== false) probe = heads.apply(probe, { ...headContext, reconstruct: true }).body
+              if (encodedLimits && options.compaction !== false) probe = compaction.reconstruct(probe, { session, lane, currentUser })
+              const restored = prefixGuard.apply(probe, { session, lane, currentUser, observe: false })
+              for (const { index } of restored.report.replayed) {
+                const source = probe.messages[index]!
+                if (sources.has(source)) replacements.set(source, restored.body.messages[index]!)
+              }
+            }
+            // Proofs affect anchor validation only. Emit the raw source objects:
+            // a real policy/history reset must still invalidate final wire replay.
+            if (session && agent && options.stabilizeEnvironment !== false) environments.apply(body.messages, session, lane, { replacements })
             if (session && agent && options.sessionHeads !== false) {
-              const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined
-              const prepared = heads.apply(body, { session, lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined })
+              const prepared = heads.apply(body, { ...headContext, replacements })
               body = prepared.body
               await log("Session head contract", { ...prepared.report })
               if (!["title", "summary", "compaction"].includes(agent)) {

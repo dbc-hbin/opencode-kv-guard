@@ -10,7 +10,7 @@ import { isSessionHeadsSnapshot, isPrefixGuardSnapshot, type SessionHeadsSnapsho
 export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot; heads?: SessionHeadsSnapshot; prefixGuard?: PrefixGuardSnapshot }
 export type CheckpointLoad = { revision: string | null; snapshot: CheckpointSnapshot | null; reason?: "malformed" | "version" | "deleted" }
 type Row = { revision: string; version: number; payload: string | null; deleted: number }
-const version = 1
+const version = 2
 const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 
 export function isCheckpointSnapshot(value: unknown, session: string): value is CheckpointSnapshot {

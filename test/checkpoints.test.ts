@@ -5,6 +5,7 @@ import { mkdtemp, readdir, rm, stat, symlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import plugin from "../src/index"
 import { CheckpointConflictError, CheckpointStore, isCheckpointSnapshot, type CheckpointSnapshot } from "../src/checkpoints"
 import { RollingCompaction, isCompactionSnapshot, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
@@ -16,12 +17,27 @@ const providers = new Set(["proxy"])
 const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const empty = (): CheckpointSnapshot => ({ modes: { messages: [] }, environments: { lanes: [] }, compaction: { lanes: [] } })
 
-test("completed response replay survives immediate disposal and restart without reviving edited content", async () => {
+test.each([
+  { label: "unchanged configuration", before: {}, after: {} },
+  {
+    label: "reordered configuration",
+    before: { glm: { models: ["fixture"], reasoningEffort: "max", clearThinking: false } },
+    after: { glm: { clearThinking: false, reasoningEffort: "max", models: ["fixture"] } },
+  },
+  {
+    label: "explicit effective defaults",
+    before: { compaction: {}, shrinkToolOutputs: {} },
+    after: {
+      compaction: { marginTokens: 0, keepRecentTurns: 1, targetRatio: 0.8, triggerRatio: 0.85, bytesPerToken: 4 },
+      shrinkToolOutputs: { maxLines: 400, maxBytes: 16384 },
+    },
+  },
+])("completed replay survives restart with $label without reviving edited content", async ({ before, after }) => {
   const stateDirectory = await root()
   const captured: ChatBody[] = []
-  const start = async () => {
+  const start = async (overrides: Record<string, unknown>) => {
     const hooks = await plugin({ directory: "/fixture", worktree: "/fixture" } as PluginInput, {
-      providers: ["proxy"], stateDirectory, crossProcess: false, compaction: false,
+      providers: ["proxy"], stateDirectory, crossProcess: false, compaction: false, ...overrides,
     })
     const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
       baseURL: "http://replay.test/v1",
@@ -40,14 +56,122 @@ test("completed response replay survives immediate disposal and restart without 
     })
     await response.text()
   }
-  const first = await start()
+  const first = await start(before)
   await request(first)
   await first.hooks.dispose!()
-  const restarted = await start()
+  const restarted = await start(after)
   await request(restarted, [{ role: "assistant", content: "Answer" }, { role: "user", content: "Next" }])
   expect(captured[1]!.messages[2]!.reasoning_content).toBe("Recorded reasoning")
   await request(restarted, [{ role: "assistant", content: "Edited answer" }, { role: "user", content: "Next" }])
   expect(captured[2]!.messages[2]!.reasoning_content).toBeUndefined()
+  await restarted.hooks.dispose!()
+})
+
+test("actual SDK query identities isolate replay across requests and checkpoint restarts", async () => {
+  const stateDirectory = await root()
+  const captured: { url: string; body: ChatBody }[] = []
+  const start = async (tenant: string) => {
+    const hooks = await plugin({ directory: "/query-fixture", worktree: "/query-fixture" } as PluginInput, {
+      providers: ["proxy"], stateDirectory, crossProcess: false, compaction: false,
+    })
+    const queryParams = { tenant }
+    const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
+      name: "fixture", baseURL: "http://query-replay.test/v1", queryParams,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        captured.push({ url: String(input), body: JSON.parse(String(init?.body)) as ChatBody })
+        return Response.json({ id: "fixture", model: "fixture", created: 1, choices: [{
+          index: 0, message: { role: "assistant", content: "Answer", reasoning_content: `Reasoning ${queryParams.tenant}` }, finish_reason: "stop",
+        }] })
+      },
+    } } } }
+    await hooks.config!(config)
+    return { hooks, queryParams, model: createOpenAICompatible({
+      ...config.provider.proxy.options, fetch: Object.assign(config.provider.proxy.options.fetch, { preconnect: globalThis.fetch.preconnect }),
+    }).chatModel("fixture") }
+  }
+  const prompt = [
+    { role: "system" as const, content: "Policy" },
+    { role: "user" as const, content: [{ type: "text" as const, text: "Task" }] },
+  ]
+  const continued = [...prompt,
+    { role: "assistant" as const, content: [{ type: "text" as const, text: "Answer" }] },
+    { role: "user" as const, content: [{ type: "text" as const, text: "Next" }] },
+  ]
+  const headers = { "x-opencode-session-id": "query-session", "x-opencode-kv-guard-agent": "build" }
+  const first = await start("a")
+  await first.model.doGenerate({ prompt, headers })
+  first.queryParams.tenant = "b"
+  await first.model.doGenerate({ prompt: continued, headers })
+  expect(captured[1]!.url).toEndWith("?tenant=b")
+  expect(captured[1]!.body.messages[2]!.reasoning_content).toBeUndefined()
+  await first.hooks.dispose!()
+  const restarted = await start("c")
+  await restarted.model.doGenerate({ prompt: continued, headers })
+  expect(captured[2]!.body.messages[2]!.reasoning_content).toBeUndefined()
+  restarted.queryParams.tenant = "a"
+  await restarted.model.doGenerate({ prompt: continued, headers })
+  expect(captured[3]!.body.messages[2]!.reasoning_content).toBe("Reasoning a")
+  await restarted.hooks.dispose!()
+})
+
+test.each(["policy", "environment"])("reasoning reconstruction preserves anchored %s notices across restart", async (kind) => {
+  const stateDirectory = await root()
+  const captured: ChatBody[] = []
+  const start = async () => {
+    const hooks = await plugin({ directory: "/anchor-fixture", worktree: "/anchor-fixture" } as PluginInput, {
+      providers: ["proxy"], stateDirectory, crossProcess: false, compaction: false,
+    })
+    const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
+      baseURL: "http://anchor-replay.test/v1",
+      fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        captured.push(JSON.parse(String(init?.body)) as ChatBody)
+        return Response.json({ choices: [{ index: 0, message: {
+          role: "assistant", content: captured.length === 1 ? "Answer" : "Second",
+          reasoning_content: captured.length === 1 ? "Recorded reasoning" : "Second reasoning",
+        }, finish_reason: "stop" }] })
+      },
+    } } } }
+    await hooks.config!(config)
+    return {
+      hooks,
+      async send(messages: WireMessage[]) {
+        const response = await config.provider.proxy.options.fetch("http://anchor-replay.test/v1/chat/completions", {
+          method: "POST", headers: { "x-opencode-session-id": "anchors", "x-opencode-kv-guard-agent": "build" },
+          body: JSON.stringify({ model: "fixture", messages }),
+        })
+        await response.text()
+      },
+    }
+  }
+  const environment = (cwd: string) => ({
+    role: "system", content: `Policy\nYou are powered by the model named fixture. The exact model ID is proxy/fixture\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: ${cwd}\n  Workspace root folder: /project\n  Is directory a git repo: yes\n  Platform: linux\n</env>`,
+  })
+  const policy = { role: "system", content: "Policy" }
+  const initial = kind === "policy" ? [policy] : [environment("/project")]
+  const updated = kind === "policy" ? [policy, { role: "developer", content: "Additional policy" }] : [environment("/new")]
+  const task = { role: "user", content: "Task" }
+  const answer = { role: "assistant", content: "Answer", reasoning_content: "Recorded reasoning" }
+  const next = { role: "user", content: "Next" }
+  const first = await start()
+  await first.send([...initial, task])
+  await first.send([...updated, task, answer, next])
+  await first.hooks.dispose!()
+  const restarted = await start()
+  const continued = [...updated, task, { role: "assistant", content: "Answer" }, next,
+    { role: "assistant", content: "Second", reasoning_content: "Second reasoning" }, { role: "user", content: "Third" }]
+  await restarted.send(continued)
+  expect(captured[2]!.messages.slice(0, captured[1]!.messages.length)).toEqual(captured[1]!.messages)
+  const again = continued.map((message) => message.role === "assistant" ? { role: message.role, content: message.content } : message)
+  again.push({ role: "assistant", content: "Second" }, { role: "user", content: "Fourth" })
+  await restarted.send(again)
+  expect(captured[3]!.messages.slice(0, captured[2]!.messages.length)).toEqual(captured[2]!.messages)
+  const edited = structuredClone(again)
+  edited[updated.length + 1]!.content = "Edited answer"
+  await restarted.send(edited)
+  expect(captured[4]!.messages.find((message) => message.content === "Edited answer")?.reasoning_content).toBeUndefined()
+  expect(captured[4]!.messages.some((message) => kind === "policy"
+    ? message.role === "developer" && message.content === "Additional policy"
+    : String(message.content).includes("Working directory: /new"))).toBe(true)
   await restarted.hooks.dispose!()
 })
 
@@ -105,6 +229,62 @@ test.each(["summary", "reasoning", "replay-pressure", "restored-pressure"])("rea
     expect(captured[2]!.messages.findLast((message) => message.role === "assistant")?.reasoning_content).toBe("Recent reasoning")
   }
   await hooks.dispose!()
+})
+
+test.each(["policy", "environment"])("anchored %s survives compaction retiring the reasoning proof", async (kind) => {
+  const stateDirectory = await root()
+  const captured: ChatBody[] = []
+  const start = async () => {
+    const hooks = await plugin({ directory: "/retired-proof", worktree: "/retired-proof" } as PluginInput, {
+      providers: ["proxy"], stateDirectory, crossProcess: false, compaction: { bytesPerToken: 1 },
+    })
+    const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
+      baseURL: "http://retired-proof.test/v1",
+      fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as ChatBody
+        if (body.stream === false) throw new Error("Tiny source history needs no semantic summary")
+        captured.push(body)
+        return Response.json({ choices: [{ index: 0, message: {
+          role: "assistant", content: captured.length === 1 ? "Answer" : "Second",
+          reasoning_content: captured.length === 1 ? "r".repeat(6000) : "Second reasoning",
+        }, finish_reason: "stop" }] })
+      },
+    } } } }
+    await hooks.config!(config)
+    return {
+      hooks,
+      async send(messages: WireMessage[], id: string) {
+        const transformed = { messages: [user(id, String(messages.at(-1)!.content))] }
+        await hooks["experimental.chat.messages.transform"]!({}, transformed)
+        const part = transformed.messages[0]!.parts[0]!
+        if (part.type !== "text") throw new Error("Expected user text")
+        const response = await config.provider.proxy.options.fetch("http://retired-proof.test/v1/chat/completions", {
+          method: "POST", headers: {
+            "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build",
+            "x-opencode-kv-guard-user": id, "x-opencode-kv-guard-limits": JSON.stringify({ context: 5000, output: 500 }),
+          },
+          body: JSON.stringify({ model: "fixture", messages: [...messages.slice(0, -1), { role: "user", content: part.text }], max_tokens: 500, stream: true }),
+        })
+        await response.text()
+      },
+    }
+  }
+  const policy = { role: "system", content: "Policy" }
+  const initial = kind === "policy" ? [policy] : environment().slice(0, 1)
+  const updated = kind === "policy" ? [policy, { role: "developer", content: "Additional policy" }] : environment("/new").slice(0, 1)
+  const task = { role: "user", content: "Task" }
+  const next = { role: "user", content: "Next" }
+  const first = await start()
+  await first.send([...initial, task], "one")
+  const second = [...updated, task, { role: "assistant", content: "Answer" }, next]
+  await first.send(second, "two")
+  expect(captured[1]!.messages.find((message) => message.content === "Answer")?.reasoning_content).toBeUndefined()
+  await first.hooks.dispose!()
+  const restarted = await start()
+  await restarted.send([...second, { role: "assistant", content: "Second" }, { role: "user", content: "Third" }], "three")
+  expect(captured[2]!.messages.slice(0, captured[1]!.messages.length)).toEqual(captured[1]!.messages)
+  expect(captured[2]!.messages.findLast((message) => message.role === "assistant")?.reasoning_content).toBe("Second reasoning")
+  await restarted.hooks.dispose!()
 })
 
 test("auxiliary providers cannot change the eligibility of an executing tool output", async () => {
@@ -341,7 +521,7 @@ describe("completed session snapshots", () => {
     await compaction.prepare(history(), context(async () => success()))
     for (const indices of [[-1], [1, 1], [2, 1], [0.5], [Number.MAX_SAFE_INTEGER + 1]]) {
       const invalid = compaction.snapshot("session")
-      invalid.lanes[0]!.state.archived = indices
+      invalid.lanes[0]!.state.segments[0]!.archived = indices
       expect(isCompactionSnapshot(invalid)).toBe(false)
     }
     const bundle = { modes: badMode, environments: environments.snapshot("session"), compaction: compaction.snapshot("session") }
@@ -420,7 +600,7 @@ describe("filesystem checkpoint CAS", () => {
     expect(unsupported).toMatchObject({ snapshot: null, reason: "version" })
     await store.save("session", empty(), unsupported.revision)
     expect((await store.load("session")).snapshot).toEqual(empty())
-    await expect(store.save("session", { ...empty(), environments: { lanes: [{ key: "invalid", checkpoints: [] }] } }, (await store.load("session")).revision)).rejects.toThrow("invalid checkpoint")
+    await expect(store.save("session", { ...empty(), environments: { lanes: [{ key: "invalid", chain: [], checkpoints: [] }] } }, (await store.load("session")).revision)).rejects.toThrow("invalid checkpoint")
   })
 
   test("project, policy, session and credentials stay isolated behind private hashed paths", async () => {

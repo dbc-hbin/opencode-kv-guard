@@ -160,20 +160,23 @@ export class ModeReminders {
 // Match only OpenCode 1.19.4's generated environment, immediately following
 // its model identity line. Other env blocks and user-authored dates stay intact.
 const environment = /(You are powered by the model named [^\n]+\. The exact model ID is [^\n]+\n)(Here is some useful information about the environment you are running in:\n<env>\n  Working directory: [^\n]+\n  Workspace root folder: [^\n]+\n  Is directory a git repo: (?:yes|no)\n  Platform: [^\n]+(?:\n  Today's date: [^\n]+)?\n<\/env>)/
-type Checkpoint = { anchor: string; environment: string }
-export type EnvironmentsSnapshot = { lanes: { key: string; checkpoints: Checkpoint[] }[] }
+type Checkpoint = { anchor: string; position: number; environment: string }
+export type EnvironmentsSnapshot = { lanes: { key: string; chain: string[]; checkpoints: Checkpoint[] }[] }
 const environmentBlock = /^Here is some useful information about the environment you are running in:\n<env>\n  Working directory: [^\n]+\n  Workspace root folder: [^\n]+\n  Is directory a git repo: (?:yes|no)\n  Platform: [^\n]+\n<\/env>$/
 
 export function isEnvironmentsSnapshot(value: unknown): value is EnvironmentsSnapshot {
   if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes)) return false
   const lanes = new Set<string>()
   return value.lanes.every((lane) => {
-    if (!record(lane) || Object.keys(lane).some((key) => !["key", "checkpoints"].includes(key)) || !sha256(lane.key) || lanes.has(lane.key) || !Array.isArray(lane.checkpoints) || !lane.checkpoints.length) return false
+    if (!record(lane) || Object.keys(lane).some((key) => !["key", "chain", "checkpoints"].includes(key)) || !sha256(lane.key) || lanes.has(lane.key) || !Array.isArray(lane.chain) || !lane.chain.every(sha256) || !Array.isArray(lane.checkpoints) || !lane.checkpoints.length) return false
     lanes.add(lane.key)
     const anchors = new Set<string>()
+    let position = 0
     return lane.checkpoints.every((checkpoint) => {
-      if (!record(checkpoint) || Object.keys(checkpoint).some((key) => key !== "anchor" && key !== "environment") || !sha256(checkpoint.anchor) || anchors.has(checkpoint.anchor) || typeof checkpoint.environment !== "string" || !environmentBlock.test(checkpoint.environment)) return false
+      if (!record(checkpoint) || Object.keys(checkpoint).some((key) => !["anchor", "position", "environment"].includes(key)) || !sha256(checkpoint.anchor) || anchors.has(checkpoint.anchor) || !Number.isSafeInteger(checkpoint.position) || (checkpoint.position as number) < position || (checkpoint.position as number) < 1 || typeof checkpoint.environment !== "string" || !environmentBlock.test(checkpoint.environment)) return false
+      if ((lane.chain as string[])[(checkpoint.position as number) - 1] !== checkpoint.anchor) return false
       anchors.add(checkpoint.anchor)
+      position = checkpoint.position as number
       return true
     })
   })
@@ -188,9 +191,9 @@ export function stripEnvironmentDate(system: string[]) {
 }
 
 export class Environments {
-  private lanes = new Map<string, { session: string; checkpoints: Checkpoint[] }>()
+  private lanes = new Map<string, { session: string; chain: string[]; checkpoints: Checkpoint[] }>()
 
-  apply(messages: WireMessage[], session: string, lane: string) {
+  apply(messages: WireMessage[], session: string, lane: string, options: { reconstruct?: boolean; replacements?: ReadonlyMap<WireMessage, WireMessage> } = {}) {
     const system = messages[0]
     if (system?.role !== "system" || typeof system.content !== "string") return
     const match = environment.exec(system.content)
@@ -199,28 +202,39 @@ export class Environments {
     // intentionally delimit different policy contexts.
     if (messages.slice(1).some((message) => message.role === "system" || message.role === "developer")) return
 
+    const key = digest(JSON.stringify([session, lane]))
+    const prior = this.lanes.get(key)
+    let sourcePrefix = ""
+    const sourceAnchors = messages.slice(1).map((message) => sourcePrefix = digest(sourcePrefix + "\n" + JSON.stringify(message)))
     let prefix = ""
-    const anchors = messages.slice(1).map((message) => {
-      prefix = digest(prefix + "\n" + JSON.stringify(message))
+    const anchors = messages.slice(1).map((message, index) => {
+      const source = digest(prefix + "\n" + JSON.stringify(message))
+      const replacement = options.replacements?.get(message)
+      const repaired = replacement && digest(prefix + "\n" + JSON.stringify(replacement))
+      prefix = repaired && source !== prior?.chain[index] && repaired === prior?.chain[index] ? repaired : source
       return prefix
     })
     if (!anchors.length) return
-    const key = digest(JSON.stringify([session, lane]))
-    const prior = this.lanes.get(key)
     const present = new Set(anchors)
-    const checkpoints = (prior?.checkpoints ?? []).filter((checkpoint) => present.has(checkpoint.anchor))
+    // Positions propose the old wire layout only. PrefixGuard must authenticate
+    // it before any restored fields can participate in normal anchor validation.
+    const checkpoints = (prior?.checkpoints ?? []).filter((checkpoint) => options.reconstruct
+      ? checkpoint.position < messages.length
+      : present.has(checkpoint.anchor)).map((checkpoint) => ({
+        ...checkpoint, anchor: sourceAnchors[checkpoint.position - 1]!,
+      }))
     const current = match[2]!.replace(/\n  Today's date: [^\n]+/, "")
     if (checkpoints.at(-1)?.environment !== current) {
-      checkpoints.push({ anchor: anchors.at(-1)!, environment: current })
+      checkpoints.push({ anchor: sourceAnchors.at(-1)!, position: messages.length - 1, environment: current })
     }
-    this.lanes.set(key, { session, checkpoints })
-    system.content = system.content.replace(environment, "$1")
+    if (!options.reconstruct) this.lanes.set(key, { session, chain: sourceAnchors, checkpoints })
+    const leading = { ...system, content: system.content.replace(environment, "$1") }
 
-    const result: WireMessage[] = [system]
+    const result: WireMessage[] = [leading]
     for (let index = 1; index < messages.length; index++) {
       result.push(messages[index]!)
       for (const checkpoint of checkpoints) {
-        if (checkpoint.anchor !== anchors[index - 1]) continue
+        if (checkpoint.position !== index) continue
         const reminder: WireMessage = {
           role: "user",
           content: `<system-reminder>\n${checkpoint.environment}\n</system-reminder>`,
@@ -233,14 +247,14 @@ export class Environments {
   }
 
   snapshot(session: string): EnvironmentsSnapshot {
-    return { lanes: [...this.lanes].flatMap(([key, lane]) => lane.session === session ? [{ key, checkpoints: structuredClone(lane.checkpoints) }] : []) }
+    return { lanes: [...this.lanes].flatMap(([key, lane]) => lane.session === session ? [{ key, chain: [...lane.chain], checkpoints: structuredClone(lane.checkpoints) }] : []) }
   }
 
   restore(session: string, value: unknown) {
     if (!isEnvironmentsSnapshot(value)) return false
     this.delete(session)
     for (const lane of value.lanes) {
-      if (!this.lanes.has(lane.key)) this.lanes.set(lane.key, { session, checkpoints: structuredClone(lane.checkpoints) })
+      if (!this.lanes.has(lane.key)) this.lanes.set(lane.key, { session, chain: [...lane.chain], checkpoints: structuredClone(lane.checkpoints) })
     }
     return true
   }
