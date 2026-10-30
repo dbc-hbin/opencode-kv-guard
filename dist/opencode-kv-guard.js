@@ -1576,7 +1576,7 @@ function isSessionHeadsSnapshot(value, session) {
   const lanes = new Set;
   const systems = (items) => Array.isArray(items) && items.every((item) => record(item) && typeof item.role === "string" && instruction(item) && json(item));
   return value.lanes.every((lane) => {
-    if (!record(lane) || !exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(isSha256) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices))
+    if (!record(lane) || !(exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices", "toolNotices"])) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(isSha256) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices))
       return false;
     const id = key(session, lane.lane, lane.model);
     if (lanes.has(id))
@@ -1585,6 +1585,25 @@ function isSessionHeadsSnapshot(value, session) {
     const normalized = tools(lane.tools === null ? undefined : lane.tools);
     if (normalized === false || JSON.stringify(normalized) !== JSON.stringify(lane.tools))
       return false;
+    if (lane.toolNotices !== undefined) {
+      if (!Array.isArray(lane.toolNotices) || !lane.toolNotices.length || !normalized)
+        return false;
+      const names = new Set(normalized.map((item) => item.function.name));
+      let position = -1;
+      if (!lane.toolNotices.every((notice) => {
+        if (!record(notice) || !exactKeys(notice, ["anchor", "unavailable", "changed"]) || !isSha256(notice.anchor) || !Array.isArray(notice.unavailable) || !notice.unavailable.every((name) => typeof name === "string" && names.has(name)))
+          return false;
+        const changed = tools(notice.changed);
+        if (!changed || JSON.stringify(changed) !== JSON.stringify(notice.changed) || !changed.every((item) => names.has(item.function.name)))
+          return false;
+        const index = lane.chain.indexOf(notice.anchor);
+        if (index < position || index < 0)
+          return false;
+        position = index;
+        return true;
+      }))
+        return false;
+    }
     let anchor = -1;
     return lane.notices.every((notice) => {
       if (!record(notice) || !exactKeys(notice, ["anchor", "system"]) || !isSha256(notice.anchor) || !systems(notice.system) || !notice.system.length)
@@ -1607,6 +1626,25 @@ function toolReset(previous, next) {
   const added = [...after].some((name) => !before.has(name));
   const removed = [...before].some((name) => !after.has(name));
   return added && removed ? "tools-replaced" : removed ? "tools-removed" : added ? "tools-added" : "tools-schema-changed";
+}
+function availability(frozen, current) {
+  const live = new Map(current.map((item) => [item.function.name, item]));
+  return {
+    unavailable: frozen.filter((item) => !live.has(item.function.name)).map((item) => item.function.name),
+    changed: frozen.flatMap((item) => {
+      const now = live.get(item.function.name);
+      return now && !equal(now, item) ? [now] : [];
+    })
+  };
+}
+function toolNoticeMessage(notice) {
+  const lines = ["Tool availability for the current agent changed. This replaces every earlier tool availability notice: each listed tool not named below is available with its listed definition."];
+  if (notice.unavailable.length)
+    lines.push(`These listed tools are unavailable now; calls to them fail: ${notice.unavailable.join(", ")}.`);
+  if (notice.changed.length)
+    lines.push("These listed tools now use the following definitions instead:", ...notice.changed.map((item) => JSON.stringify(item)));
+  return { role: "system", content: lines.join(`
+`) };
 }
 
 class SessionHeads {
@@ -1647,19 +1685,30 @@ class SessionHeads {
         }
       }
     } else {
-      const effective = [...previous.system, ...previous.notices.flatMap((notice) => notice.system)];
       let shared = 0;
       while (shared < previous.chain.length && previous.chain[shared] === anchors[shared])
         shared++;
-      let reason = toolReset(previous.tools, normalizedTools);
+      const liveTools = context.stableTools === true && normalizedTools === null ? [] : normalizedTools;
+      const keepCatalog = context.stableTools === true && previous.tools !== null && liveTools !== null && liveTools.every((item) => previous.tools.some((frozen) => frozen.function.name === item.function.name));
+      let reason = keepCatalog ? undefined : toolReset(previous.tools, normalizedTools);
+      let history;
       if (!reason && shared < previous.chain.length && !context.reconstruct)
-        reason = shared === anchors.length ? "history-reverted" : "history-edited";
+        history = shared === anchors.length ? "history-reverted" : "history-edited";
       if (!reason && context.reconstruct && anchors.length < previous.chain.length)
-        reason = "history-reverted";
+        history = "history-reverted";
+      const keep = !history ? previous.chain.length : context.reconstruct ? anchors.length : shared;
+      const retained = previous.notices.filter((notice) => previous.chain.indexOf(notice.anchor) < keep);
+      const retainedTools = (previous.toolNotices ?? []).filter((notice) => previous.chain.indexOf(notice.anchor) < keep);
+      const live = keepCatalog ? availability(previous.tools, liveTools) : undefined;
+      const announced = retainedTools.at(-1) ?? { unavailable: [], changed: [] };
+      const announce = live !== undefined && !equal({ unavailable: announced.unavailable, changed: announced.changed }, live);
+      if (!reason && announce && !anchors.length)
+        reason = toolReset(previous.tools, normalizedTools) ?? "tools-availability-changed";
+      const effective = [...previous.system, ...retained.flatMap((notice) => notice.system)];
       const compatible = system.length >= effective.length && effective.every((message, index) => equal(message, system[index]));
       if (!reason && !compatible)
         reason = "system-contract-changed";
-      if (!reason && (previous.notices.length || system.length > effective.length) && conversation.some(instruction))
+      if (!reason && (retained.length || system.length > effective.length) && conversation.some(instruction))
         reason = "system-contract-changed";
       if (!reason && system.length > effective.length && !anchors.length)
         reason = "unanchored-system-addition";
@@ -1669,8 +1718,18 @@ class SessionHeads {
         report.reason = reason;
       } else {
         state = structuredClone(previous);
+        state.notices = structuredClone(retained);
+        state.toolNotices = structuredClone(retainedTools);
+        if (history) {
+          report.status = "rewound";
+          report.reason = history;
+        }
         if (context.reconstruct) {
           state.notices = state.notices.map((notice) => ({
+            ...notice,
+            anchor: anchors[previous.chain.indexOf(notice.anchor)]
+          }));
+          state.toolNotices = state.toolNotices.map((notice) => ({
             ...notice,
             anchor: anchors[previous.chain.indexOf(notice.anchor)]
           }));
@@ -1680,19 +1739,32 @@ class SessionHeads {
           state.notices.push({ anchor: anchors.at(-1), system: structuredClone(system.slice(effective.length)) });
           report.status = "appended";
         }
+        if (announce) {
+          state.toolNotices.push({ anchor: anchors.at(-1), ...live });
+          report.status = "appended";
+        }
+        if (!state.toolNotices.length)
+          delete state.toolNotices;
       }
     }
     state.notices = state.notices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)] }));
+    if (state.toolNotices)
+      state.toolNotices = state.toolNotices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)] }));
     state.chain = sourceAnchors;
     if (!context.reconstruct)
       this.lanes.set(id, { session: context.session, state });
     report.notices = state.notices.reduce((total, notice) => total + notice.system.length, 0);
+    if (state.toolNotices)
+      report.toolNotices = state.toolNotices.length;
     const messages = [...structuredClone(state.system)];
     for (let index = 0;index < conversation.length; index++) {
       messages.push(conversation[index]);
       for (const notice of state.notices)
         if (notice.anchor === sourceAnchors[index])
           messages.push(...structuredClone(notice.system));
+      for (const notice of state.toolNotices ?? [])
+        if (notice.anchor === sourceAnchors[index])
+          messages.push(toolNoticeMessage(notice));
     }
     const result = { ...body, messages };
     if (state.tools !== null)
@@ -3073,7 +3145,7 @@ var nativeConversationEnd = `
 
 `;
 var plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated", "speculativeCompaction"];
+  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated", "speculativeCompaction", "stableAgentTools"];
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key))
       throw new Error(`KV guard: unknown option ${key}`);
@@ -3091,7 +3163,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
     throw new Error("KV guard: maxOutputTokens must be a positive integer");
   }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated", "speculativeCompaction"]) {
+  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated", "speculativeCompaction", "stableAgentTools"]) {
     if (options[key] !== undefined && typeof options[key] !== "boolean")
       throw new Error(`KV guard: ${key} must be boolean`);
   }
@@ -3331,7 +3403,8 @@ The previous response stopped at the output token limit before finishing. Contin
           sessionHeads: options.sessionHeads !== false,
           prefixGuard: options.prefixGuard !== false,
           prefixHandoff: options.prefixHandoff !== false,
-          shrinkToolOutputs: outputShrinker?.limits ?? false
+          shrinkToolOutputs: outputShrinker?.limits ?? false,
+          ...options.stableAgentTools === true ? { stableAgentTools: true } : {}
         })));
       for (const target of targets) {
         target.provider.options ??= {};
@@ -3358,9 +3431,12 @@ The previous response stopped at the output token limit before finishing. Contin
           headers.delete("content-length");
           const currentUser = userTurns.consume(body.messages, session && expectedUser ? userTurns.marker(session, expectedUser) : undefined);
           url.hash = "";
-          const lane = digest(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]));
+          const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
+          const stableTools = options.stableAgentTools === true && !!agent && !internalAgents.includes(agent) && !parentSession;
+          const laneAgent = stableTools ? { stableAgentTools: true } : agent;
+          const lane = digest(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, laneAgent]));
           const headScope = digest(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]));
-          const headLane = digest(JSON.stringify([headScope, agent]));
+          const headLane = digest(JSON.stringify([headScope, laneAgent]));
           if (session) {
             const lanes = sessionLanes.get(session) ?? new Set;
             lanes.add(lane);
@@ -3580,8 +3656,7 @@ ${instructions}`
               return handled;
           }
           const prepare = async (overflow) => {
-            const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
-            const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined };
+            const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined, stableTools };
             const replacements = new Map;
             if (session && agent && options.prefixGuard !== false) {
               const sources = new Set(body.messages);

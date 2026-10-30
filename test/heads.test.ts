@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { PrefixGuard, SessionHeads, isPrefixGuardSnapshot, isSessionHeadsSnapshot, type AssistantContext, type HeadContext } from "../src/heads"
 import type { ChatBody } from "../src/compaction"
-import { Environments, isEnvironmentsSnapshot, type WireMessage } from "../src/prefix"
+import { Environments, canonical, isEnvironmentsSnapshot, type WireMessage } from "../src/prefix"
 
 const context: HeadContext = { session: "session", lane: "provider/endpoint/agent" }
 const completed: AssistantContext = { ...context, outcome: "success", finishReason: "stop" }
@@ -138,18 +138,100 @@ describe("persistent session heads", () => {
     }
   })
 
-  test("edited and reverted history drops old notice anchors permanently", () => {
+  test("edited and reverted history keeps only notices anchored in the unchanged prefix", () => {
     const heads = new SessionHeads()
     heads.apply(body(), context)
     heads.apply(body([policy, delta, user, answer, next]), context)
     const reverted = heads.apply(body([policy, user]), context)
-    expect(reverted.report).toMatchObject({ status: "reset", reason: "history-reverted", notices: 0 })
+    expect(reverted.report).toMatchObject({ status: "rewound", reason: "history-reverted", notices: 0 })
     const restored = heads.apply(body([policy, user, answer, next]), context)
     expect(restored.report.status).toBe("stable")
     expect(restored.body.messages).toEqual([policy, user, answer, next])
     const edited = heads.apply(body([policy, { ...user, content: "edited" }, answer, next]), context)
-    expect(edited.report).toMatchObject({ status: "reset", reason: "history-edited", notices: 0 })
+    expect(edited.report).toMatchObject({ status: "rewound", reason: "history-edited", notices: 0 })
     expect(edited.body.messages.some((message) => message.content === delta.content)).toBe(false)
+  })
+
+  test("a revert after an anchored notice resends the earlier head and notice in place", () => {
+    const heads = new SessionHeads()
+    const later = { role: "assistant", content: "later answer" }
+    const third = { role: "user", content: "third" }
+    heads.apply(body([policy, user]), context)
+    const anchored = heads.apply(body([policy, delta, user, answer, next]), context)
+    heads.apply(body([policy, delta, user, answer, next, later, third]), context)
+    const replacement = { role: "user", content: "replacement" }
+    const reverted = heads.apply(body([policy, delta, user, answer, next, { role: "assistant", content: "other" }, replacement]), context)
+    expect(reverted.report).toMatchObject({ status: "rewound", reason: "history-edited", notices: 1 })
+    expect(reverted.body.messages.slice(0, anchored.body.messages.length)).toEqual(anchored.body.messages)
+    expect(reverted.body.messages.at(-1)).toBe(replacement)
+    const truncated = heads.apply(body([policy, delta, user]), context)
+    expect(truncated.report).toMatchObject({ status: "appended", reason: "history-reverted", notices: 1 })
+    expect(truncated.body.messages).toEqual([policy, user, delta])
+  })
+
+  test("stable agent tools keep the frozen catalog and announce live availability at anchors", () => {
+    const heads = new SessionHeads()
+    const stable: HeadContext = { ...context, stableTools: true }
+    const full = [tool("read"), tool("write")]
+    const first = heads.apply(body([policy, user], { tools: full }), stable)
+    const narrowed = heads.apply(body([policy, user, answer, next], { tools: [tool("read", { path: { type: "string" } })] }), stable)
+    expect(narrowed.report).toMatchObject({ status: "appended", toolNotices: 1 })
+    expect(narrowed.body.tools).toEqual(first.body.tools)
+    expect(narrowed.body.messages.slice(0, 4)).toEqual([policy, user, answer, next])
+    const notice = narrowed.body.messages.at(-1)!
+    expect(notice.role).toBe("system")
+    expect(notice.content).toContain(JSON.stringify(canonical(tool("read", { path: { type: "string" } }))))
+    const later = { role: "user", content: "later" }
+    const restored = heads.apply(body([policy, user, answer, next, { role: "assistant", content: "ok" }, later], { tools: full }), stable)
+    expect(restored.report).toMatchObject({ status: "appended", toolNotices: 2 })
+    expect(restored.body.tools).toEqual(first.body.tools)
+    expect(restored.body.messages.slice(0, narrowed.body.messages.length)).toEqual(narrowed.body.messages)
+    expect(restored.body.messages.at(-1)?.role).toBe("system")
+    const snapshot = JSON.parse(JSON.stringify(heads.snapshot(context.session)))
+    expect(isSessionHeadsSnapshot(snapshot, context.session)).toBe(true)
+    snapshot.lanes[0].toolNotices[0].unavailable = ["unknown"]
+    expect(isSessionHeadsSnapshot(snapshot, context.session)).toBe(false)
+  })
+
+  test("each tool notice is a complete availability state, so restored tools are covered", () => {
+    const heads = new SessionHeads()
+    const stable: HeadContext = { ...context, stableTools: true }
+    const a1 = tool("a"), b1 = tool("b"), a2 = tool("a", { x: { type: "string" } }), b2 = tool("b", { y: { type: "string" } })
+    const turns: WireMessage[] = [policy, user]
+    const step = (tools: unknown[]) => {
+      turns.push({ role: "assistant", content: `answer ${turns.length}` }, { role: "user", content: `turn ${turns.length}` })
+      return heads.apply(body([...turns], { tools }), stable)
+    }
+    heads.apply(body([...turns], { tools: [a1, b1] }), stable)
+    step([a2, b2])
+    const partial = step([a1, b2])
+    expect(partial.report.toolNotices).toBe(2)
+    const latest = partial.body.messages.at(-1)!.content as string
+    expect(latest).toContain(JSON.stringify(canonical(b2)))
+    expect(latest).not.toContain(JSON.stringify(canonical(a2)))
+    // Partial re-enabling: [a] unavailable after [a, b] unavailable.
+    const fresh = new SessionHeads()
+    fresh.apply(body([policy, user], { tools: [a1, b1] }), stable)
+    const bare = body([policy, user, answer, next])
+    delete bare.tools
+    const none = fresh.apply(bare, stable)
+    expect(none.report).toMatchObject({ status: "appended", toolNotices: 1 })
+    expect(none.body.tools).toEqual(canonical([a1, b1]))
+    const third = { role: "user", content: "third" }
+    const some = fresh.apply(body([policy, user, answer, next, { role: "assistant", content: "ok" }, third], { tools: [b1] }), stable)
+    expect(some.report.toolNotices).toBe(2)
+    expect(some.body.messages.slice(0, none.body.messages.length)).toEqual(none.body.messages)
+    expect(fresh.snapshot(context.session).lanes[0]!.toolNotices!.map((notice) => notice.unavailable)).toEqual([["a", "b"], ["a"]])
+  })
+
+  test("stable agent tools still reset for a new tool name and are off by default", () => {
+    const heads = new SessionHeads()
+    heads.apply(body(), { ...context, stableTools: true })
+    const added = heads.apply(body([policy, user, answer, next], { tools: [tool("read"), tool("write")] }), { ...context, stableTools: true })
+    expect(added.report).toMatchObject({ status: "reset", reason: "tools-added" })
+    const plain = new SessionHeads()
+    plain.apply(body([policy, user], { tools: [tool("read"), tool("write")] }), context)
+    expect(plain.apply(body([policy, user, answer, next]), context).report).toMatchObject({ status: "reset", reason: "tools-removed" })
   })
 
   test("an edit to an earlier chain node invalidates a later otherwise-identical user anchor", () => {

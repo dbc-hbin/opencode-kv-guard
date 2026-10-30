@@ -29,7 +29,7 @@ const nativeConversationEnd = "\n</conversation>\n\n"
 type Exchange = { target: string; headScope: string; lane: string; userID: string; body: ChatBody; assistant: ChatBody["messages"][number] }
 
 const plugin: Plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated", "speculativeCompaction"]
+  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated", "speculativeCompaction", "stableAgentTools"]
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key)) throw new Error(`KV guard: unknown option ${key}`)
   }
@@ -46,7 +46,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
     throw new Error("KV guard: maxOutputTokens must be a positive integer")
   }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated", "speculativeCompaction"]) {
+  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated", "speculativeCompaction", "stableAgentTools"]) {
     if (options[key] !== undefined && typeof options[key] !== "boolean") throw new Error(`KV guard: ${key} must be boolean`)
   }
   if (options.stateDirectory !== undefined && (typeof options.stateDirectory !== "string" || !isAbsolute(options.stateDirectory))) {
@@ -272,6 +272,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           canonicalToolSchemas: options.canonicalToolSchemas !== false, glm,
           sessionHeads: options.sessionHeads !== false, prefixGuard: options.prefixGuard !== false,
           prefixHandoff: options.prefixHandoff !== false, shrinkToolOutputs: outputShrinker?.limits ?? false,
+          ...(options.stableAgentTools === true ? { stableAgentTools: true } : {}),
         })),
       )
       for (const target of targets) {
@@ -301,9 +302,14 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           // Endpoint and credential identity isolate restored state and usage
           // even when provider aliases or session affinity headers are shared.
           url.hash = ""
-          const lane = hash(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, agent]))
+          // Stable agent tools keep one lane for all primary agents of a
+          // top-level session; internal agents and child sessions stay separate.
+          const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined
+          const stableTools = options.stableAgentTools === true && !!agent && !internalAgents.includes(agent) && !parentSession
+          const laneAgent = stableTools ? { stableAgentTools: true } : agent
+          const lane = hash(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, laneAgent]))
           const headScope = hash(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]))
-          const headLane = hash(JSON.stringify([headScope, agent]))
+          const headLane = hash(JSON.stringify([headScope, laneAgent]))
           if (session) {
             const lanes = sessionLanes.get(session) ?? new Set<string>()
             lanes.add(lane)
@@ -507,8 +513,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             if (handled) return handled
           }
           const prepare = async (overflow?: { promptTokens?: number }) => {
-            const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined
-            const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined }
+            const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined, stableTools }
             const replacements = new Map<ChatBody["messages"][number], ChatBody["messages"][number]>()
             if (session && agent && options.prefixGuard !== false) {
               const sources = new Set(body.messages)

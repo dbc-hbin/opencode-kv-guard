@@ -43,16 +43,20 @@ function chain(messages: WireMessage[], prior?: string[], replacements?: Readonl
   })
 }
 
-export type HeadContext = { session: string; lane: string; currentUser?: WireMessage; parentSession?: string; parentLane?: string; reconstruct?: boolean; replacements?: ReadonlyMap<WireMessage, WireMessage> }
+export type HeadContext = { session: string; lane: string; currentUser?: WireMessage; parentSession?: string; parentLane?: string; reconstruct?: boolean; replacements?: ReadonlyMap<WireMessage, WireMessage>; stableTools?: boolean }
 export type HeadResetReason = "tools-added" | "tools-removed" | "tools-replaced" | "tools-schema-changed" | "tools-availability-changed" | "system-contract-changed" | "unanchored-system-addition" | "history-edited" | "history-reverted"
 export type HeadReport = {
-  status: "initialized" | "stable" | "appended" | "reset" | "unsupported"
+  status: "initialized" | "stable" | "appended" | "rewound" | "reset" | "unsupported"
   reason?: HeadResetReason | "unsupported-tools"
   notices: number
+  toolNotices?: number
   parent?: "shared" | "incompatible" | "missing"
 }
 type HeadNotice = { anchor: string; system: WireMessage[] }
-type HeadLane = { lane: string; model: string; system: WireMessage[]; tools: HeadTool[] | null; chain: string[]; notices: HeadNotice[] }
+// Tools kept on the wire after an agent switch withdrew or redefined them.
+// Each notice records the availability announced at its anchor.
+type ToolNotice = { anchor: string; unavailable: string[]; changed: HeadTool[] }
+type HeadLane = { lane: string; model: string; system: WireMessage[]; tools: HeadTool[] | null; chain: string[]; notices: HeadNotice[]; toolNotices?: ToolNotice[] }
 export type SessionHeadsSnapshot = { version: 1; session: string; lanes: HeadLane[] }
 
 export function isSessionHeadsSnapshot(value: unknown, session: string): value is SessionHeadsSnapshot {
@@ -60,12 +64,26 @@ export function isSessionHeadsSnapshot(value: unknown, session: string): value i
   const lanes = new Set<string>()
   const systems = (items: unknown): items is WireMessage[] => Array.isArray(items) && items.every((item) => object(item) && typeof item.role === "string" && instruction(item as WireMessage) && json(item))
   return value.lanes.every((lane) => {
-    if (!object(lane) || !exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(sha256) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices)) return false
+    if (!object(lane) || !(exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices", "toolNotices"])) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(sha256) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices)) return false
     const id = key(session, lane.lane, lane.model)
     if (lanes.has(id)) return false
     lanes.add(id)
     const normalized = tools(lane.tools === null ? undefined : lane.tools)
     if (normalized === false || JSON.stringify(normalized) !== JSON.stringify(lane.tools)) return false
+    if (lane.toolNotices !== undefined) {
+      if (!Array.isArray(lane.toolNotices) || !lane.toolNotices.length || !normalized) return false
+      const names = new Set(normalized.map((item) => item.function.name))
+      let position = -1
+      if (!lane.toolNotices.every((notice) => {
+        if (!object(notice) || !exactKeys(notice, ["anchor", "unavailable", "changed"]) || !sha256(notice.anchor) || !Array.isArray(notice.unavailable) || !notice.unavailable.every((name) => typeof name === "string" && names.has(name))) return false
+        const changed = tools(notice.changed)
+        if (!changed || JSON.stringify(changed) !== JSON.stringify(notice.changed) || !changed.every((item) => names.has(item.function.name))) return false
+        const index = (lane.chain as string[]).indexOf(notice.anchor)
+        if (index < position || index < 0) return false
+        position = index
+        return true
+      })) return false
+    }
     let anchor = -1
     return lane.notices.every((notice) => {
       if (!object(notice) || !exactKeys(notice, ["anchor", "system"]) || !sha256(notice.anchor) || !systems(notice.system) || !notice.system.length) return false
@@ -85,6 +103,27 @@ function toolReset(previous: HeadTool[] | null, next: HeadTool[] | null): HeadRe
   const added = [...after].some((name) => !before.has(name))
   const removed = [...before].some((name) => !after.has(name))
   return added && removed ? "tools-replaced" : removed ? "tools-removed" : added ? "tools-added" : "tools-schema-changed"
+}
+
+// Compare the frozen wire catalog with the live one OpenCode will execute.
+function availability(frozen: HeadTool[], current: HeadTool[]) {
+  const live = new Map(current.map((item) => [item.function.name, item]))
+  return {
+    unavailable: frozen.filter((item) => !live.has(item.function.name)).map((item) => item.function.name),
+    changed: frozen.flatMap((item) => {
+      const now = live.get(item.function.name)
+      return now && !equal(now, item) ? [now] : []
+    }),
+  }
+}
+
+// Each notice is complete: it replaces every earlier availability notice, so
+// a restored tool or definition is covered by omission and stated explicitly.
+function toolNoticeMessage(notice: ToolNotice): WireMessage {
+  const lines = ["Tool availability for the current agent changed. This replaces every earlier tool availability notice: each listed tool not named below is available with its listed definition."]
+  if (notice.unavailable.length) lines.push(`These listed tools are unavailable now; calls to them fail: ${notice.unavailable.join(", ")}.`)
+  if (notice.changed.length) lines.push("These listed tools now use the following definitions instead:", ...notice.changed.map((item) => JSON.stringify(item)))
+  return { role: "system", content: lines.join("\n") }
 }
 
 // Only complete, still-authoritative instruction messages can move to a notice.
@@ -125,17 +164,34 @@ export class SessionHeads {
         }
       }
     } else {
-      const effective = [...previous.system, ...previous.notices.flatMap((notice) => notice.system)]
       let shared = 0
       while (shared < previous.chain.length && previous.chain[shared] === anchors[shared]) shared++
-      let reason = toolReset(previous.tools, normalizedTools)
-      if (!reason && shared < previous.chain.length && !context.reconstruct) reason = shared === anchors.length ? "history-reverted" : "history-edited"
-      if (!reason && context.reconstruct && anchors.length < previous.chain.length) reason = "history-reverted"
+      // With stable agent tools, a primary-agent switch that only withdraws or
+      // redefines known tools keeps the frozen catalog and announces the live
+      // availability instead. A genuinely new tool name still resets. The SDK
+      // omits an empty tool list, so absence means every listed tool is withdrawn.
+      const liveTools = context.stableTools === true && normalizedTools === null ? [] : normalizedTools
+      const keepCatalog = context.stableTools === true && previous.tools !== null && liveTools !== null
+        && liveTools.every((item) => previous.tools!.some((frozen) => frozen.function.name === item.function.name))
+      let reason: HeadResetReason | undefined = keepCatalog ? undefined : toolReset(previous.tools, normalizedTools)
+      let history: "history-reverted" | "history-edited" | undefined
+      if (!reason && shared < previous.chain.length && !context.reconstruct) history = shared === anchors.length ? "history-reverted" : "history-edited"
+      if (!reason && context.reconstruct && anchors.length < previous.chain.length) history = "history-reverted"
+      // A revert or edit keeps the head and the notices anchored inside the
+      // unchanged leading history; those bytes were already sent in place.
+      const keep = !history ? previous.chain.length : context.reconstruct ? anchors.length : shared
+      const retained = previous.notices.filter((notice) => previous.chain.indexOf(notice.anchor) < keep)
+      const retainedTools = (previous.toolNotices ?? []).filter((notice) => previous.chain.indexOf(notice.anchor) < keep)
+      const live = keepCatalog ? availability(previous.tools!, liveTools!) : undefined
+      const announced = retainedTools.at(-1) ?? { unavailable: [], changed: [] }
+      const announce = live !== undefined && !equal({ unavailable: announced.unavailable, changed: announced.changed }, live)
+      if (!reason && announce && !anchors.length) reason = toolReset(previous.tools, normalizedTools) ?? "tools-availability-changed"
+      const effective = [...previous.system, ...retained.flatMap((notice) => notice.system)]
       const compatible = system.length >= effective.length && effective.every((message, index) => equal(message, system[index]))
       if (!reason && !compatible) reason = "system-contract-changed"
       // Moving an instruction across another original instruction can change
       // same-role precedence, even if both messages retain their roles.
-      if (!reason && (previous.notices.length || system.length > effective.length) && conversation.some(instruction)) reason = "system-contract-changed"
+      if (!reason && (retained.length || system.length > effective.length) && conversation.some(instruction)) reason = "system-contract-changed"
       if (!reason && system.length > effective.length && !anchors.length) reason = "unanchored-system-addition"
       if (reason) {
         state = fresh()
@@ -143,8 +199,17 @@ export class SessionHeads {
         report.reason = reason
       } else {
         state = structuredClone(previous)
+        state.notices = structuredClone(retained)
+        state.toolNotices = structuredClone(retainedTools)
+        if (history) {
+          report.status = "rewound"
+          report.reason = history
+        }
         if (context.reconstruct) {
           state.notices = state.notices.map((notice) => ({
+            ...notice, anchor: anchors[previous.chain.indexOf(notice.anchor)]!,
+          }))
+          state.toolNotices = state.toolNotices.map((notice) => ({
             ...notice, anchor: anchors[previous.chain.indexOf(notice.anchor)]!,
           }))
         }
@@ -153,18 +218,26 @@ export class SessionHeads {
           state.notices.push({ anchor: anchors.at(-1)!, system: structuredClone(system.slice(effective.length)) })
           report.status = "appended"
         }
+        if (announce) {
+          state.toolNotices.push({ anchor: anchors.at(-1)!, ...live! })
+          report.status = "appended"
+        }
+        if (!state.toolNotices.length) delete state.toolNotices
       }
     }
     // Once continuity is proven, retain the actual source basis. Later pressure
     // reductions may retire the wire proof that authenticated a missing field.
     state.notices = state.notices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)]! }))
+    if (state.toolNotices) state.toolNotices = state.toolNotices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)]! }))
     state.chain = sourceAnchors
     if (!context.reconstruct) this.lanes.set(id, { session: context.session, state })
     report.notices = state.notices.reduce((total, notice) => total + notice.system.length, 0)
+    if (state.toolNotices) report.toolNotices = state.toolNotices.length
     const messages = [...structuredClone(state.system)]
     for (let index = 0; index < conversation.length; index++) {
       messages.push(conversation[index]!)
       for (const notice of state.notices) if (notice.anchor === sourceAnchors[index]) messages.push(...structuredClone(notice.system))
+      for (const notice of state.toolNotices ?? []) if (notice.anchor === sourceAnchors[index]) messages.push(toolNoticeMessage(notice))
     }
     const result: ChatBody = { ...body, messages }
     if (state.tools !== null) result.tools = structuredClone(state.tools)

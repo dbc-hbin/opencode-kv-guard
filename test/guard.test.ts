@@ -305,6 +305,50 @@ test("per-turn OpenCode request IDs preserve the previous environment prefix", a
   await hooks.dispose!()
 })
 
+test("stable agent tools apply only when enabled and only to top-level primary sessions", async () => {
+  const read = { type: "function", function: { name: "read", parameters: { type: "object" } } }
+  const write = { type: "function", function: { name: "write", parameters: { type: "object" } } }
+  const run = async (options: Record<string, unknown>, agents: string[], parent?: string) => {
+    const captured: { tools?: unknown[]; messages: WireMessage[] }[] = []
+    const config = { provider: { local: { npm: "@ai-sdk/openai-compatible", options: {
+      baseURL: "http://stable-tools.test/v1",
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        captured.push(await new Request(input, init).json() as { tools?: unknown[]; messages: WireMessage[] })
+        return new Response("ok")
+      },
+    } } } }
+    const hooks = await plugin({} as PluginInput, { providers: ["local"], compaction: false, persistence: false, ...options })
+    await hooks.config!(config)
+    const messages: WireMessage[] = [{ role: "system", content: "Policy" }, { role: "user", content: "one" }]
+    for (const [index, agent] of agents.entries()) {
+      if (index) messages.push({ role: "assistant", content: `answer ${index}` }, { role: "user", content: `turn ${index}` })
+      const tools = agent === "primary" || agent === "build" ? [read, write] : agent === "bare" ? undefined : [read]
+      await (await config.provider.local.options.fetch("http://stable-tools.test/v1/chat/completions", {
+        method: "POST",
+        headers: { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": agent, ...(parent ? { "x-opencode-parent-session-id": parent } : {}) },
+        body: JSON.stringify({ model: "fixture", messages, ...(tools ? { tools } : {}) }),
+      })).text()
+    }
+    await hooks.dispose!()
+    return captured
+  }
+  const names = (body: { tools?: unknown[] }) => (body.tools as { function: { name: string } }[] | undefined)?.map((item) => item.function.name)
+  // An agent literally named "primary" gets no stable catalog unless opted in.
+  const disabled = await run({}, ["primary", "primary-ask"])
+  expect(names(disabled[1]!)).toEqual(["read"])
+  const named = await run({}, ["build", "primary"])
+  expect(names(named[1]!)).toEqual(["read", "write"])
+  // Child sessions keep per-agent lanes and the live catalog.
+  const child = await run({ stableAgentTools: true }, ["build", "ask"], "parent")
+  expect(names(child[1]!)).toEqual(["read"])
+  // An omitted live tool list is a complete withdrawal, not a reset.
+  const enabled = await run({ stableAgentTools: true }, ["build", "bare", "build"])
+  expect(enabled.map(names)).toEqual([["read", "write"], ["read", "write"], ["read", "write"]])
+  for (let index = 1; index < enabled.length; index++) {
+    expect(enabled[index]!.messages.slice(0, enabled[index - 1]!.messages.length)).toEqual(enabled[index - 1]!.messages)
+  }
+})
+
 test("URL templates bind to the resolved endpoint and unresolved targets do not activate hooks", async () => {
   const key = "KV_GUARD_TEST_TENANT"
   const previous = process.env[key]
