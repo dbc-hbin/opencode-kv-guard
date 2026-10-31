@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { ContextOverflowError, RollingCompaction, isCompactionSnapshot, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
+import { ContextOverflowError, RollingCompaction, isCompactionSnapshot, shakeToFit, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
 import { Environments, type WireMessage } from "../src/prefix"
 import { UsageTracker } from "../src/usage"
 
@@ -28,6 +28,11 @@ function success(content = "fixture-semantic-summary", finish_reason = "stop"): 
 
 function context(completeSummary: CompactionContext["completeSummary"], overrides: Partial<CompactionContext> = {}): CompactionContext {
   return { session: "session", lane: "provider/endpoint/build", contextWindow: 5000, outputLimit: 500, completeSummary, ...overrides }
+}
+
+function artifacts() {
+  const saved = new Map<string, string>()
+  return { saved, path: (text: string) => `/artifacts/tool_kvguard_${new Bun.CryptoHasher("sha256").update(text).digest("hex")}`, save: async (path: string, text: string) => { saved.set(path, text) } }
 }
 
 function forwarded(result: CompactionResult): ChatBody {
@@ -73,6 +78,18 @@ function repeatedReads(): ChatBody {
 }
 
 describe("staged pressure reductions", () => {
+  test("duplicate reads of native absolute paths are superseded", async () => {
+    if (process.platform !== "win32") return
+    const path = "C:\\project\\file.ts"
+    const content = readOutput().replace("<path>/project/file.ts</path>", `<path>${path}</path>`)
+    const original = history(0)
+    const args = JSON.stringify({ filePath: path })
+    original.messages.splice(1, 0, { role: "user", content: "Inspect the file" }, ...readBatch("earlier", content, args))
+    original.messages.push(...readBatch("later", content, args))
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => success(), { contextWindow: 3200 }))
+    expect("report" in result && result.report?.supersededReads).toBe(1)
+  })
+
   test("removing tiny measured reasoning cannot masquerade as a large token reduction", async () => {
     const original: ChatBody = {
       model: "fixture", max_tokens: 1000, stream: true,
@@ -778,15 +795,32 @@ describe("rolling semantic compaction", () => {
     for (const message of batch(7)) expect(result.messages).toContainEqual(message)
   })
 
-  test("trailing assistant step limits cannot make the newest tool batch disposable", async () => {
+  test("dead-end rescue shakes the newest tool batch behind a trailing step limit", async () => {
     const original = history(0)
     const current = original.messages[1]!
-    original.messages.push(...batch(0, 3000), { role: "assistant", content: "No further tool calls; give the final response." })
+    const tools = batch(0, 3000)
+    const trailing = { role: "assistant", content: "No further tool calls; give the final response." }
+    original.messages.push(...tools, trailing)
     const copy = structuredClone(original)
+    const store = artifacts()
     let calls = 0
-    await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { currentUser: current }))).rejects.toThrow("mandatory")
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { currentUser: current, artifacts: store }))
+    const outgoing = forwarded(result)
     expect(calls).toBe(0)
+    expect("report" in result && result.report?.rescue).toBe(true)
+    expect(outgoing.messages).toContain(current)
+    expect(outgoing.messages).toContain(trailing)
+    expect(outgoing.messages[2]).toBe(tools[0])
+    for (const message of tools.slice(1)) {
+      const path = store.path(message.content as string)
+      expect(store.saved.get(path)).toBe(message.content as string)
+      expect(outgoing.messages).toContainEqual({ ...message, content: expect.stringContaining(JSON.stringify(path)) })
+    }
+    expect(bytes(outgoing)).toBeLessThanOrEqual(4500)
     expect(original).toEqual(copy)
+    // Without raw storage nothing can be shaken and the mandatory batch fails.
+    await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { currentUser: current }))).rejects.toThrow("Compaction cannot fit input budget")
+    expect(calls).toBe(0)
   })
 
   test("generated environment does not displace the current user or newest tool group", async () => {
@@ -927,7 +961,7 @@ describe("rolling semantic compaction", () => {
     original.messages.at(-1)!.content = "must-keep".repeat(1500)
     const copy = structuredClone(original)
     let calls = 0
-    await expect(compaction.prepare(original, context(async () => { calls++; return success() }))).rejects.toThrow("mandatory current user instruction")
+    await expect(compaction.prepare(original, context(async () => { calls++; return success() }))).rejects.toThrow("Compaction cannot fit input budget 4500")
     expect(calls).toBe(0)
     expect(original).toEqual(copy)
   })
@@ -984,7 +1018,7 @@ describe("rolling semantic compaction", () => {
     }
   })
 
-  test("opaque media and signed reasoning remain exact, or fail if mandatory context is too large", async () => {
+  test("opaque media and signed reasoning remain exact, or fold as sanitized text in the rescue", async () => {
     const compaction = new RollingCompaction({ bytesPerToken: 1 })
     const original = history()
     const media: WireMessage = { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,fixture" } }] }
@@ -995,7 +1029,166 @@ describe("rolling semantic compaction", () => {
     expect(result.messages).toContainEqual(signed)
     const giant = history()
     giant.messages.splice(3, 0, { ...signed, reasoning_content: "s".repeat(10000) })
-    await expect(compaction.prepare(giant, context(async () => { throw new Error("Unexpected inference") }, { session: "giant" }))).rejects.toThrow("opaque/multimodal")
+    const requests: ChatBody[] = []
+    const folded = await compaction.prepare(giant, context(async (body) => { requests.push(body); return success() }, { session: "giant" }))
+    expect("report" in folded && folded.report?.rescue).toBe(true)
+    const entry = archived(requests).find((item) => item.source_index === 3)!
+    expect(entry.message.signature).toBeUndefined()
+    expect(entry.message.reasoning_content).toBe("s".repeat(10000))
+    expect(forwarded(folded).messages).toContain(giant.messages.at(-1)!)
+  })
+
+  test("mandatory input over the recovery target is forwarded unchanged while it fits the budget", async () => {
+    const original = history(1, 100)
+    original.messages.push(...batch(0, 1700))
+    let calls = 0
+    const store = artifacts()
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { artifacts: store }))
+    expect(calls).toBe(0)
+    expect(forwarded(result)).toBe(original)
+    expect("report" in result && result.report?.mandatoryOverTarget).toBe(true)
+    expect(store.saved.size).toBe(0)
+    // After an overflow the same request no longer counts as fitting.
+    const overflowed = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { overflow: {}, artifacts: store }))
+    expect(calls).toBe(0)
+    expect("report" in overflowed && overflowed.report?.rescue).toBe(true)
+    expect(store.saved.size).toBe(2)
+  })
+
+  test("shake replaces old heavy tool results before semantic folding and survives reconstruction", async () => {
+    const original = history(0)
+    original.messages.splice(1, 0, { role: "user", content: "inspect" }, ...batch(0, 1500), { role: "assistant", content: "done" })
+    const skill: WireMessage[] = [
+      { role: "assistant", content: null, tool_calls: [{ id: "skill-1", type: "function", function: { name: "skill", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "skill-1", content: "k".repeat(600) },
+    ]
+    original.messages.splice(5, 0, ...skill)
+    const newest = batch(1, 200)
+    original.messages.push(...newest)
+    const store = artifacts()
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    let calls = 0
+    const ctx = context(async () => { calls++; return success() }, { artifacts: store })
+    const result = await compaction.prepare(original, ctx)
+    const outgoing = forwarded(result)
+    expect(calls).toBe(0)
+    expect("report" in result && result.report?.shook).toBe(2)
+    expect(outgoing.messages).toContain(skill[1])
+    for (const message of newest) expect(outgoing.messages).toContain(message)
+    expect(bytes(outgoing)).toBeLessThanOrEqual(Number("report" in result && result.report?.target))
+    // A restarted preparation rebuilds the identical placeholder bytes.
+    expect(compaction.reconstruct(structuredClone(original), { session: "session", lane: ctx.lane })).toEqual(outgoing)
+    const restored = new RollingCompaction({ bytesPerToken: 1 })
+    expect(await restored.restore("session", compaction.snapshot("session"))).toBe(true)
+    expect(restored.reconstruct(structuredClone(original), { session: "session", lane: ctx.lane })).toEqual(outgoing)
+  })
+
+  test("manual compaction folds everything eligible below the trigger, or reports a no-op", async () => {
+    const original = history(4, 100)
+    const requests: ChatBody[] = []
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const result = await compaction.prepare(original, context(async (body) => { requests.push(body); return success() }, { contextWindow: 50000, manual: true }))
+    const outgoing = forwarded(result)
+    expect(requests.length).toBe(1)
+    expect(archived(requests).map((entry) => entry.source_index)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    expect(outgoing.messages.at(-1)).toBe(original.messages.at(-1)!)
+    expect(outgoing.messages).toHaveLength(3)
+    const again = await compaction.prepare(original, context(async () => { throw new Error("Unexpected inference") }, { contextWindow: 50000, manual: true }))
+    expect("report" in again && again.report?.manualNoop).toBe(true)
+    expect(forwarded(again)).toEqual(outgoing)
+  })
+
+  test("manual compaction keeps the configured recent turns exact", async () => {
+    const original = history(4, 100)
+    const requests: ChatBody[] = []
+    const result = await new RollingCompaction({ bytesPerToken: 1, keepRecentTurns: 2 }).prepare(original, context(async (body) => { requests.push(body); return success() }, { contextWindow: 50000, manual: true }))
+    expect(archived(requests).map((entry) => entry.source_index)).toEqual([1, 2, 3, 4, 5, 6])
+    for (const message of original.messages.slice(7)) expect(forwarded(result).messages).toContain(message)
+  })
+
+  test("shake checkpoints accept native absolute artifact paths and reject other files", () => {
+    const shake = (path: string) => ({ lanes: [{ key: "a".repeat(64), state: { segments: [], covered: 2, fingerprint: "b".repeat(64), signature: "c".repeat(64), reductions: [{ index: 1, kind: "shake", path, tokens: 10 }] } }] })
+    const name = `tool_kvguard_${"d".repeat(64)}`
+    expect(isCompactionSnapshot(shake(`/data/opencode/tool-output/${name}`))).toBe(true)
+    if (process.platform === "win32") expect(isCompactionSnapshot(shake(`C:\\Users\\u\\opencode\\tool-output\\${name}`))).toBe(true)
+    expect(isCompactionSnapshot(shake("/etc/passwd"))).toBe(false)
+    expect(isCompactionSnapshot(shake(`relative/${name}`))).toBe(false)
+  })
+
+  test("restored checkpoints cannot archive a policy instruction", async () => {
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const original = history()
+    const ctx = context(async () => success())
+    const result = forwarded(await compaction.prepare(original, ctx))
+    const snapshot = compaction.snapshot("session")
+    const state = snapshot.lanes[0]!.state
+    expect(state.segments[0]!.archived[0]).toBe(1)
+    const tampered = structuredClone(snapshot)
+    tampered.lanes[0]!.state.segments[0]!.archived.unshift(0)
+    const restored = new RollingCompaction({ bytesPerToken: 1 })
+    expect(await restored.restore("session", tampered)).toBe(true)
+    const rebuilt = restored.reconstruct(structuredClone(original), { session: "session", lane: ctx.lane })
+    expect(rebuilt.messages[0]).toEqual(original.messages[0])
+    expect(rebuilt).not.toEqual(result)
+  })
+
+  test("rescue transcripts drop nested signed and encrypted reasoning", async () => {
+    const original = history(2, 100)
+    const opaque: WireMessage = { role: "assistant", content: "kept text", reasoning: [{ type: "reasoning", text: "visible", signature: "s".repeat(4000), details: { encrypted_content: "e".repeat(4000) } }] }
+    original.messages.splice(1, 0, { role: "user", content: "q" }, opaque)
+    const requests: ChatBody[] = []
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async (body) => { requests.push(body); return success() }))
+    expect("report" in result && result.report?.rescue).toBe(true)
+    const entry = archived(requests).find((item) => item.source_index === 2)!
+    expect(entry.message).toEqual({ role: "assistant", content: "kept text", reasoning: [{ type: "reasoning", text: "visible", details: {} }] })
+  })
+
+  test("shakeToFit removes tool results and media from the end until the request fits", () => {
+    const store = artifacts()
+    const early = batch(0, 2000)
+    const late = batch(1, 2000)
+    const media: WireMessage = { role: "user", content: [{ type: "text", text: "shot" }, { type: "image_url", image_url: { url: "data:," } }] }
+    const skill: WireMessage[] = [
+      { role: "assistant", content: null, tool_calls: [{ id: "s", type: "function", function: { name: "skill", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "s", content: "k".repeat(3000) },
+    ]
+    const body: ChatBody = { model: "m", messages: [{ role: "system", content: "s" }, ...early, media, ...late, ...skill, { role: "user", content: "summarize" }] }
+    const fits = (limit: number) => (candidate: ChatBody) => bytes(candidate) <= limit
+    expect(shakeToFit(body, fits(Infinity), store, 1)!.body).toBe(body)
+    const one = shakeToFit(body, fits(bytes(body) - 1000), store, 1)!
+    expect(one.saves.map((save) => save.text)).toEqual([late[2]!.content as string])
+    expect(one.body.messages.slice(0, 6)).toEqual(body.messages.slice(0, 6))
+    expect(one.body.messages.at(-2)).toBe(skill[1])
+    const all = shakeToFit(body, fits(3000 + 2000), store, 1)!
+    expect(all.saves).toHaveLength(4)
+    expect(all.body.messages[4]!.content).toEqual([{ type: "text", text: "shot" }, { type: "text", text: "[image_url omitted to fit the context]" }])
+    expect(shakeToFit(body, fits(3000), store, 1)).toBeUndefined()
+  })
+
+  test("a failed raw-output save skips that shake and continues the chain", async () => {
+    const original = history(0)
+    original.messages.splice(1, 0, { role: "user", content: "inspect" }, ...batch(0, 2000), { role: "assistant", content: "done" })
+    const store = artifacts()
+    const failing = { path: store.path, save: async (path: string, text: string) => { if (text.startsWith("b")) throw Object.assign(new Error("locked"), { code: "EBUSY" }); await store.save(path, text) } }
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => success(), { artifacts: failing }))
+    const outgoing = forwarded(result)
+    expect("report" in result && result.report?.shakeStorageFailed).toBe(true)
+    expect("report" in result && result.report?.shook).toBe(1)
+    expect(outgoing.messages).toContain(original.messages[3])
+    expect([...store.saved.values()]).toEqual([original.messages[4]!.content as string])
+  })
+
+  test("rescue replaces attached media with text placeholders before folding", async () => {
+    const original = history(2, 100)
+    const media: WireMessage = { role: "user", content: [{ type: "text", text: "screenshot" }, { type: "image_url", image_url: { url: `data:image/png;base64,${"i".repeat(6000)}` } }] }
+    original.messages.splice(1, 0, media, { role: "assistant", content: "seen" })
+    let calls = 0
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { artifacts: artifacts() }))
+    const outgoing = forwarded(result)
+    expect(calls).toBe(0)
+    expect("report" in result && result.report?.droppedMedia).toBe(1)
+    expect(outgoing.messages[1]!.content).toEqual([{ type: "text", text: "screenshot" }, { type: "text", text: "[image_url omitted to fit the context]" }])
+    expect(bytes(outgoing)).toBeLessThanOrEqual(4500)
   })
 
   test("changed covered prefixes and shortened history invalidate earlier summaries", async () => {

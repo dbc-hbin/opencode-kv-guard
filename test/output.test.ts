@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { afterEach, describe, expect, spyOn, test } from "bun:test"
+import * as fsp from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
-import { ToolOutputShrinker } from "../src/output"
+import { ToolArtifacts, ToolOutputShrinker } from "../src/output"
 
 const roots: string[] = []
 afterEach(async () => {
@@ -279,5 +280,52 @@ describe("tool output storage reduction", () => {
     }
     expect(() => new ToolOutputShrinker({}, "relative")).toThrow()
     expect(() => new ToolOutputShrinker({ maxBytes: 512, maxLines: 3 })).not.toThrow()
+  })
+})
+
+describe("content-addressed compaction artifacts", () => {
+  test("publishes complete files only, repairs partial copies and refuses symlinks", async () => {
+    const data = await root()
+    const artifacts = new ToolArtifacts(data)
+    const text = "raw tool output\n".repeat(2000)
+    const path = artifacts.contentPath(text)
+    // Concurrent writers of identical text both succeed with one complete file.
+    await Promise.all([artifacts.saveContent(path, text), artifacts.saveContent(path, text)])
+    expect(await readFile(path, "utf8")).toBe(text)
+    expect(await readdir(directory(data))).toEqual([basename(path)])
+    expect((await stat(path)).mode & 0o777).toBe(0o600)
+    // Reuse refreshes the retention timestamp OpenCode's cleanup uses.
+    const old = new Date(Date.now() - 6 * 24 * 3600 * 1000)
+    await utimes(path, old, old)
+    await artifacts.saveContent(path, text)
+    expect((await stat(path)).mtimeMs).toBeGreaterThan(Date.now() - 60_000)
+    // A truncated copy left by an interrupted process is replaced, not reused.
+    await writeFile(path, text.slice(0, 100))
+    await artifacts.saveContent(path, text)
+    expect(await readFile(path, "utf8")).toBe(text)
+    expect(await readdir(directory(data))).toEqual([basename(path)])
+    const other = "other output"
+    const linked = artifacts.contentPath(other)
+    await symlink("/etc/hosts", linked)
+    await expect(artifacts.saveContent(linked, other)).rejects.toThrow()
+    await expect(artifacts.saveContent(path, other)).rejects.toThrow("does not match its text")
+  })
+
+  test("falls back to an atomic rename where hard links are unsupported", async () => {
+    const data = await root()
+    const artifacts = new ToolArtifacts(data)
+    const unsupported = spyOn(fsp, "link").mockImplementation(async () => { throw Object.assign(new Error("no hard links"), { code: "EPERM" }) })
+    try {
+      const text = "drvfs output"
+      const path = artifacts.contentPath(text)
+      await artifacts.saveContent(path, text)
+      await artifacts.saveContent(path, text)
+      expect(await readFile(path, "utf8")).toBe(text)
+      expect(await readdir(directory(data))).toEqual([basename(path)])
+      // Other link errors are real failures.
+      unsupported.mockImplementation(async () => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }) })
+      await expect(artifacts.saveContent(artifacts.contentPath("other"), "other")).rejects.toThrow("disk full")
+      expect(await readdir(directory(data))).toEqual([basename(path)])
+    } finally { unsupported.mockRestore() }
   })
 })

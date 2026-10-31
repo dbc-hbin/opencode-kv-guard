@@ -7,6 +7,7 @@ import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDa
 import createPlugin from "../src/index"
 import { CheckpointConflictError, CheckpointStore } from "../src/checkpoints"
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import type { Part } from "@opencode-ai/sdk"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import type { Fetch } from "../src/transport"
 
@@ -921,5 +922,61 @@ test("an output-limit finish is continued only once its step completed", async (
   stored = [userTurn, assistant({ created: 1, completed: 2 })]
   await idle()
   expect(prompts).toHaveLength(1)
+  await hooks.dispose!()
+})
+
+test("/kv-compact compacts only the command's own user message and is cleared when its turn ends", async () => {
+  const sent: Record<string, unknown>[] = []
+  const fetch: Fetch = async (input, init) => {
+    const body = await new Request(input, init).json() as Record<string, unknown>
+    sent.push(body)
+    if (body.stream === false) return Response.json({ id: "summary", object: "chat.completion", created: 1, model: "fixture", choices: [{ index: 0, message: { role: "assistant", content: "FOLDED" }, finish_reason: "stop" }] })
+    return new Response(`data: ${JSON.stringify({ id: "main", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config: Record<string, any> = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://kv-compact.test/v1", fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], compaction: { bytesPerToken: 1 } })
+  await hooks.config!(config as never)
+  const registered = config.command["kv-compact"]
+  expect(registered.subtask).toBe(false)
+  const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
+  const summaries = () => sent.filter((body) => body.stream === false).length
+  const post = async (userID: string, text = "Task") => {
+    const turn: Messages = [user(userID, text)]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const body = { model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
+    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context: 100_000, output: 500 }), "x-opencode-kv-guard-user": userID }
+    await (await config.provider.proxy.options.fetch("http://kv-compact.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })).text()
+  }
+  // OpenCode runs command.execute.before on the resolved template parts, then
+  // creates the user message and calls chat.message with those parts.
+  const command = async () => {
+    const parts = [{ type: "text", text: registered.template }] as never as Part[]
+    await hooks["command.execute.before"]!({ command: "kv-compact", sessionID: "session", arguments: "" }, { parts })
+    return parts
+  }
+  const message = async (messageID: string, parts: Part[]) => {
+    await hooks["chat.message"]!({ sessionID: "session" }, { message: { id: messageID } as never, parts })
+    return parts
+  }
+  const plainParts = () => [{ type: "text", text: "ordinary prompt" }] as never as Part[]
+
+  // A concurrent ordinary prompt between the command hook and its message is not authorized.
+  const commandParts = await command()
+  expect((await message("msg_other", plainParts()))[0]).toMatchObject({ text: "ordinary prompt" })
+  const stored = await message("msg_command", commandParts)
+  expect(stored[0]).toMatchObject({ text: registered.template })
+  await post("msg_other")
+  expect(summaries()).toBe(0)
+  await post("msg_command", registered.template)
+  expect(summaries()).toBe(1)
+  expect(JSON.stringify(sent.at(-1)!.messages)).toContain("FOLDED")
+  // A command turn that never reached a selected provider is cleared on idle.
+  await message("msg_elsewhere", await command())
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "session" } } as never })
+  await post("msg_elsewhere")
+  expect(summaries()).toBe(1)
   await hooks.dispose!()
 })

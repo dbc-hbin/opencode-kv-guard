@@ -1,3 +1,4 @@
+import { basename, isAbsolute } from "node:path"
 import { isGeneratedEnvironment, type WireMessage } from "./prefix"
 import { digest as hash, instruction, record } from "./shared"
 
@@ -31,11 +32,19 @@ export type CompactionContext = {
   speculate?: boolean
   // Compact now even below the trigger (speculative runs only).
   force?: boolean
+  // User-requested compaction (/kv-compact): run the chain now and fold
+  // every eligible group outside the kept recent turns, not just to target.
+  manual?: boolean
   completeSummary: (body: ChatBody, signal?: AbortSignal) => Promise<Response>
+  // Raw storage for shaken tool results. `path` is a pure function of the
+  // text so a rebuilt placeholder keeps identical bytes. Without it, tool
+  // results are never shaken.
+  artifacts?: { path: (text: string) => string; save: (path: string, text: string) => Promise<void> }
 }
 export type CompactionResult = { body: ChatBody; report?: Record<string, number | boolean> } | { response: Response }
 type Options = Required<Omit<Exclude<CompactionOptions, false>, "summaryOutputTokens">> & { summaryOutputTokens?: number }
 type Reduction = { index: number; kind: "reasoning" } | { index: number; kind: "read"; proof: number }
+  | { index: number; kind: "shake"; path: string; tokens: number } | { index: number; kind: "media" }
 type Segment = { summary: string; archived: number[] }
 type State = { segments: Segment[]; covered: number; fingerprint: string; signature: string; reductions?: Reduction[] }
 // A background compaction prepared before the trigger is crossed. `base` is
@@ -71,7 +80,8 @@ export function isCompactionSnapshot(value: unknown): value is CompactionSnapsho
     return state.reductions.every((reduction) => {
       if (!record(reduction) || !Number.isSafeInteger(reduction.index) || (reduction.index as number) <= previous || (reduction.index as number) >= (state.covered as number)) return false
       previous = reduction.index as number
-      if (reduction.kind === "reasoning") return Object.keys(reduction).every((key) => key === "index" || key === "kind")
+      if (reduction.kind === "reasoning" || reduction.kind === "media") return Object.keys(reduction).every((key) => key === "index" || key === "kind")
+      if (reduction.kind === "shake") return Object.keys(reduction).every((key) => ["index", "kind", "path", "tokens"].includes(key)) && typeof reduction.path === "string" && isAbsolute(reduction.path) && /^tool_kvguard_[a-f0-9]{64}$/.test(basename(reduction.path)) && Number.isSafeInteger(reduction.tokens) && (reduction.tokens as number) > 0
       return reduction.kind === "read" && Object.keys(reduction).every((key) => ["index", "kind", "proof"].includes(key)) && Number.isSafeInteger(reduction.proof) && (reduction.proof as number) > previous && (reduction.proof as number) < (state.covered as number) && !readIndices.has(reduction.proof)
     })
   })
@@ -120,6 +130,29 @@ function plain(message: WireMessage) {
     if (!Array.isArray(message.tool_calls) || !message.tool_calls.every((call) => record(call) && call.type === "function" && Object.keys(call).every((key) => ["id", "type", "function"].includes(key)) && record(call.function) && typeof call.function.name === "string" && typeof call.function.arguments === "string" && Object.keys(call.function).every((key) => key === "name" || key === "arguments"))) return false
   }
   return true
+}
+
+// Provider-signed or encrypted state (reasoning signatures, encrypted
+// reasoning, thought signatures) is dropped from rescue summary transcripts.
+const signedKey = /signature|encrypted/i
+
+// Fragment summaries see opaque messages as text: non-text parts become
+// placeholders and signed fields are dropped instead of serializing payloads.
+function unsigned(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(unsigned)
+  if (!record(value)) return value
+  return Object.fromEntries(Object.entries(value).flatMap(([key, entry]) => signedKey.test(key) ? [] : [[key, unsigned(entry)]]))
+}
+
+function transcriptMessage(message: WireMessage): WireMessage {
+  if (plain(message)) return message
+  const result = unsigned(message) as WireMessage
+  if (Array.isArray(message.content)) {
+    result.content = message.content.map((part) => record(part) && part.type === "text" && typeof part.text === "string"
+      ? { type: "text", text: part.text }
+      : { type: record(part) && typeof part.type === "string" ? part.type : typeof part, omitted: "non-text content omitted from the summary transcript" })
+  }
+  return result
 }
 
 function groups(messages: WireMessage[]): Group[] {
@@ -172,12 +205,50 @@ function readResults(messages: WireMessage[], units: Group[]) {
       if (!record(call) || !record(call.function) || call.function.name !== "read" || typeof call.function.arguments !== "string" || !completeRead(message.content)) continue
       let args: unknown
       try { args = JSON.parse(call.function.arguments) } catch { continue }
-      if (!record(args) || typeof args.filePath !== "string" || !args.filePath.startsWith("/") || Object.keys(args).some((key) => !["filePath", "offset", "limit"].includes(key)) || (args.offset !== undefined && args.offset !== 1) || (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || (args.limit as number) < 1))) continue
+      if (!record(args) || typeof args.filePath !== "string" || !isAbsolute(args.filePath) || Object.keys(args).some((key) => !["filePath", "offset", "limit"].includes(key)) || (args.offset !== undefined && args.offset !== 1) || (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || (args.limit as number) < 1))) continue
       if (!(message.content as string).startsWith(`<path>${args.filePath}</path>\n`)) continue
       result.set(index, { key: call.function.arguments, content: message.content as string, end: group.end })
     }
   }
   return result
+}
+
+function shakePlaceholder(path: string, tokens: number) {
+  return `[Tool result removed from context (~${tokens} tokens); full output: ${JSON.stringify(path)}]`
+}
+
+function mediaPlaceholders(content: unknown[]) {
+  return content.map((part) => record(part) && part.type === "text" ? part : { type: "text", text: `[${record(part) && typeof part.type === "string" ? part.type : "content"} omitted to fit the context]` })
+}
+
+function hasMedia(message: WireMessage) {
+  return !instruction(message) && Array.isArray(message.content) && message.content.some((part) => !record(part) || part.type !== "text")
+}
+
+// Shake tool results and replace media from the end of a request until it
+// fits, so the longest unchanged prefix stays cached. Returns the rewritten
+// body and the raw texts to save first, or undefined if it cannot fit.
+export function shakeToFit(body: ChatBody, fits: (body: ChatBody) => boolean, artifacts: NonNullable<CompactionContext["artifacts"]>, bytesPerToken: number) {
+  const messages = [...body.messages]
+  const saves: { path: string; text: string }[] = []
+  const names = new Map<unknown, unknown>(messages.flatMap((message) => Array.isArray(message.tool_calls) ? message.tool_calls.flatMap((call) => record(call) && record(call.function) ? [[call.id, call.function.name] as const] : []) : []))
+  const size = (text: string) => Math.ceil(Buffer.byteLength(JSON.stringify(text), "utf8") / bytesPerToken)
+  if (fits(body)) return { body, saves }
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!
+    if (message.role === "tool" && typeof message.content === "string" && names.get(message.tool_call_id) !== "skill") {
+      const path = artifacts.path(message.content)
+      const tokens = size(message.content)
+      if (tokens < 2 * size(shakePlaceholder(path, tokens))) continue
+      messages[index] = { ...message, content: shakePlaceholder(path, tokens) }
+      saves.push({ path, text: message.content })
+    } else if (hasMedia(message)) {
+      messages[index] = { ...message, content: mediaPlaceholders(message.content as unknown[]) }
+    } else continue
+    const candidate = { ...body, messages: [...messages] }
+    if (fits(candidate)) return { body: candidate, saves }
+  }
+  return undefined
 }
 
 function reduced(body: ChatBody, reductions: Reduction[]): ChatBody {
@@ -188,6 +259,10 @@ function reduced(body: ChatBody, reductions: Reduction[]): ChatBody {
     if (reduction.kind === "reasoning") {
       delete message.reasoning
       delete message.reasoning_content
+    } else if (reduction.kind === "shake") {
+      message.content = shakePlaceholder(reduction.path, reduction.tokens)
+    } else if (reduction.kind === "media") {
+      message.content = mediaPlaceholders(message.content as unknown[])
     } else {
       message.content = `[Read result superseded by the identical complete result in tool call ${body.messages[reduction.proof]!.tool_call_id}.]`
     }
@@ -382,13 +457,20 @@ export class RollingCompaction {
       const indices = new Set(segment.archived)
       if (units.some((group) => {
         const count = Array.from({ length: group.end - group.start }, (_, offset) => group.start + offset).filter((index) => indices.has(index)).length
-        return count > 0 && (!group.plain || group === lastGroup || group === newestToolGroup || count !== group.end - group.start)
+        // Opaque conversational groups may be archived by the rescue; policy
+        // instructions and generated environments never are.
+        return count > 0 && (group === lastGroup || group === newestToolGroup || count !== group.end - group.start
+          || instruction(body.messages[group.start]!) || isGeneratedEnvironment(body.messages[group.start]!))
       })) return { signature }
     }
     const reads = state.reductions ? readResults(body.messages, units) : undefined
     if (state.reductions?.some((reduction) => {
-      if (reduction.index >= lastUser) return true
       const message = body.messages[reduction.index]
+      // Rescue reductions may cover the current turn's newest batch, never the
+      // current instruction itself. The fingerprint pins their source content.
+      if (reduction.kind === "shake") return reduction.index === lastUser || message?.role !== "tool" || typeof message.content !== "string"
+      if (reduction.kind === "media") return reduction.index === lastUser || !message || instruction(message) || !Array.isArray(message.content)
+      if (reduction.index >= lastUser) return true
       if (reduction.kind === "reasoning") return !message || message.role !== "assistant" || !plain(message)
       const earlier = reads?.get(reduction.index)
       const later = reads?.get(reduction.proof)
@@ -487,14 +569,28 @@ export class RollingCompaction {
     const trigger = Math.floor(budget * config.triggerRatio)
     // targetRatio is the recovery band relative to the trigger, as in OMP.
     const target = Math.floor(trigger * config.targetRatio)
+    // A manual compaction reduces as far as the chain allows.
+    const goal = context.manual ? 0 : target
     const before = estimate(body)
     let reductions: Reduction[] = []
     let prefixHandoff = false
+    // Shake (as in OMP): replace heavy tool results with a stable placeholder
+    // naming a private raw copy, without inference. A result is heavy when
+    // removing it saves at least its placeholder's size. Skill results carry
+    // instructions and stay exact.
+    // Raw copies are saved before a placeholder naming them is planned. A
+    // failed save (unsupported file system, locked file, permissions) skips
+    // that result, so the chain continues with soft compaction or the rescue
+    // instead of failing the request.
+    let storageFailed = false
     const report = (after: number, compacted: boolean, reused: boolean, summaryRequests = 0, coveredMessages = 0) => ({
       estimatedBefore: before, estimatedAfter: after, budget, trigger, target, compacted, reused, summaryRequests, coveredMessages,
       reducedReasoning: reductions.filter((reduction) => reduction.kind === "reasoning").length,
       supersededReads: reductions.filter((reduction) => reduction.kind === "read").length,
+      shakenResults: reductions.filter((reduction) => reduction.kind === "shake").length,
+      droppedMedia: reductions.filter((reduction) => reduction.kind === "media").length,
       prefixHandoff,
+      ...(storageFailed ? { shakeStorageFailed: true } : {}),
     })
     if (context.allowSummary === false) {
       if (before > budget) throw new Error(`Summary-disabled request estimates ${before} input tokens, exceeding budget ${budget}; native/manual compaction must fit without recursive summarization`)
@@ -522,7 +618,7 @@ export class RollingCompaction {
     const current = context.restoreReasoning?.(effectiveBody) ?? effectiveBody
     if (context.overflow) overflowScale = Math.max(1, Math.max(context.overflow.promptTokens ?? 0, budget + 1) / Math.max(1, measured(current)))
     const currentSize = estimate(current)
-    if (currentSize <= trigger && !context.force) {
+    if (currentSize <= trigger && !context.force && !context.manual) {
       // An unfinished background summary keeps running. It extends this
       // request's cached prefix, so with one endpoint slot this request waits
       // only for its decode, and the result is ready when the trigger is hit.
@@ -577,7 +673,7 @@ export class RollingCompaction {
     body = reduced(workingSource, reductions)
     const effective = () => rewritten(body, state?.segments ?? [])
     const policyIntervals = intervals(source.messages)
-    if (estimate(effective()) > target) {
+    if (estimate(effective()) > goal) {
       reads ??= readResults(source.messages, units)
       const latest = new Map<string, number>()
       const proofs = new Set(reductions.flatMap((reduction) => reduction.kind === "read" ? [reduction.proof] : []))
@@ -590,76 +686,167 @@ export class RollingCompaction {
       }
       body = reduced(workingSource, reductions)
     }
+    const users = body.messages.flatMap((message, index) => index <= lastUser && message.role === "user" && !isGeneratedEnvironment(message) ? [index] : [])
+    const recent = users[Math.max(0, users.length - config.keepRecentTurns)]!
+    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]!))
+    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]!.tool_calls) && (body.messages[group.start]!.tool_calls as unknown[]).length > 0)
+    const shake = async (selected: (group: Group) => boolean) => {
+      if (!context.artifacts) return
+      const taken = new Set(reductions.map((reduction) => reduction.index))
+      for (const group of units!) {
+        const calls = workingSource.messages[group.start]!.tool_calls
+        if (!selected(group) || !Array.isArray(calls)) continue
+        for (let index = group.start + 1; index < group.end; index++) {
+          const message = workingSource.messages[index]!
+          if (taken.has(index) || archived.has(index) || typeof message.content !== "string") continue
+          const call = calls.find((call) => record(call) && call.id === message.tool_call_id)
+          if (record(call) && record(call.function) && call.function.name === "skill") continue
+          const path = context.artifacts.path(message.content)
+          const tokens = bytesEstimate(message.content)
+          if (tokens < 2 * bytesEstimate(shakePlaceholder(path, tokens))) continue
+          active()
+          try { await context.artifacts.save(path, message.content) } catch {
+            storageFailed = true
+            continue
+          }
+          reductions.push({ index, kind: "shake", path, tokens })
+        }
+      }
+      reductions.sort((a, b) => a.index - b.index)
+      body = reduced(workingSource, reductions)
+    }
+    // A normal boundary shakes only results outside the kept recent turns.
+    if (context.artifacts && estimate(effective()) > goal) await shake((group) => group.end <= recent && group !== newestToolGroup)
     reductions.sort((a, b) => a.index - b.index)
     const checkpoint = (segments: Segment[]): State => {
       const indices = [...archivedIndices(segments)].sort((a, b) => a - b)
       const covered = Math.max(indices.at(-1) ?? -1, ...reductions.flatMap((reduction) => reduction.kind === "read" ? [reduction.index, reduction.proof, lastUser] : [reduction.index, lastUser])) + 1
       return { segments, covered, fingerprint: hash(JSON.stringify(source.messages.slice(0, covered))), signature, ...(reductions.length ? { reductions } : {}) }
     }
-    const reducedCurrent = effective()
-    const reducedSize = estimate(reducedCurrent)
-    if (reductions.length > (state?.reductions?.length ?? 0) && reducedSize <= target) {
+    const baseShakes = (state?.reductions ?? []).filter((reduction) => reduction.kind === "shake").length
+    const commit = (segments: Segment[]) => {
       active()
       lane.state = checkpoint(segments)
-      return { body: reducedCurrent, report: report(reducedSize, true, !!state, 0, archived.size) }
+      return reductions.filter((reduction) => reduction.kind === "shake").length - baseShakes
     }
-    const users = body.messages.flatMap((message, index) => index <= lastUser && message.role === "user" && !isGeneratedEnvironment(message) ? [index] : [])
-    const recent = users[Math.max(0, users.length - config.keepRecentTurns)]!
-    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]!))
-    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]!.tool_calls) && (body.messages[group.start]!.tool_calls as unknown[]).length > 0)
-    const eligible = units.filter((group) => group !== lastGroup && group !== newestToolGroup && group.plain && !(group.start <= lastUser && lastUser < group.end) && !archived.has(group.start))
-    // Prefer complete recent turns. If they prevent recovery, fold complete
-    // older groups inside those turns, keeping the latest instruction and batch.
-    const candidates = [...eligible.filter((group) => group.end <= recent), ...eligible.filter((group) => group.end > recent)]
+    let reducedSize = estimate(effective())
+    if (reductions.length > (state?.reductions?.length ?? 0) && reducedSize <= goal) {
+      const shook = commit(segments)
+      return { body: effective(), report: { ...report(reducedSize, true, !!state, 0, archived.size), shook } }
+    }
     const derivedCap = Math.min(context.outputLimit, Math.max(1, trigger - target))
     const summaryCap = Math.min(context.outputLimit, config.summaryOutputTokens ?? derivedCap)
     // Each planned summary occupies input in the rewritten request, which the
     // final fit check estimates with the overflow scale applied.
     const summaryReserve = Math.ceil(summaryCap * overflowScale)
     const touched = new Map<number, { segment: Segment; previous?: Segment; additions: number[] }>()
+    const committed = segments.map((segment) => ({ summary: segment.summary, archived: [...segment.archived] }))
     let plannedSize = reducedSize
-    // Opening an interval must repay its own wrapper and full output reserve.
-    // Skip unprofitable intervals instead of letting small early groups consume
-    // the recovery available in a later interval.
-    for (const group of candidates) {
-      if (archived.has(group.start)) continue
-      const interval = policyIntervals[group.start]!
-      let plan = touched.get(interval)
-      if (!plan) {
-        const previous = segments.find((segment) => policyIntervals[segment.archived[0]!] === interval)
-        const additions: number[] = []
-        for (const candidate of candidates) {
-          if (policyIntervals[candidate.start] !== interval || archived.has(candidate.start)) continue
-          for (let index = candidate.start; index < candidate.end; index++) additions.push(index)
-          const segment = { summary: "", archived: [...(previous?.archived ?? []), ...additions].sort((a, b) => a - b) }
-          const trial = [...segments.filter((entry) => entry !== previous), segment].sort((a, b) => a.archived[0]! - b.archived[0]!)
-          const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryReserve
-          if (size >= plannedSize) continue
-          plan = { segment, previous, additions }
-          touched.set(interval, plan)
-          if (previous) segments.splice(segments.indexOf(previous), 1)
-          segments.push(segment)
-          segments.sort((a, b) => a.archived[0]! - b.archived[0]!)
-          for (const index of additions) archived.add(index)
-          plannedSize = size
-          break
+    const resetPlan = () => {
+      segments.splice(0, segments.length, ...committed.map((segment) => ({ summary: segment.summary, archived: [...segment.archived] })))
+      archived.clear()
+      for (const index of archivedIndices(segments)) archived.add(index)
+      touched.clear()
+      plannedSize = reducedSize
+    }
+    // Soft compaction folds exact plain groups. The rescue plan also folds
+    // opaque/signed groups as sanitized text. System/tools, the current user
+    // instruction, the newest tool batch and a trailing message stay unfolded.
+    const planFolds = (rescue: boolean) => {
+      resetPlan()
+      const eligible = units.filter((group) => !instruction(body.messages[group.start]!) && !isGeneratedEnvironment(body.messages[group.start]!)
+        && !(group.start <= lastUser && lastUser < group.end) && !archived.has(group.start)
+        && group !== lastGroup && group !== newestToolGroup && (rescue || group.plain))
+      // Prefer complete recent turns. If they prevent recovery, fold complete
+      // older groups inside those turns, keeping the latest instruction and batch.
+      // A manual soft pass is not under pressure and keeps the recent turns.
+      const older = eligible.filter((group) => group.end <= recent)
+      const candidates = context.manual && !rescue ? older : [...older, ...eligible.filter((group) => group.end > recent)]
+      // Opening an interval must repay its own wrapper and full output reserve.
+      // Skip unprofitable intervals instead of letting small early groups consume
+      // the recovery available in a later interval.
+      for (const group of candidates) {
+        if (archived.has(group.start)) continue
+        const interval = policyIntervals[group.start]!
+        let plan = touched.get(interval)
+        if (!plan) {
+          const previous = segments.find((segment) => policyIntervals[segment.archived[0]!] === interval)
+          const additions: number[] = []
+          for (const candidate of candidates) {
+            if (policyIntervals[candidate.start] !== interval || archived.has(candidate.start)) continue
+            for (let index = candidate.start; index < candidate.end; index++) additions.push(index)
+            const segment = { summary: "", archived: [...(previous?.archived ?? []), ...additions].sort((a, b) => a - b) }
+            const trial = [...segments.filter((entry) => entry !== previous), segment].sort((a, b) => a.archived[0]! - b.archived[0]!)
+            const size = estimate(rewritten(body, trial)) + (touched.size + 1) * summaryReserve
+            if (size >= plannedSize) continue
+            plan = { segment, previous, additions }
+            touched.set(interval, plan)
+            if (previous) segments.splice(segments.indexOf(previous), 1)
+            segments.push(segment)
+            segments.sort((a, b) => a.archived[0]! - b.archived[0]!)
+            for (const index of additions) archived.add(index)
+            plannedSize = size
+            break
+          }
+          if (!plan) continue
+        } else {
+          for (let index = group.start; index < group.end; index++) {
+            plan.additions.push(index)
+            plan.segment.archived.push(index)
+            archived.add(index)
+          }
+          plan.segment.archived.sort((a, b) => a - b)
+          plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryReserve
         }
-        if (!plan) continue
-      } else {
-        for (let index = group.start; index < group.end; index++) {
-          plan.additions.push(index)
-          plan.segment.archived.push(index)
-          archived.add(index)
-        }
-        plan.segment.archived.sort((a, b) => a - b)
-        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryReserve
+        if (plannedSize <= goal) break
       }
-      if (plannedSize <= target) break
+    }
+    planFolds(false)
+    let rescue = false
+    // The rescue only needs to fit the actual budget; soft compaction keeps
+    // the lower target that prevents repeated rewrites. A manual compaction
+    // folds everything eligible and only has to fit the budget.
+    let limit = context.manual ? budget : target
+    if (!touched.size || plannedSize > limit) {
+      if (context.manual && !touched.size && reducedSize <= budget) {
+        // Nothing left to fold: keep any new reductions, else report a no-op.
+        if (reductions.length > (state?.reductions?.length ?? 0)) {
+          const shook = commit(segments)
+          return { body: effective(), report: { ...report(reducedSize, true, !!state, 0, archived.size), shook } }
+        }
+        return { body: current, report: { ...report(currentSize, false, !!state, 0, archived.size), manualNoop: true } }
+      }
+      if (!context.manual && !context.overflow && currentSize <= budget) {
+        // Mandatory content alone exceeds the recovery target but the
+        // unchanged request still fits: send it as is, keeping the cached
+        // prefix, rather than failing or rewriting history for no recovery.
+        reductions = [...(state?.reductions ?? [])]
+        segments.splice(0, segments.length, ...committed)
+        return { body: current, report: { ...report(currentSize, false, !!state, 0, archivedIndices(committed).size), mandatoryOverTarget: true } }
+      }
+      // Dead-end rescue (as in OMP): shake every remaining tool result,
+      // including the newest batch, and replace attached media, then fold any
+      // remaining history. Signed state is dropped only from the summary text.
+      rescue = true
+      limit = budget
+      resetPlan()
+      if (context.artifacts) await shake(() => true)
+      const taken = new Set(reductions.map((reduction) => reduction.index))
+      workingSource.messages.forEach((message, index) => {
+        if (index !== lastUser && !taken.has(index) && !archived.has(index) && !isGeneratedEnvironment(message) && hasMedia(message)) reductions.push({ index, kind: "media" })
+      })
+      reductions.sort((a, b) => a.index - b.index)
+      body = reduced(workingSource, reductions)
+      reducedSize = estimate(effective())
+      if (reducedSize <= budget) {
+        const shook = commit(segments)
+        return { body: effective(), report: { ...report(reducedSize, true, !!state, 0, archived.size), shook, rescue: true } }
+      }
+      planFolds(true)
     }
     const mandatorySize = estimate(rewritten(body, segments))
-    if (!touched.size || plannedSize > target) {
-      const opaque = units.some((group) => !group.plain && !instruction(body.messages[group.start]!))
-      throw new Error(`Compaction cannot reach recovery budget ${target}: mandatory current user instruction, newest tool/result group, fixed system/tools/format${opaque ? ", or opaque/multimodal data" : ""} require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}. Reduce the mandatory input or supply larger actual model limits`)
+    if (!touched.size || plannedSize > limit) {
+      throw new Error(`Compaction cannot fit input budget ${budget}: current user instruction, trailing message and fixed system/tools/format require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}, even after removing tool results and attachments and summarizing remaining history. Reduce the mandatory input or supply larger actual model limits`)
     }
 
     let calls = 0
@@ -668,7 +855,7 @@ export class RollingCompaction {
     const constrained = constrainedOutput(body)
     for (const plan of [...touched.values()].sort((a, b) => a.segment.archived[0]! - b.segment.archived[0]!)) {
       plan.additions.sort((a, b) => a - b)
-      const transcript = plan.additions.map((index) => JSON.stringify({ source_index: index, message: body.messages[index] })).join("\n")
+      const transcript = plan.additions.map((index) => JSON.stringify({ source_index: index, message: transcriptMessage(body.messages[index]!) })).join("\n")
       let summary = plan.previous?.summary ?? ""
       let offset = 0
       const request = (text: string): ChatBody => ({
@@ -748,10 +935,9 @@ export class RollingCompaction {
     }
     const result = rewritten(body, segments)
     const after = estimate(result)
-    if (after > target) throw new Error(`Compaction still estimates ${after} input tokens after folding, above recovery budget ${target}; no summary state was committed`)
-    active()
-    lane.state = checkpoint(segments)
-    return { body: result, report: report(after, true, !!state, calls, archived.size) }
+    if (after > limit) throw new Error(`Compaction still estimates ${after} input tokens after folding, above ${rescue ? "input" : "recovery"} budget ${limit}; no summary state was committed`)
+    const shook = commit(segments)
+    return { body: result, report: { ...report(after, true, !!state, calls, archived.size), shook, ...(rescue ? { rescue: true } : {}) } }
   }
 
   snapshot(session: string): CompactionSnapshot {

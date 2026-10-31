@@ -4,14 +4,15 @@ import { isAbsolute, join } from "node:path"
 import { admittedFetch, endpointGate, type AdmissionGate, type Fetch } from "./transport"
 import { processEndpointGate } from "./process-gate"
 import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDate, UserTurns } from "./prefix"
+import { randomUUID } from "node:crypto"
 import { compactSystem } from "./compact"
-import { ContextOverflowError, RollingCompaction, constrainedOutput, overflowPromptTokens, providerError, readSummary, summaryRequestBase, type ChatBody, type ProviderError, type SummaryResult } from "./compaction"
+import { ContextOverflowError, RollingCompaction, constrainedOutput, shakeToFit, overflowPromptTokens, providerError, readSummary, summaryRequestBase, type ChatBody, type ProviderError, type SummaryResult } from "./compaction"
 import { CheckpointStore, type CheckpointSnapshot } from "./checkpoints"
 import { UsageTracker, observeResponse } from "./usage"
 import { parseGLMOptions, normalizeGLMRequest, createGLMChunkAdapter } from "./glm"
 import { compactSkillCatalog } from "./skills"
 import { compactToolDescriptions } from "./tools"
-import { ToolOutputShrinker } from "./output"
+import { ToolArtifacts, ToolOutputShrinker } from "./output"
 import { SessionHeads, PrefixGuard } from "./heads"
 import { digest as hash, record } from "./shared"
 
@@ -19,6 +20,10 @@ const agentHeader = "x-opencode-kv-guard-agent"
 const limitsHeader = "x-opencode-kv-guard-limits"
 const userHeader = "x-opencode-kv-guard-user"
 const systemSuffixHeader = "x-opencode-kv-guard-system-suffix"
+// User command that runs the plugin's rolling chain (reductions, shake, soft
+// summary, rescue) on its own turn, without OpenCode's native history rewrite.
+const manualCommand = "kv-compact"
+const manualCommandPrompt = "The conversation context was just compacted on request. Reply with one short sentence confirming it and stating the current task, if any. Do not call tools or continue the task until the next instruction."
 // Internal OpenCode agents that never own a resumable conversation.
 const internalAgents = ["title", "summary", "compaction"]
 // Pinned OpenCode 1.19.4 compaction prompt (core session/compaction.ts
@@ -64,6 +69,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   const heads = new SessionHeads()
   const prefixGuard = new PrefixGuard()
   const compaction = new RollingCompaction(options.compaction)
+  const toolArtifacts = new ToolArtifacts()
   const userTurns = new UserTurns()
   const usage = new UsageTracker()
   const sessionLanes = new Map<string, Set<string>>()
@@ -76,9 +82,17 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   // summarize by extending that exact prefix instead of a fresh transcript.
   const lastExchanges = new Map<string, Exchange>()
   const nativeCompactions = new Set<string>()
+  // /kv-compact: the command tags its own text part with a private nonce
+  // (pending), chat.message binds that exact user message ID, and only the
+  // request for that message runs the rolling chain.
+  const manualMarker = `\u001ekv-guard-compact:${randomUUID()}:`
+  const manualPattern = new RegExp(`${manualMarker}([a-f0-9-]{36})\u001f`)
+  const manualPending = new Map<string, string>()
+  const manualCompactions = new Map<string, string>()
   // Provider targets observed rejecting tool_choice "none" on a summary.
   const toolChoiceNoneRejected = new Set<string>()
   const manualHandoff = options.compaction !== false && options.prefixHandoff !== false
+  let manualCommandOwned = false
   const disposed = new AbortController()
   let store: CheckpointStore | undefined
   const log = async (message: string, extra: Record<string, unknown>) => {
@@ -90,7 +104,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   const compactionNotice = (session: string) => {
     let title: Promise<string | undefined> | undefined
     let started = false
-    const show = (message: string, variant: "info" | "success") => {
+    const show = (message: string, variant: "info" | "success" | "warning") => {
       title ??= Promise.resolve().then(() => client.session.get({ path: { id: session } })).then((result) => result.data?.title)
       void title.then((resolved) => client.tui.showToast({ body: { title: resolved, message, variant } })).catch((error) =>
         Promise.resolve().then(() => client.app.log({ body: { service: "kv-guard", level: "warn", message: "Compaction notification failed", extra: { error: error instanceof Error ? error.message : String(error) } } })).catch(() => {}))
@@ -102,6 +116,11 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       },
       finished(report?: Record<string, unknown>) {
         if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0 || report?.speculative === true) show("Session compacted", "success")
+        else if (typeof report?.shook === "number" && report.shook > 0) show(`Removed ${report.shook} large tool result${report.shook === 1 ? "" : "s"} from context; full output saved`, "success")
+        if (report?.rescue === true) show("Context was still too large: recent tool results and attachments were removed to fit", "warning")
+        if (report?.shakeStorageFailed === true) show("Could not save some tool outputs to disk; those results were kept in context", "warning")
+        if (report?.manualNoop === true) show("Nothing to compact", "info")
+        if (report?.mandatoryOverTarget === true) show("Context is near the limit and cannot be compacted further; reduce attachments, tools or large tool output", "warning")
       },
     }
   }
@@ -222,6 +241,11 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
 
   return {
     async config(config) {
+      // Register /kv-compact unless the user defined a command of that name.
+      manualCommandOwned = options.compaction !== false && !config.command?.[manualCommand]
+      // subtask: false keeps the command in the requesting session even when a
+      // subagent is selected; a child session would never see the binding.
+      if (manualCommandOwned) config.command = { ...config.command, [manualCommand]: { template: manualCommandPrompt, description: "Compact the session context now, keeping the KV-cached prefix (kv-guard)", subtask: false } }
       // Resolve every target before mutating config. The v1.19.4 provider loader
       // runs this hook before constructing SDK instances and copies options.fetch.
       const targets = [...providers].map((id) => {
@@ -467,15 +491,24 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               stream: false,
               ...(prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }),
             }
-            const fallback = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / (compaction.options ? compaction.options.bytesPerToken : 4))
-            const size = options.usageAccounting === false ? fallback(handoff) : usage.estimate(handoff, exchange.lane, fallback)
+            const bytesPerToken = compaction.options ? compaction.options.bytesPerToken : 4
+            const fallback = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / bytesPerToken)
+            const measure = (candidate: ChatBody) => options.usageAccounting === false ? fallback(candidate) : usage.estimate(candidate, exchange.lane, fallback)
             const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - (compaction.options ? compaction.options.marginTokens : 0)
-            if (size > budget) {
-              await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: size, budget })
+            // Like the dead-end rescue, shake tool results and media from the
+            // end until the handoff fits, keeping the longest cached prefix.
+            const fitted = shakeToFit(handoff, (candidate) => measure(candidate) <= budget, { path: (text) => toolArtifacts.contentPath(text), save: (path, text) => toolArtifacts.saveContent(path, text) }, bytesPerToken)
+            if (!fitted) {
+              await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: measure(handoff), budget })
               return undefined
             }
+            try { for (const { path, text } of fitted.saves) await toolArtifacts.saveContent(path, text) } catch (error) {
+              await log("Manual compaction kept the native request", { reason: "raw output storage failed", error: error instanceof Error ? error.message : String(error) })
+              return undefined
+            }
+            const size = measure(fitted.body)
             const notice = compactionNotice(sessionID)
-            const response = await notice.summary(() => sendSummary(handoff))
+            const response = await notice.summary(() => sendSummary(fitted.body))
             if (!response.ok) {
               const error = await providerError(response)
               // The handoff is longer than OpenCode's own serialized request;
@@ -493,7 +526,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             }
             notice.finished({ summaryRequests: 1 })
             lastExchanges.delete(sessionID)
-            await log("Manual compaction via prefix handoff", { estimated: size, budget, cachedMessages: prior.messages.length + 1 })
+            await log("Manual compaction via prefix handoff", { estimated: size, budget, cachedMessages: prior.messages.length + 1, shook: fitted.saves.length })
             const id = typeof summary.completion.id === "string" ? summary.completion.id : `kv-guard-${hash(summary.content).slice(0, 16)}`
             const created = Math.floor(Date.now() / 1000)
             const usageField = summary.completion.usage !== undefined ? { usage: summary.completion.usage } : {}
@@ -512,6 +545,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             const handled = await manualCompaction(session)
             if (handled) return handled
           }
+          // Only the /kv-compact command's own user message runs manually.
+          const manual = !!session && !!agent && !internalAgents.includes(agent) && !!currentUser && !!expectedUser && manualCompactions.get(session) === expectedUser
           const prepare = async (overflow?: { promptTokens?: number }) => {
             const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined, stableTools }
             const replacements = new Map<ChatBody["messages"][number], ChatBody["messages"][number]>()
@@ -563,9 +598,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
                 allowSummary, currentUser, prefixHandoff: options.prefixHandoff !== false,
                 restoreReasoning: options.prefixGuard === false ? undefined : (effective: ChatBody) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
                 estimate: options.usageAccounting === false ? undefined : (candidate: ChatBody, fallback: (value: unknown) => number) => usage.estimate(candidate, lane, fallback),
-                overflow,
-                speculate: options.speculativeCompaction === true && allowSummary,
+                overflow, manual,
+                speculate: options.speculativeCompaction === true && allowSummary && !manual,
                 completeSummary: (summary: ChatBody) => notice.summary(() => sendSummary(summary)),
+                artifacts: { path: (text: string) => toolArtifacts.contentPath(text), save: (path: string, text: string) => toolArtifacts.saveContent(path, text) },
               }
               const history = body
               const prepared = await compaction.prepare(body, compactionContext)
@@ -651,6 +687,26 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         activeProviders.add(target.id)
       }
     },
+    async "command.execute.before"(input, output) {
+      if (input.command !== manualCommand || !manualCommandOwned) return
+      const part = output.parts.find((part) => part.type === "text")
+      if (part?.type !== "text") return
+      const nonce = randomUUID()
+      part.text = manualMarker + nonce + "\u001f" + part.text
+      manualPending.set(nonce, input.sessionID)
+    },
+    async "chat.message"(input, output) {
+      // Bind only the message carrying this command's nonce, then strip it
+      // before OpenCode stores the message.
+      for (const part of output.parts) {
+        if (part.type !== "text") continue
+        const match = manualPattern.exec(part.text)
+        if (!match) continue
+        part.text = part.text.replace(manualPattern, "")
+        if (manualPending.get(match[1]!) === input.sessionID) manualCompactions.set(input.sessionID, output.message.id)
+        manualPending.delete(match[1]!)
+      }
+    },
     async "chat.params"(input, output) {
       if (!activeProviders.has(input.model.providerID) || maxOutputTokens === undefined) return
       output.maxOutputTokens = Math.min(output.maxOutputTokens ?? maxOutputTokens, maxOutputTokens)
@@ -708,6 +764,9 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       if (event.type === "session.idle") {
         // A compaction cancelled between its hooks never reaches its transform.
         nativeCompactions.delete(event.properties.sessionID)
+        // The command turn is over, whether or not a selected provider ran it.
+        for (const [nonce, owner] of manualPending) if (owner === event.properties.sessionID) manualPending.delete(nonce)
+        manualCompactions.delete(event.properties.sessionID)
         return continueTruncated(event.properties.sessionID)
       }
       if (event.type !== "session.deleted") return
@@ -720,6 +779,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       outputCalls.delete(session)
       lastExchanges.delete(session)
       nativeCompactions.delete(session)
+      for (const [nonce, owner] of manualPending) if (owner === session) manualPending.delete(nonce)
+      manualCompactions.delete(session)
       compaction.delete(session)
       // OpenCode fires event hooks without awaiting them. Own this work until
       // the tombstone commits, including when plugin disposal follows deletion.
@@ -764,6 +825,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       outputCalls.clear()
       lastExchanges.clear()
       nativeCompactions.clear()
+      manualPending.clear()
+      manualCompactions.clear()
       truncatedHandled.clear()
       toolChoiceNoneRejected.clear()
       if (deletionFailures.length) throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion")

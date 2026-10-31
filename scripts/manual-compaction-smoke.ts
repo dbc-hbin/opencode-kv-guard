@@ -17,9 +17,11 @@ const requests: Wire[] = []
 const handoffSummary = "## Objective\n- HANDOFF_SUMMARY_MARKER"
 const nativeSummary = "## Objective\n- NATIVE_SUMMARY_MARKER"
 const encoder = new TextEncoder()
-const sse = (text: string) => {
+// Report a prompt size proportional to the request, so usage-anchored budgeting
+// sees realistic counts.
+const sse = (text: string, prompt = 100) => {
   const chunk = (delta: unknown, finish_reason: string | null) => `data: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta, finish_reason }] })}\n\n`
-  const usage = `data: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\n`
+  const usage = `data: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [], usage: { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10 } })}\n\n`
   return new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(encoder.encode(chunk({ role: "assistant", content: text }, null) + chunk({}, "stop") + usage + "data: [DONE]\n\n")); controller.close() } }), { headers: { "content-type": "text/event-stream" } })
 }
 const proxy = Bun.serve({
@@ -32,7 +34,7 @@ const proxy = Bun.serve({
     if (body.stream === false) return Response.json({ id: "handoff", object: "chat.completion", created: 1, model: "fixture", choices: [{ index: 0, message: { role: "assistant", content: handoffSummary }, finish_reason: "stop" }], usage: { prompt_tokens: 900, completion_tokens: 20, total_tokens: 920, prompt_tokens_details: { cached_tokens: 800 } } })
     const last = JSON.stringify(body.messages.at(-1)?.content ?? "")
     if (last.includes("Here is the conversation so far")) return sse(nativeSummary)
-    return sse(`Answer ${requests.length}.`)
+    return sse(`Answer ${requests.length}.`, Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 4))
   },
 })
 const config = {
@@ -111,7 +113,31 @@ try {
     await client.session.prompt({ path: { id: sessionID }, body: { model: { providerID, modelID: "fixture" }, parts: [{ type: "text", text: "USER_TURN_2" }] } })
     const next = JSON.stringify(requests.at(-1)!.messages)
     assert.ok(next.includes("NATIVE_SUMMARY_MARKER") && next.includes("USER_TURN_2"))
-    return { version: "1.19.4", handoffMessages: handoff.messages.length, cachedPrefixMessages: lastMain.messages.length, nativeFallbackOnStaleExchange: true, summaryCacheRead: 800 }
+
+    // /kv-compact runs the plugin's rolling chain on its own turn: older turns
+    // are folded into a wire summary while OpenCode's stored history is kept.
+    for (const turn of [3, 4, 5]) await client.session.prompt({ path: { id: sessionID }, body: { model: { providerID, modelID: "fixture" }, parts: [{ type: "text", text: `USER_TURN_${turn} ${"p".repeat(4000)}` }] } })
+    const storedBefore = (await client.session.messages({ path: { id: sessionID } })).data!.length
+    const beforeRolling = requests.length
+    await client.session.command({ path: { id: sessionID }, body: { command: "kv-compact", arguments: "", model: `${providerID}/fixture` } })
+    const rolling = requests.slice(beforeRolling)
+    const summaries = rolling.filter((request) => request.stream === false)
+    assert.ok(summaries.length > 0, "/kv-compact must make a rolling summary request")
+    const main = rolling.findLast((request) => request.stream !== false)!
+    const wire = JSON.stringify(main.messages)
+    assert.ok(wire.includes("Historical conversation summary") && wire.includes("HANDOFF_SUMMARY_MARKER"), "the command turn must carry the rolling summary")
+    assert.ok(!wire.includes("USER_TURN_3"), "older turns must be folded on the wire")
+    assert.ok(String(main.messages.at(-1)?.content).includes("compacted on request"), "the command prompt must be the current instruction")
+    assert.ok(!wire.includes("kv-guard-compact"), "the command correlation nonce must not reach the provider")
+    const storedAfter = (await client.session.messages({ path: { id: sessionID } })).data!
+    assert.equal(storedAfter.length, storedBefore + 2, "OpenCode history is kept; only the command turn is added")
+    assert.ok(!storedAfter.slice(storedBefore).some((message) => message.info.role === "assistant" && message.info.summary), "/kv-compact must not create a native compaction")
+    assert.ok(!JSON.stringify(storedAfter).includes("kv-guard-compact"), "the command correlation nonce must not be stored")
+    // The next turn replays the same checkpointed prefix.
+    await client.session.prompt({ path: { id: sessionID }, body: { model: { providerID, modelID: "fixture" }, parts: [{ type: "text", text: "USER_TURN_6" }] } })
+    const following = requests.at(-1)!
+    assert.deepEqual(following.messages.slice(0, main.messages.length - 1), main.messages.slice(0, -1), "the next turn must keep the compacted prefix")
+    return { version: "1.19.4", handoffMessages: handoff.messages.length, cachedPrefixMessages: lastMain.messages.length, nativeFallbackOnStaleExchange: true, summaryCacheRead: 800, kvCompactSummaries: summaries.length, kvCompactKeptStoredHistory: true }
   })(), deadline.promise])
   console.log(JSON.stringify(result, null, 2))
 } finally {
