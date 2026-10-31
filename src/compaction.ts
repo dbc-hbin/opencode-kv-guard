@@ -45,6 +45,10 @@ export type CompactionResult = { body: ChatBody; report?: Record<string, number 
 type Options = Required<Omit<Exclude<CompactionOptions, false>, "summaryOutputTokens">> & { summaryOutputTokens?: number }
 type Reduction = { index: number; kind: "reasoning" } | { index: number; kind: "read"; proof: number }
   | { index: number; kind: "shake"; path: string; tokens: number } | { index: number; kind: "media" }
+  // Middle of one text (the content string, or text part `part`) cut to keep
+  // `head` and `tail` UTF-16 units; `path` names the saved full text, if any.
+  // `media` also replaces the message's attachments, as a media reduction does.
+  | { index: number; kind: "clip"; head: number; tail: number; tokens: number; part?: number; path?: string; media?: true }
 type Segment = { summary: string; archived: number[] }
 type State = { segments: Segment[]; covered: number; fingerprint: string; signature: string; reductions?: Reduction[] }
 // A background compaction prepared before the trigger is crossed. `base` is
@@ -81,6 +85,11 @@ export function isCompactionSnapshot(value: unknown): value is CompactionSnapsho
       if (!record(reduction) || !Number.isSafeInteger(reduction.index) || (reduction.index as number) <= previous || (reduction.index as number) >= (state.covered as number)) return false
       previous = reduction.index as number
       if (reduction.kind === "reasoning" || reduction.kind === "media") return Object.keys(reduction).every((key) => key === "index" || key === "kind")
+      if (reduction.kind === "clip") return Object.keys(reduction).every((key) => ["index", "kind", "head", "tail", "tokens", "part", "path", "media"].includes(key))
+        && (reduction.media === undefined || reduction.media === true && reduction.part !== undefined)
+        && [reduction.head, reduction.tail].every((value) => Number.isSafeInteger(value) && (value as number) >= 0) && Number.isSafeInteger(reduction.tokens) && (reduction.tokens as number) > 0
+        && (reduction.part === undefined || Number.isSafeInteger(reduction.part) && (reduction.part as number) >= 0)
+        && (reduction.path === undefined || typeof reduction.path === "string" && isAbsolute(reduction.path) && /^tool_kvguard_[a-f0-9]{64}$/.test(basename(reduction.path)))
       if (reduction.kind === "shake") return Object.keys(reduction).every((key) => ["index", "kind", "path", "tokens"].includes(key)) && typeof reduction.path === "string" && isAbsolute(reduction.path) && /^tool_kvguard_[a-f0-9]{64}$/.test(basename(reduction.path)) && Number.isSafeInteger(reduction.tokens) && (reduction.tokens as number) > 0
       return reduction.kind === "read" && Object.keys(reduction).every((key) => ["index", "kind", "proof"].includes(key)) && Number.isSafeInteger(reduction.proof) && (reduction.proof as number) > previous && (reduction.proof as number) < (state.covered as number) && !readIndices.has(reduction.proof)
     })
@@ -263,6 +272,11 @@ function reduced(body: ChatBody, reductions: Reduction[]): ChatBody {
       message.content = shakePlaceholder(reduction.path, reduction.tokens)
     } else if (reduction.kind === "media") {
       message.content = mediaPlaceholders(message.content as unknown[])
+    } else if (reduction.kind === "clip") {
+      const clip = (text: string) => `${text.slice(0, reduction.head)}\n[... ~${reduction.tokens} tokens clipped to fit the context${reduction.path ? `; full text: ${JSON.stringify(reduction.path)}` : ""} ...]\n${text.slice(text.length - reduction.tail)}`
+      message.content = reduction.part === undefined
+        ? clip(message.content as string)
+        : (reduction.media ? mediaPlaceholders(message.content as unknown[]) : message.content as unknown[]).map((part, index) => index === reduction.part ? { ...(part as Record<string, unknown>), text: clip((part as Record<string, unknown>).text as string) } : part)
     } else {
       message.content = `[Read result superseded by the identical complete result in tool call ${body.messages[reduction.proof]!.tool_call_id}.]`
     }
@@ -468,6 +482,12 @@ export class RollingCompaction {
       const message = body.messages[reduction.index]
       // Rescue reductions may cover the current turn's newest batch, never the
       // current instruction itself. The fingerprint pins their source content.
+      if (reduction.kind === "clip") {
+        if (!message || instruction(message) || isGeneratedEnvironment(message)) return true
+        const part = reduction.part === undefined ? undefined : Array.isArray(message.content) ? message.content[reduction.part] : undefined
+        const text = reduction.part === undefined ? message.content : record(part) && part.type === "text" ? part.text : undefined
+        return typeof text !== "string" || reduction.head + reduction.tail >= text.length
+      }
       if (reduction.kind === "shake") return reduction.index === lastUser || message?.role !== "tool" || typeof message.content !== "string"
       if (reduction.kind === "media") return reduction.index === lastUser || !message || instruction(message) || !Array.isArray(message.content)
       if (reduction.index >= lastUser) return true
@@ -589,6 +609,7 @@ export class RollingCompaction {
       supersededReads: reductions.filter((reduction) => reduction.kind === "read").length,
       shakenResults: reductions.filter((reduction) => reduction.kind === "shake").length,
       droppedMedia: reductions.filter((reduction) => reduction.kind === "media").length,
+      clippedMessages: reductions.filter((reduction) => reduction.kind === "clip").length,
       prefixHandoff,
       ...(storageFailed ? { shakeStorageFailed: true } : {}),
     })
@@ -844,9 +865,85 @@ export class RollingCompaction {
       }
       planFolds(true)
     }
-    const mandatorySize = estimate(rewritten(body, segments))
+    let clipped = 0
+    let clipStorageFailed = false
     if (!touched.size || plannedSize > limit) {
-      throw new Error(`Compaction cannot fit input budget ${budget}: current user instruction, trailing message and fixed system/tools/format require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}, even after removing tool results and attachments and summarizing remaining history. Reduce the mandatory input or supply larger actual model limits`)
+      // Last resort: cut the middle of the largest remaining texts (current
+      // instruction, newest batch, trailing message), one per message, keeping
+      // head and tail and naming a saved full copy, until the plan fits. A
+      // committed clip is recomputed from its source text and a media
+      // reduction is merged, so growing history can always tighten them.
+      // Aim for the recovery target first so the next turns need no new clip;
+      // fall back to the budget only if the target is out of reach.
+      const prior = reductions
+      const texts = workingSource.messages.flatMap((message, index) => {
+        const existing = prior.find((reduction) => reduction.index === index)
+        if (archived.has(index) || instruction(message) || isGeneratedEnvironment(message) || existing && existing.kind !== "clip" && existing.kind !== "media") return []
+        const media = existing?.kind === "media" || existing?.kind === "clip" && !!existing.media
+        if (typeof message.content === "string") return [{ index, media, part: undefined as number | undefined, text: message.content }]
+        if (!Array.isArray(message.content)) return []
+        const parts = message.content.flatMap((part, partIndex) => record(part) && part.type === "text" && typeof part.text === "string" ? [{ index, media, part: partIndex as number | undefined, text: part.text }] : [])
+        return parts.sort((a, b) => b.text.length - a.text.length).slice(0, 1)
+      }).sort((a, b) => b.text.length - a.text.length)
+      const selected = new Set(texts.map(({ index }) => index))
+      const base = prior.flatMap((reduction): Reduction[] => !selected.has(reduction.index) ? [reduction] : reduction.kind === "media" || reduction.kind === "clip" && reduction.media ? [{ index: reduction.index, kind: "media" }] : [])
+      const paths = new Map<number, string | undefined>()
+      for (const aim of [...new Set([Math.min(target, limit), limit])]) {
+        reductions = [...base]
+        clipped = 0
+        body = reduced(workingSource, reductions)
+        plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryReserve
+        for (const { index, media, part, text } of texts) {
+          if (plannedSize <= aim) break
+          // Artifact paths have a fixed length, so sizing can use the path
+          // before the text is saved; only a profitable clip is saved.
+          const path = paths.has(index) ? paths.get(index) : context.artifacts?.path(text)
+          const others = reductions.filter((reduction) => reduction.index !== index)
+          const clip = (keep: number): Reduction => {
+            let head = Math.ceil(keep / 2)
+            let tail = keep - head
+            // Do not split a UTF-16 surrogate pair at either cut.
+            if (head && /[\uD800-\uDBFF]/.test(text[head - 1]!)) head--
+            if (tail && /[\uDC00-\uDFFF]/.test(text[text.length - tail]!)) tail--
+            return { index, kind: "clip", head, tail, tokens: bytesEstimate(text.slice(head, text.length - tail)), ...(part === undefined ? {} : { part }), ...(path ? { path } : {}), ...(media && part !== undefined ? { media: true as const } : {}) }
+          }
+          const size = (reduction: Reduction) => {
+            body = reduced(workingSource, [...others, reduction].sort((a, b) => a.index - b.index))
+            return estimate(rewritten(body, segments)) + touched.size * summaryReserve
+          }
+          let low = 0
+          let high = text.length - 1
+          if (high < 0 || size(clip(0)) >= plannedSize) {
+            body = reduced(workingSource, reductions)
+            continue
+          }
+          while (low < high) {
+            const keep = Math.ceil((low + high) / 2)
+            if (size(clip(keep)) <= aim) low = keep
+            else high = keep - 1
+          }
+          let reduction = clip(low)
+          if (path && !paths.has(index)) {
+            active()
+            try { await context.artifacts!.save(path, text) } catch {
+              clipStorageFailed = true
+              paths.set(index, undefined)
+              const { path: _, ...unsaved } = reduction as Extract<Reduction, { kind: "clip" }>
+              reduction = unsaved
+            }
+            if (!paths.has(index)) paths.set(index, path)
+          }
+          reductions = [...others, reduction].sort((a, b) => a.index - b.index)
+          clipped++
+          body = reduced(workingSource, reductions)
+          plannedSize = estimate(rewritten(body, segments)) + touched.size * summaryReserve
+        }
+        if (plannedSize <= aim) break
+      }
+    }
+    const mandatorySize = estimate(rewritten(body, segments))
+    if (plannedSize > limit) {
+      throw new Error(`Compaction cannot fit input budget ${budget}: fixed system/tools/format and message structure require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}, even after removing tool results and attachments, summarizing remaining history and clipping remaining texts. Reduce the fixed input or supply larger actual model limits`)
     }
 
     let calls = 0
@@ -937,7 +1034,7 @@ export class RollingCompaction {
     const after = estimate(result)
     if (after > limit) throw new Error(`Compaction still estimates ${after} input tokens after folding, above ${rescue ? "input" : "recovery"} budget ${limit}; no summary state was committed`)
     const shook = commit(segments)
-    return { body: result, report: { ...report(after, true, !!state, calls, archived.size), shook, ...(rescue ? { rescue: true } : {}) } }
+    return { body: result, report: { ...report(after, true, !!state, calls, archived.size), shook, ...(clipped > 0 ? { clipped } : {}), ...(clipStorageFailed ? { clipStorageFailed: true } : {}), ...(rescue ? { rescue: true } : {}) } }
   }
 
   snapshot(session: string): CompactionSnapshot {

@@ -118,6 +118,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0 || report?.speculative === true) show("Session compacted", "success")
         else if (typeof report?.shook === "number" && report.shook > 0) show(`Removed ${report.shook} large tool result${report.shook === 1 ? "" : "s"} from context; full output saved`, "success")
         if (report?.rescue === true) show("Context was still too large: recent tool results and attachments were removed to fit", "warning")
+        if (typeof report?.clipped === "number" && report.clipped > 0) show(`Context was still too large: the middle of ${report.clipped} recent message${report.clipped === 1 ? "" : "s"} was cut; ${report.clipStorageFailed === true ? "the full text could not be saved" : "full text saved"}`, "warning")
         if (report?.shakeStorageFailed === true) show("Could not save some tool outputs to disk; those results were kept in context", "warning")
         if (report?.manualNoop === true) show("Nothing to compact", "info")
         if (report?.mandatoryOverTarget === true) show("Context is near the limit and cannot be compacted further; reduce attachments, tools or large tool output", "warning")

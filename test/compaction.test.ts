@@ -818,9 +818,14 @@ describe("rolling semantic compaction", () => {
     }
     expect(bytes(outgoing)).toBeLessThanOrEqual(4500)
     expect(original).toEqual(copy)
-    // Without raw storage nothing can be shaken and the mandatory batch fails.
-    await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { currentUser: current }))).rejects.toThrow("Compaction cannot fit input budget")
+    // Without raw storage nothing can be shaken; the newest batch is clipped instead.
+    const clipped = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }, { currentUser: current }))
+    const kept = forwarded(clipped)
     expect(calls).toBe(0)
+    expect("report" in clipped && (clipped.report?.clippedMessages as number) > 0).toBe(true)
+    expect(kept.messages).toContain(current)
+    expect(kept.messages).toContain(trailing)
+    expect(bytes(kept)).toBeLessThanOrEqual(4500)
   })
 
   test("generated environment does not displace the current user or newest tool group", async () => {
@@ -955,15 +960,79 @@ describe("rolling semantic compaction", () => {
     expect(bytes(forwarded(result))).toBeLessThan(3000)
   })
 
-  test("giant mandatory latest input fails before inference instead of truncating", async () => {
+  test("giant mandatory latest input is middle-clipped with a saved full copy", async () => {
     const compaction = new RollingCompaction({ bytesPerToken: 1 })
     const original = history(2)
-    original.messages.at(-1)!.content = "must-keep".repeat(1500)
+    const text = "head-marker" + "must-keep".repeat(1500) + "tail-marker"
+    original.messages.at(-1)!.content = text
     const copy = structuredClone(original)
-    let calls = 0
-    await expect(compaction.prepare(original, context(async () => { calls++; return success() }))).rejects.toThrow("Compaction cannot fit input budget 4500")
-    expect(calls).toBe(0)
+    const store = artifacts()
+    const result = await compaction.prepare(original, context(async () => success(), { artifacts: store }))
+    const outgoing = forwarded(result)
+    const content = outgoing.messages.at(-1)!.content as string
+    expect(content.startsWith("head-marker")).toBe(true)
+    expect(content.endsWith("tail-marker")).toBe(true)
+    expect(content).toContain(JSON.stringify(store.path(text)))
+    expect(store.saved.get(store.path(text))).toBe(text)
+    expect("report" in result && result.report?.clippedMessages).toBe(1)
+    expect(bytes(outgoing)).toBeLessThanOrEqual(4500)
     expect(original).toEqual(copy)
+    // The checkpoint replays the same clip on the next request.
+    expect(compaction.reconstruct(original, context(async () => success()))).toEqual(outgoing)
+  })
+
+  test("a committed clip is tightened when the next step adds input", async () => {
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const original = history(0)
+    const current = original.messages[1]!
+    current.content = "head-marker" + "x".repeat(12000) + "tail-marker"
+    const store = artifacts()
+    const first = forwarded(await compaction.prepare(original, context(async () => success(), { currentUser: current, artifacts: store })))
+    expect(bytes(first)).toBeLessThanOrEqual(4500)
+    const next = structuredClone(original)
+    const calls = Array.from({ length: 20 }, (_, index) => ({ id: `call-${index}`, type: "function", function: { name: "read", arguments: "{}" } }))
+    next.messages.push({ role: "assistant", content: null, tool_calls: calls }, ...calls.map((call) => ({ role: "tool", tool_call_id: call.id, content: "ok" })))
+    expect(bytes(next) - bytes(original) + bytes(first)).toBeGreaterThan(4500)
+    const result = await compaction.prepare(next, context(async () => success(), { currentUser: next.messages[1]!, artifacts: store }))
+    const outgoing = forwarded(result)
+    expect("report" in result && result.report?.clipped).toBeGreaterThan(0)
+    expect(bytes(outgoing)).toBeLessThanOrEqual(4500)
+    expect((outgoing.messages[1]!.content as string).startsWith("head-marker")).toBe(true)
+    expect([...store.saved.values()]).toEqual([current.content as string])
+  })
+
+  test("text left after media replacement is clipped in the same reduction", async () => {
+    const original = history(0)
+    const current = original.messages[1]!
+    const media: WireMessage = { role: "user", content: [{ type: "text", text: "t".repeat(6000) }, { type: "image_url", image_url: { url: `data:image/png;base64,${"i".repeat(2000)}` } }] }
+    original.messages.push({ role: "assistant", content: "seen" }, media)
+    const compaction = new RollingCompaction({ bytesPerToken: 1 })
+    const result = await compaction.prepare(original, context(async () => success(), { currentUser: current, artifacts: artifacts() }))
+    const outgoing = forwarded(result)
+    const parts = outgoing.messages.at(-1)!.content as { type: string; text: string }[]
+    expect(parts[1]).toEqual({ type: "text", text: "[image_url omitted to fit the context]" })
+    expect(parts[0]!.text).toContain("tokens clipped to fit the context")
+    expect(bytes(outgoing)).toBeLessThanOrEqual(4500)
+    expect(compaction.reconstruct(original, context(async () => success(), { currentUser: current }))).toEqual(outgoing)
+  })
+
+  test("a failed clip save is reported apart from shake storage", async () => {
+    const original = history(0)
+    original.messages[1]!.content = "x".repeat(12000)
+    const failing = { path: artifacts().path, save: async () => { throw Object.assign(new Error("full"), { code: "ENOSPC" }) } }
+    const result = await new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => success(), { artifacts: failing }))
+    const outgoing = forwarded(result)
+    expect("report" in result && result.report?.clipStorageFailed).toBe(true)
+    expect("report" in result && result.report?.shakeStorageFailed).toBeUndefined()
+    expect(outgoing.messages[1]!.content).not.toContain("full text:")
+  })
+
+  test("fixed system text alone above the budget still fails before inference", async () => {
+    const original = history(0)
+    original.messages[0]!.content = "s".repeat(6000)
+    let calls = 0
+    await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }))).rejects.toThrow("Compaction cannot fit input budget 4500")
+    expect(calls).toBe(0)
   })
 
   test("summary generation preserves tenant/template settings and removes main output constraints", async () => {
