@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { stripVTControlCharacters } from "node:util"
 import { digest, record } from "./shared"
 
-export type ToolOutputOptions = false | { maxBytes?: number; maxLines?: number }
+type ToolOutputOptions = false | { maxBytes?: number; maxLines?: number }
 type Options = Required<Exclude<ToolOutputOptions, false>>
 const tools: Record<string, true> = { bash: true, grep: true, glob: true, webfetch: true }
 
@@ -72,7 +72,7 @@ export class ToolArtifacts {
     this.directory = join(resolve(dataDirectory), "opencode", "tool-output")
   }
 
-  async directories(create: boolean) {
+  private async directories(create: boolean) {
     for (const directory of [dirname(this.directory), this.directory]) {
       if (create) await mkdir(directory, { recursive: true, mode: 0o700 })
       const info = await lstat(directory)

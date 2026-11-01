@@ -1,9 +1,9 @@
 export type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type GateRelease = () => void | Promise<void>
-export type AdmissionGate = { readonly capacity: number; acquire(signal?: AbortSignal): Promise<GateRelease> }
+export type AdmissionGate = { acquire(signal?: AbortSignal): Promise<GateRelease> }
 
-type Waiter = { grant: (release: () => void) => void; reject: (reason: unknown) => void; signal?: AbortSignal; abort: () => void }
+type Waiter = { grant: (release: () => void) => void; signal?: AbortSignal; abort: () => void }
 
 export class Gate implements AdmissionGate {
   private active = 0
@@ -14,7 +14,7 @@ export class Gate implements AdmissionGate {
   acquire(signal?: AbortSignal): Promise<() => void> {
     const { promise, resolve: grant, reject } = Promise.withResolvers<() => void>()
     const waiter: Waiter = {
-      grant, reject, signal,
+      grant, signal,
       abort: () => {
         this.waiting = this.waiting.filter((item) => item !== waiter)
         reject(signal!.reason)

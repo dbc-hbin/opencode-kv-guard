@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { ContextOverflowError, RollingCompaction, isCompactionSnapshot, shakeToFit, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
+import { ContextOverflowError, RollingCompaction, isCompactionSnapshot, overflowPromptTokens, providerError, shakeToFit, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
 import { Environments, type WireMessage } from "../src/prefix"
 import { UsageTracker } from "../src/usage"
 
@@ -78,8 +78,7 @@ function repeatedReads(): ChatBody {
 }
 
 describe("staged pressure reductions", () => {
-  test("duplicate reads of native absolute paths are superseded", async () => {
-    if (process.platform !== "win32") return
+  test.if(process.platform === "win32")("duplicate reads of native absolute paths are superseded", async () => {
     const path = "C:\\project\\file.ts"
     const content = readOutput().replace("<path>/project/file.ts</path>", `<path>${path}</path>`)
     const original = history(0)
@@ -418,7 +417,9 @@ describe("prefix-sharing summary handoff", () => {
       expect(request.tools).toBeUndefined()
       expect(bytes(request)).toBeLessThanOrEqual(4500)
     }
-    expect(archived(requests).length).toBeGreaterThan(0)
+    const entries = archived(requests)
+    expect(entries.map((entry) => entry.message)).toEqual(original.messages.slice(1, 1 + entries.length))
+    expect(entries.at(-1)!.source_index).toBe(entries.length)
     expect("report" in result && result.report?.prefixHandoff).toBe(false)
   })
 
@@ -1027,14 +1028,6 @@ describe("rolling semantic compaction", () => {
     expect(outgoing.messages[1]!.content).not.toContain("full text:")
   })
 
-  test("fixed system text alone above the budget still fails before inference", async () => {
-    const original = history(0)
-    original.messages[0]!.content = "s".repeat(6000)
-    let calls = 0
-    await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }))).rejects.toThrow("Compaction cannot fit input budget 4500")
-    expect(calls).toBe(0)
-  })
-
   test("summary generation preserves tenant/template settings and removes main output constraints", async () => {
     const original = {
       ...history(),
@@ -1077,12 +1070,16 @@ describe("rolling semantic compaction", () => {
   })
 
   test("fixed system and tool schemas that cannot fit fail without inference", async () => {
-    for (const field of ["system", "tools"]) {
-      const original = history()
-      if (field === "system") original.messages[0]!.content = "p".repeat(10000)
-      else original.tools = [{ type: "function", function: { name: "read", description: "d".repeat(10000), parameters: { type: "object" } } }]
+    const cases = [
+      { field: "system", original: history(), size: 10000, message: "fixed system/tools/format" },
+      { field: "tools", original: history(), size: 10000, message: "fixed system/tools/format" },
+      { field: "system", original: history(0), size: 6000, message: "Compaction cannot fit input budget 4500" },
+    ]
+    for (const { field, original, size, message } of cases) {
+      if (field === "system") original.messages[0]!.content = "p".repeat(size)
+      else original.tools = [{ type: "function", function: { name: "read", description: "d".repeat(size), parameters: { type: "object" } } }]
       let calls = 0
-      await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }))).rejects.toThrow("fixed system/tools/format")
+      await expect(new RollingCompaction({ bytesPerToken: 1 }).prepare(original, context(async () => { calls++; return success() }))).rejects.toThrow(message)
       expect(calls).toBe(0)
     }
   })
@@ -1175,13 +1172,17 @@ describe("rolling semantic compaction", () => {
     for (const message of original.messages.slice(7)) expect(forwarded(result).messages).toContain(message)
   })
 
-  test("shake checkpoints accept native absolute artifact paths and reject other files", () => {
-    const shake = (path: string) => ({ lanes: [{ key: "a".repeat(64), state: { segments: [], covered: 2, fingerprint: "b".repeat(64), signature: "c".repeat(64), reductions: [{ index: 1, kind: "shake", path, tokens: 10 }] } }] })
-    const name = `tool_kvguard_${"d".repeat(64)}`
-    expect(isCompactionSnapshot(shake(`/data/opencode/tool-output/${name}`))).toBe(true)
-    if (process.platform === "win32") expect(isCompactionSnapshot(shake(`C:\\Users\\u\\opencode\\tool-output\\${name}`))).toBe(true)
+  const shake = (path: string) => ({ lanes: [{ key: "a".repeat(64), state: { segments: [], covered: 2, fingerprint: "b".repeat(64), signature: "c".repeat(64), reductions: [{ index: 1, kind: "shake", path, tokens: 10 }] } }] })
+  const shakeName = `tool_kvguard_${"d".repeat(64)}`
+
+  test("shake checkpoints accept absolute artifact paths and reject other files", () => {
+    expect(isCompactionSnapshot(shake(`/data/opencode/tool-output/${shakeName}`))).toBe(true)
     expect(isCompactionSnapshot(shake("/etc/passwd"))).toBe(false)
-    expect(isCompactionSnapshot(shake(`relative/${name}`))).toBe(false)
+    expect(isCompactionSnapshot(shake(`relative/${shakeName}`))).toBe(false)
+  })
+
+  test.if(process.platform === "win32")("shake checkpoints accept native Windows artifact paths", () => {
+    expect(isCompactionSnapshot(shake(`C:\\Users\\u\\opencode\\tool-output\\${shakeName}`))).toBe(true)
   })
 
   test("restored checkpoints cannot archive a policy instruction", async () => {
@@ -1599,5 +1600,36 @@ describe("speculative compaction", () => {
     cancelled.delete("session")
     expect(aborted).toBe(true)
     expect(cancelled.snapshot("session").lanes).toEqual([])
+  })
+})
+
+describe("provider overflow errors", () => {
+  test.each([
+    ["This model's maximum context length is 8000 tokens. However, you requested 9000 tokens (8500 in the messages, 500 in the completion).", 8500],
+    ["prompt has 12,345 tokens, but the configured context size is 8,192 tokens", 12345],
+    ["input (9001 tokens) is longer than the model's context length (8192 tokens)", 9001],
+    ["1,024 tokens from the input messages exceed the limit", 1024],
+    ["prompt is too long", undefined],
+  ])("overflowPromptTokens(%j) is %p", (message, tokens) => {
+    expect(overflowPromptTokens(message)).toBe(tokens)
+  })
+
+  test.each([
+    { status: 400, body: JSON.stringify({ error: { message: "prompt is too long", code: "context_length_exceeded" } }), overflow: true, text: "prompt is too long context_length_exceeded" },
+    { status: 400, body: JSON.stringify({ message: "rate limit: too many tokens" }), overflow: false, text: "rate limit: too many tokens" },
+    { status: 400, body: "", overflow: true, text: "" },
+    { status: 413, body: "payload", overflow: true, text: "payload" },
+    { status: 422, body: JSON.stringify({ error: "prompt is too long" }), overflow: false, text: "prompt is too long" },
+  ])("status $status classifies overflow=$overflow", async ({ status, body, overflow, text }) => {
+    const error = await providerError(new Response(body, { status, headers: { "x-proof": "kept" } }))
+    expect(error).toMatchObject({ overflow, text })
+    const rebuilt = error!.response()
+    expect(rebuilt.status).toBe(status)
+    expect(rebuilt.headers.get("x-proof")).toBe("kept")
+    expect(await rebuilt.text()).toBe(body)
+  })
+
+  test.each([200, 401, 500, 503])("status %i is not a provider request error", async (status) => {
+    expect(await providerError(new Response("prompt is too long", { status }))).toBeUndefined()
   })
 })

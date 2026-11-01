@@ -423,7 +423,6 @@ describe("streaming usage observation", () => {
     const releasing = Promise.withResolvers<void>()
     const permission = Promise.withResolvers<void>()
     const gate: AdmissionGate = {
-      capacity: 1,
       async acquire() {
         return async () => {
           releasing.resolve()

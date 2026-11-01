@@ -3,7 +3,7 @@ import type { ChatBody } from "./compaction"
 import type { WireMessage } from "./prefix"
 import { digest as hash, record } from "./shared"
 
-export type UsageRequest = { readonly startedAt: number }
+type UsageRequest = { readonly startedAt: number }
 export type UsageReport = {
   laneFingerprint: string
   label?: string

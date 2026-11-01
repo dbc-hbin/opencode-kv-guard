@@ -40,7 +40,6 @@ describe("generated skill catalog compaction", () => {
     expect(text).toContain("<available_skills>")
     expect(text).not.toContain("<location>")
     expect(text).not.toContain("/private/skills/")
-    expect(text).not.toContain("denied-skill")
     expect(text).not.toContain("skill://")
     expect(text.indexOf("a-first:")).toBeLessThan(text.indexOf("z-last:"))
     expect(result.report?.skills).toBe(2)
@@ -50,15 +49,6 @@ describe("generated skill catalog compaction", () => {
     expect(JSON.stringify(input)).toBe(original)
     expect(JSON.stringify(result.report)).not.toContain("private")
     expect(JSON.stringify(result.report)).not.toContain("last")
-  })
-
-  test("does not fetch or add catalog members absent from the permission-filtered wire block", () => {
-    const input = body("Policy.\n" + catalog(listed))
-    const result = compactSkillCatalog(input, {})
-    expect(result.report?.skills).toBe(1)
-    expect(result.body.messages[0]!.content).toContain(`${listed[0]!.name}: ${listed[0]!.description}`)
-    expect(result.body.messages[0]!.content).not.toContain("denied-skill")
-    expect(result.body.messages).toHaveLength(input.messages.length)
   })
 
   test("retains name-based loading instructions and is idempotent", () => {

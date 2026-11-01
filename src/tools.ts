@@ -1,4 +1,4 @@
-import { digest as hash } from "./shared"
+import { digest as hash, record } from "./shared"
 
 // Exact builtin tool descriptions from OpenCode 1.19.4, commit
 // 148842ef7cb1bc34192b3fff57d0f9721ab9c801, packages/opencode/src/tool/.
@@ -129,14 +129,13 @@ function compact(name: string, description: string): string | undefined {
   }
 }
 
-export type ToolDescriptionReport = { tools: number; originalChars: number; replacementChars: number }
+type ToolDescriptionReport = { tools: number; originalChars: number; replacementChars: number }
 
 export function compactToolDescriptions(tools: unknown[]): { tools: unknown[]; report?: ToolDescriptionReport } {
   let report: ToolDescriptionReport | undefined
   const result = tools.map((tool) => {
-    if (typeof tool !== "object" || tool === null || !("type" in tool) || tool.type !== "function" || !("function" in tool)) return tool
+    if (!record(tool) || tool.type !== "function" || !record(tool.function)) return tool
     const fn = tool.function
-    if (typeof fn !== "object" || fn === null || !("name" in fn) || !("description" in fn)) return tool
     const { name, description } = fn
     if (typeof name !== "string" || typeof description !== "string") return tool
     const replacement = compact(name, description)

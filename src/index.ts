@@ -14,7 +14,7 @@ import { compactSkillCatalog } from "./skills"
 import { compactToolDescriptions } from "./tools"
 import { ToolArtifacts, ToolOutputShrinker } from "./output"
 import { SessionHeads, PrefixGuard } from "./heads"
-import { digest as hash, record } from "./shared"
+import { digest as hash, isSha256, record } from "./shared"
 
 const agentHeader = "x-opencode-kv-guard-agent"
 const limitsHeader = "x-opencode-kv-guard-limits"
@@ -274,7 +274,6 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         const local = endpointGate(baseURL, maxConcurrent)
         const shared = options.crossProcess === false ? undefined : processEndpointGate(baseURL, maxConcurrent, join(stateDirectory, "admission"))
         const gate: AdmissionGate = shared ? {
-          capacity: maxConcurrent,
           async acquire(signal) {
             const releaseLocal = await local.acquire(signal)
             try {
@@ -367,7 +366,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             delete body[camel]
           }
           if (options.promptCacheKey === true && session) body.prompt_cache_key ??= session
-          if (options.usageAccounting !== false && target.provider.options?.includeUsage !== false && body.stream === true && (body.stream_options === undefined || body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options))) {
+          if (options.usageAccounting !== false && target.provider.options?.includeUsage !== false && body.stream === true && (body.stream_options === undefined || record(body.stream_options))) {
             body.stream_options = { include_usage: true, ...body.stream_options as Record<string, unknown> | undefined }
           }
           if (maxOutputTokens !== undefined) {
@@ -385,7 +384,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           if (options.canonicalToolSchemas !== false && body.tools) body.tools = canonical(body.tools)
           if (options.compactSkills !== false && encodedSystemSuffix) {
             const suffix: unknown = JSON.parse(encodedSystemSuffix)
-            if (!suffix || typeof suffix !== "object" || !("length" in suffix) || typeof suffix.length !== "number" || !Number.isSafeInteger(suffix.length) || suffix.length < 0 || !("hash" in suffix) || typeof suffix.hash !== "string" || !/^[a-f0-9]{64}$/.test(suffix.hash)) throw new Error("KV guard: invalid user system suffix metadata")
+            if (!record(suffix) || typeof suffix.length !== "number" || !Number.isSafeInteger(suffix.length) || suffix.length < 0 || !isSha256(suffix.hash)) throw new Error("KV guard: invalid user system suffix metadata")
             const compacted = compactSkillCatalog(body, { userSystem: suffix.length ? { length: suffix.length, hash: suffix.hash } : undefined })
             body = compacted.body
             if (compacted.report) await log("Skill catalog compression", { ...compacted.report })
@@ -416,7 +415,6 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             const ticket = usage.begin(outgoing, requestLane)
             let admissionWaitMs = 0
             const gate: AdmissionGate = {
-              capacity: target.gate.capacity,
               async acquire(waitSignal) {
                 const started = performance.now()
                 const release = await target.gate.acquire(waitSignal)
@@ -492,10 +490,12 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               stream: false,
               ...(prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }),
             }
-            const bytesPerToken = compaction.options ? compaction.options.bytesPerToken : 4
+            const config = compaction.options
+            if (!config) return undefined
+            const { bytesPerToken } = config
             const fallback = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / bytesPerToken)
             const measure = (candidate: ChatBody) => options.usageAccounting === false ? fallback(candidate) : usage.estimate(candidate, exchange.lane, fallback)
-            const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - (compaction.options ? compaction.options.marginTokens : 0)
+            const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - config.marginTokens
             // Like the dead-end rescue, shake tool results and media from the
             // end until the handoff fits, keeping the longest cached prefix.
             const fitted = shakeToFit(handoff, (candidate) => measure(candidate) <= budget, { path: (text) => toolArtifacts.contentPath(text), save: (path, text) => toolArtifacts.saveContent(path, text) }, bytesPerToken)
@@ -586,7 +586,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
                 throw new Error("KV guard: current user provenance was removed by another transform; cannot compact safely")
               }
               const limits: unknown = JSON.parse(encodedLimits)
-              if (!limits || typeof limits !== "object" || !("context" in limits) || typeof limits.context !== "number") {
+              if (!record(limits) || typeof limits.context !== "number") {
                 throw new Error("KV guard: invalid model context metadata")
               }
               const output = body.max_completion_tokens ?? body.max_tokens
@@ -646,7 +646,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             if (!session || !agent || options.diagnostics !== true) return
             const report = audit.observe(body, session, lane)
             // Only hashes/count comparisons; no prompts, credentials, paths, or tool arguments.
-            await client.app.log({ body: { service: "kv-guard", level: "info", message: "Request prefix comparison (not a token-cache hit measurement)", extra: report } })
+            await log("Request prefix comparison (not a token-cache hit measurement)", report)
           }
           const canRecover = !!session && !!agent && !!encodedLimits && options.compaction !== false && !internalAgents.includes(agent)
           // Overflow recovery prepares the same history once more with the

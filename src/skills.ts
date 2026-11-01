@@ -1,13 +1,13 @@
 import type { ChatBody } from "./compaction"
-import { digest, record } from "./shared"
+import { digest, instruction, record } from "./shared"
 
-export type SkillCatalogProvenance = {
+type SkillCatalogProvenance = {
   // The caller attests that user.system is absent when this is undefined.
   // Otherwise this is its exact JS string length and UTF-8 SHA-256, carried
   // from OpenCode's user message before it is merged into the system prompt.
   userSystem?: { length: number; hash: string }
 }
-export type SkillCatalogReport = { skills: number; originalChars: number; replacementChars: number }
+type SkillCatalogReport = { skills: number; originalChars: number; replacementChars: number }
 
 // OpenCode 1.19.4, packages/opencode/src/session/system.ts:112-125 and
 // skill/index.ts:320-337. prompt.ts:1263-1268 puts this generated block last;
@@ -21,7 +21,7 @@ export function compactSkillCatalog(body: ChatBody, provenance: SkillCatalogProv
   if (!Array.isArray(body.tools) || !body.tools.some((tool) => record(tool) && tool.type === "function" && record(tool.function) && tool.function.name === "skill")) return { body }
   const primary = body.messages[0]
   if (!primary || primary.role !== "system" || typeof primary.content !== "string") return { body }
-  if (body.messages.slice(1).some((message) => message.role === "system" || message.role === "developer")) return { body }
+  if (body.messages.slice(1).some(instruction)) return { body }
 
   let generated = primary.content
   const suffix = provenance.userSystem

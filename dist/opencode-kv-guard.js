@@ -15,7 +15,6 @@ class Gate {
     const { promise, resolve: grant, reject } = Promise.withResolvers();
     const waiter = {
       grant,
-      reject,
       signal,
       abort: () => {
         this.waiting = this.waiting.filter((item) => item !== waiter);
@@ -165,6 +164,7 @@ var digest = (value) => createHash("sha256").update(value).digest("hex");
 var record = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var isSha256 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 var instruction = (message) => message.role === "system" || message.role === "developer";
+var busy = (error) => error instanceof Error && ("code" in error) && typeof error.code === "string" && /^SQLITE_(BUSY|LOCKED)/.test(error.code);
 var uuidV4 = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
 // src/process-gate.ts
@@ -203,11 +203,6 @@ function dead(lease) {
   const current = identity(lease.pid);
   return current !== undefined && (current.dead || current.identity !== lease.identity);
 }
-function busy(error) {
-  if (!(error instanceof Error) || !("code" in error) || typeof error.code !== "string")
-    return false;
-  return error.code.startsWith("SQLITE_BUSY") || error.code.startsWith("SQLITE_LOCKED");
-}
 function change(directory, signal) {
   let watcher;
   const { promise, resolve } = Promise.withResolvers();
@@ -223,8 +218,6 @@ function change(directory, signal) {
     watcher.on("error", wake);
   } catch {}
   signal?.addEventListener("abort", wake, { once: true });
-  if (signal?.aborted)
-    wake();
   return { promise, close };
 }
 
@@ -269,7 +262,6 @@ class ProcessGate {
   async acquire(signal) {
     signal?.throwIfAborted();
     mkdirSync(this.directory, { recursive: true, mode: 448 });
-    signal?.throwIfAborted();
     const processOwner = identity(process.pid);
     if (!processOwner)
       throw new Error("KV guard: process admission requires a readable Linux or macOS process identity");
@@ -303,12 +295,7 @@ class ProcessGate {
         }
         if (acquired) {
           let released;
-          const release = () => released ??= this.release(id, owner);
-          if (signal?.aborted) {
-            await release();
-            signal.throwIfAborted();
-          }
-          return release;
+          return () => released ??= this.release(id, owner);
         }
         await changed.promise;
       } finally {
@@ -397,7 +384,7 @@ class UserTurns {
       } else if (Array.isArray(message.content)) {
         let removedPart = false;
         message.content = message.content.filter((part) => {
-          if (!part || typeof part !== "object" || !("text" in part) || typeof part.text !== "string")
+          if (!record(part) || typeof part.text !== "string")
             return true;
           if (message.role === "user" && expected && part.text.startsWith(expected))
             current = message;
@@ -542,7 +529,7 @@ class Environments {
     const match = environment.exec(system.content);
     if (!match || !messages.some((message) => message.role === "user"))
       return;
-    if (messages.slice(1).some((message) => message.role === "system" || message.role === "developer"))
+    if (messages.slice(1).some(instruction))
       return;
     const key = digest(JSON.stringify([session, lane]));
     const prior = this.lanes.get(key);
@@ -712,11 +699,11 @@ function isCompactionSnapshot(value) {
     return false;
   const keys = new Set;
   return value.lanes.every((lane) => {
-    if (!record(lane) || Object.keys(lane).some((key) => key !== "key" && key !== "state") || typeof lane.key !== "string" || !/^[a-f0-9]{64}$/.test(lane.key) || keys.has(lane.key) || !record(lane.state))
+    if (!record(lane) || Object.keys(lane).some((key) => key !== "key" && key !== "state") || !isSha256(lane.key) || keys.has(lane.key) || !record(lane.state))
       return false;
     keys.add(lane.key);
     const state = lane.state;
-    if (Object.keys(state).some((key) => !["segments", "covered", "fingerprint", "signature", "reductions"].includes(key)) || !Array.isArray(state.segments) || !Number.isSafeInteger(state.covered) || state.covered < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature))
+    if (Object.keys(state).some((key) => !["segments", "covered", "fingerprint", "signature", "reductions"].includes(key)) || !Array.isArray(state.segments) || !Number.isSafeInteger(state.covered) || state.covered < 1 || !isSha256(state.fingerprint) || !isSha256(state.signature))
       return false;
     let lastArchived = -1;
     if (!state.segments.every((segment) => {
@@ -852,6 +839,12 @@ function groups(messages) {
     index = end;
   }
   return result;
+}
+function anchorGroups(messages, units, lastUser) {
+  return {
+    lastGroup: units.findLast((group) => !isGeneratedEnvironment(messages[group.start])),
+    newestToolGroup: units.findLast((group) => group.start > lastUser && Array.isArray(messages[group.start].tool_calls) && messages[group.start].tool_calls.length > 0)
+  };
 }
 function completeRead(content) {
   if (typeof content !== "string")
@@ -1145,8 +1138,11 @@ class RollingCompaction {
   constructor(input) {
     this.options = options(input);
   }
+  key(body, context) {
+    return digest(JSON.stringify([context.session, context.lane, body.model]));
+  }
   retained(body, context) {
-    const state = this.lanes.get(digest(JSON.stringify([context.session, context.lane, body.model])))?.state;
+    const state = this.lanes.get(this.key(body, context))?.state;
     const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message));
     let leading = 0;
     while (instruction(body.messages[leading] ?? { role: "" }))
@@ -1170,8 +1166,7 @@ class RollingCompaction {
       return { signature };
     const units = groups(body.messages);
     const policyIntervals = intervals(body.messages);
-    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]));
-    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start].tool_calls) && body.messages[group.start].tool_calls.length > 0);
+    const { lastGroup, newestToolGroup } = anchorGroups(body.messages, units, lastUser);
     const seenIntervals = new Set;
     for (const segment of state.segments) {
       const interval = policyIntervals[segment.archived[0]];
@@ -1223,7 +1218,7 @@ class RollingCompaction {
     if (this.options === false)
       return Promise.resolve({ body });
     context.signal?.throwIfAborted();
-    const key = digest(JSON.stringify([context.session, context.lane, body.model]));
+    const key = this.key(body, context);
     let lane = this.lanes.get(key);
     if (!lane) {
       lane = { session: context.session, tail: Promise.resolve() };
@@ -1245,7 +1240,7 @@ class RollingCompaction {
   speculate(body, context) {
     if (this.options === false)
       return;
-    const key = digest(JSON.stringify([context.session, context.lane, body.model]));
+    const key = this.key(body, context);
     const lane = this.lanes.get(key);
     if (!lane || lane.speculation)
       return;
@@ -1404,8 +1399,7 @@ class RollingCompaction {
     }
     const users = body.messages.flatMap((message, index) => index <= lastUser && message.role === "user" && !isGeneratedEnvironment(message) ? [index] : []);
     const recent = users[Math.max(0, users.length - config.keepRecentTurns)];
-    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]));
-    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start].tool_calls) && body.messages[group.start].tool_calls.length > 0);
+    const { lastGroup, newestToolGroup } = anchorGroups(body.messages, units, lastUser);
     const shake = async (selected) => {
       if (!context.artifacts)
         return;
@@ -1533,7 +1527,6 @@ class RollingCompaction {
       }
       if (!context.manual && !context.overflow && currentSize <= budget) {
         reductions = [...state?.reductions ?? []];
-        segments.splice(0, segments.length, ...committed);
         return { body: current, report: { ...report(currentSize, false, !!state, 0, archivedIndices(committed).size), mandatoryOverTarget: true } };
       }
       rescue = true;
@@ -1633,8 +1626,8 @@ class RollingCompaction {
           break;
       }
     }
-    const mandatorySize = estimate(rewritten(body, segments));
     if (plannedSize > limit) {
+      const mandatorySize = estimate(rewritten(body, segments));
       throw new Error(`Compaction cannot fit input budget ${budget}: fixed system/tools/format and message structure require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}, even after removing tool results and attachments, summarizing remaining history and clipping remaining texts. Reduce the fixed input or supply larger actual model limits`);
     }
     let calls = 0;
@@ -1775,8 +1768,8 @@ import { chmod, lstat, mkdir, open } from "fs/promises";
 import { join as join2, resolve as resolve2 } from "path";
 
 // src/heads.ts
-import { createHash as createHash2, randomUUID as randomUUID3 } from "crypto";
-var hash = (value) => createHash2("sha256").update(JSON.stringify(canonical(value))).digest("hex");
+import { randomUUID as randomUUID3 } from "crypto";
+var hash = (value) => digest(JSON.stringify(canonical(value)));
 var exactKeys = (value, keys) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 var equal = (a, b) => hash(a) === hash(b);
 var key = (session, lane, model) => hash([session, lane, model ?? null]);
@@ -2226,10 +2219,9 @@ class PrefixGuard {
 // src/checkpoints.ts
 var version = 2;
 function isCheckpointSnapshot(value, session) {
-  if (!value || typeof value !== "object" || Array.isArray(value))
+  if (!record(value))
     return false;
-  const bundle = value;
-  return Object.keys(bundle).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key)) && isModeRemindersSnapshot(bundle.modes, session) && isEnvironmentsSnapshot(bundle.environments) && isCompactionSnapshot(bundle.compaction) && (bundle.heads === undefined || isSessionHeadsSnapshot(bundle.heads, session)) && (bundle.prefixGuard === undefined || isPrefixGuardSnapshot(bundle.prefixGuard, session));
+  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key)) && isModeRemindersSnapshot(value.modes, session) && isEnvironmentsSnapshot(value.environments) && isCompactionSnapshot(value.compaction) && (value.heads === undefined || isSessionHeadsSnapshot(value.heads, session)) && (value.prefixGuard === undefined || isPrefixGuardSnapshot(value.prefixGuard, session));
 }
 
 class CheckpointConflictError extends Error {
@@ -2350,7 +2342,7 @@ class CheckpointStore {
           db.close();
         }
       } catch (error) {
-        if (!(error instanceof Error) || !("code" in error) || typeof error.code !== "string" || !/^SQLITE_(BUSY|LOCKED)/.test(error.code))
+        if (!busy(error))
           throw error;
         if (!notified) {
           notified = true;
@@ -3029,7 +3021,7 @@ function compactSkillCatalog(body, provenance) {
   const primary = body.messages[0];
   if (!primary || primary.role !== "system" || typeof primary.content !== "string")
     return { body };
-  if (body.messages.slice(1).some((message) => message.role === "system" || message.role === "developer"))
+  if (body.messages.slice(1).some(instruction))
     return { body };
   let generated = primary.content;
   const suffix = provenance.userSystem;
@@ -3223,11 +3215,9 @@ ${taskBackgroundCompact}` : "") + rest;
 function compactToolDescriptions(tools) {
   let report;
   const result = tools.map((tool) => {
-    if (typeof tool !== "object" || tool === null || !("type" in tool) || tool.type !== "function" || !("function" in tool))
+    if (!record(tool) || tool.type !== "function" || !record(tool.function))
       return tool;
     const fn = tool.function;
-    if (typeof fn !== "object" || fn === null || !("name" in fn) || !("description" in fn))
-      return tool;
     const { name, description } = fn;
     if (typeof name !== "string" || typeof description !== "string")
       return tool;
@@ -3711,7 +3701,6 @@ The previous response stopped at the output token limit before finishing. Contin
         const local = endpointGate(baseURL, maxConcurrent);
         const shared = options.crossProcess === false ? undefined : processEndpointGate(baseURL, maxConcurrent, join4(stateDirectory, "admission"));
         const gate = shared ? {
-          capacity: maxConcurrent,
           async acquire(signal) {
             const releaseLocal = await local.acquire(signal);
             try {
@@ -3813,7 +3802,7 @@ The previous response stopped at the output token limit before finishing. Contin
           }
           if (options.promptCacheKey === true && session)
             body.prompt_cache_key ??= session;
-          if (options.usageAccounting !== false && target.provider.options?.includeUsage !== false && body.stream === true && (body.stream_options === undefined || body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options))) {
+          if (options.usageAccounting !== false && target.provider.options?.includeUsage !== false && body.stream === true && (body.stream_options === undefined || record(body.stream_options))) {
             body.stream_options = { include_usage: true, ...body.stream_options };
           }
           if (maxOutputTokens !== undefined) {
@@ -3833,7 +3822,7 @@ The previous response stopped at the output token limit before finishing. Contin
             body.tools = canonical(body.tools);
           if (options.compactSkills !== false && encodedSystemSuffix) {
             const suffix = JSON.parse(encodedSystemSuffix);
-            if (!suffix || typeof suffix !== "object" || !("length" in suffix) || typeof suffix.length !== "number" || !Number.isSafeInteger(suffix.length) || suffix.length < 0 || !("hash" in suffix) || typeof suffix.hash !== "string" || !/^[a-f0-9]{64}$/.test(suffix.hash))
+            if (!record(suffix) || typeof suffix.length !== "number" || !Number.isSafeInteger(suffix.length) || suffix.length < 0 || !isSha256(suffix.hash))
               throw new Error("KV guard: invalid user system suffix metadata");
             const compacted = compactSkillCatalog(body, { userSystem: suffix.length ? { length: suffix.length, hash: suffix.hash } : undefined });
             body = compacted.body;
@@ -3866,7 +3855,6 @@ The previous response stopped at the output token limit before finishing. Contin
             const ticket = usage.begin(outgoing, requestLane);
             let admissionWaitMs = 0;
             const gate = {
-              capacity: target.gate.capacity,
               async acquire(waitSignal) {
                 const started = performance.now();
                 const release = await target.gate.acquire(waitSignal);
@@ -3949,10 +3937,13 @@ ${instructions}`
               stream: false,
               ...prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }
             };
-            const bytesPerToken = compaction.options ? compaction.options.bytesPerToken : 4;
+            const config = compaction.options;
+            if (!config)
+              return;
+            const { bytesPerToken } = config;
             const fallback = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / bytesPerToken);
             const measure = (candidate) => options.usageAccounting === false ? fallback(candidate) : usage.estimate(candidate, exchange.lane, fallback);
-            const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - (compaction.options ? compaction.options.marginTokens : 0);
+            const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - config.marginTokens;
             const fitted = shakeToFit(handoff, (candidate) => measure(candidate) <= budget, { path: (text) => toolArtifacts.contentPath(text), save: (path, text) => toolArtifacts.saveContent(path, text) }, bytesPerToken);
             if (!fitted) {
               await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: measure(handoff), budget });
@@ -4050,7 +4041,7 @@ ${instructions}`
                 throw new Error("KV guard: current user provenance was removed by another transform; cannot compact safely");
               }
               const limits = JSON.parse(encodedLimits);
-              if (!limits || typeof limits !== "object" || !("context" in limits) || typeof limits.context !== "number") {
+              if (!record(limits) || typeof limits.context !== "number") {
                 throw new Error("KV guard: invalid model context metadata");
               }
               const output = body.max_completion_tokens ?? body.max_tokens;
@@ -4117,7 +4108,7 @@ ${instructions}`
             if (!session || !agent || options.diagnostics !== true)
               return;
             const report = audit.observe(body, session, lane);
-            await client.app.log({ body: { service: "kv-guard", level: "info", message: "Request prefix comparison (not a token-cache hit measurement)", extra: report } });
+            await log("Request prefix comparison (not a token-cache hit measurement)", report);
           };
           const canRecover = !!session && !!agent && !!encodedLimits && options.compaction !== false && !internalAgents.includes(agent);
           const recover = async (error) => {

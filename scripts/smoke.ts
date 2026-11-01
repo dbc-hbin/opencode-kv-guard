@@ -5,6 +5,7 @@ import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import type { Server, Subprocess } from "bun"
 import { z } from "zod"
+import { fixtureEnv } from "./fixture"
 
 const requestSchema = z.object({
   model: z.string(),
@@ -20,7 +21,8 @@ const encoder = new TextEncoder()
 const children: Subprocess<"ignore", "pipe", "pipe">[] = []
 const servers: Server<undefined>[] = []
 
-async function scenario(guarded: boolean, disableTitle = false, codeMode = false, outputStorage = false, subagent = false) {
+type Scenario = { guarded: boolean; disableTitle?: boolean; codeMode?: boolean; outputStorage?: boolean; subagent?: boolean }
+async function scenario({ guarded, disableTitle = false, codeMode = false, outputStorage = false, subagent = false }: Scenario) {
   const home = join(root, subagent ? "subagent" : outputStorage ? "output-storage" : codeMode ? "code-mode" : disableTitle ? "no-title" : guarded ? "guarded" : "baseline")
   await mkdir(home, { recursive: true })
   const fixture = join(home, "fixture.txt")
@@ -115,13 +117,7 @@ async function scenario(guarded: boolean, disableTitle = false, codeMode = false
     provider: { fixture: { npm: "@ai-sdk/openai-compatible", name: "Local smoke fixture", options: { baseURL: `http://127.0.0.1:${server.port}/\${KV_GUARD_SMOKE_TENANT}/v1`, apiKey: "local-fixture-not-a-secret" }, models: { fixture: { name: "fixture", limit: { context: 32768, output: 1024 } } } } },
     ...(guarded ? { plugin: [[plugin, { providers: ["fixture"], maxOutputTokens: 128, diagnostics: true, glm: { models: ["fixture"] } }]] } : {}),
   }
-  const env = {
-    ...process.env,
-    HOME: home, PWD: home, KV_GUARD_SMOKE_TENANT: "tenant", OPENCODE_TEST_HOME: home, XDG_CONFIG_HOME: join(home, "config"), XDG_DATA_HOME: join(home, "data"), XDG_CACHE_HOME: join(home, "cache"), XDG_STATE_HOME: join(home, "state"),
-    OPENCODE_CONFIG_DIR: join(home, "config", "opencode"), OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-    OPENCODE_EXPERIMENTAL_CODE_MODE: String(codeMode),
-    OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_DISABLE_EXTERNAL_SKILLS: "true", OPENCODE_DISABLE_CLAUDE_CODE: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_LSP_DOWNLOAD: "true", OPENCODE_DISABLE_FFF: "true", OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "true", OPENCODE_PURE: "false",
-  }
+  const env = { ...fixtureEnv(home, config), KV_GUARD_SMOKE_TENANT: "tenant", OPENCODE_EXPERIMENTAL_CODE_MODE: String(codeMode) }
   const firstArrival = next()
   const child = Bun.spawn([binary, "run", "--dir", home, "--format", "json", "--model", "fixture/fixture", `Read ${fixture} then answer.`], { cwd: home, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
   children.push(child)
@@ -214,7 +210,7 @@ async function scenario(guarded: boolean, disableTitle = false, codeMode = false
 const deadline = Promise.withResolvers<never>()
 const timer = setTimeout(() => deadline.reject(new Error("Pinned CLI smoke exceeded 120 seconds")), 120_000)
 try {
-  const results = await Promise.race([(async () => ({ baseline: await scenario(false), guarded: await scenario(true), noTitle: await scenario(true, true), codeMode: await scenario(true, true, true), outputStorage: await scenario(true, true, false, true), subagent: await scenario(true, true, false, false, true) }))(), deadline.promise])
+  const results = await Promise.race([(async () => ({ baseline: await scenario({ guarded: false }), guarded: await scenario({ guarded: true }), noTitle: await scenario({ guarded: true, disableTitle: true }), codeMode: await scenario({ guarded: true, disableTitle: true, codeMode: true }), outputStorage: await scenario({ guarded: true, disableTitle: true, outputStorage: true }), subagent: await scenario({ guarded: true, disableTitle: true, subagent: true }) }))(), deadline.promise])
   assert.ok(results.guarded.systemChars < results.baseline.systemChars)
   assert.ok(results.guarded.toolDescriptionChars < results.baseline.toolDescriptionChars / 2)
   console.log(JSON.stringify({ version: "1.19.4", ...results }, null, 2))

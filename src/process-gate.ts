@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, watch, type FSWatcher } from "node:fs"
 import { hostname } from "node:os"
 import { join, resolve } from "node:path"
 import { endpointKey, type AdmissionGate, type GateRelease } from "./transport"
-import { digest } from "./shared"
+import { busy, digest } from "./shared"
 
 type Lease = { id: string; pid: number; identity: string }
 type Owner = { identity: string; dead: boolean }
@@ -47,11 +47,6 @@ function dead(lease: Lease) {
   return current !== undefined && (current.dead || current.identity !== lease.identity)
 }
 
-function busy(error: unknown) {
-  if (!(error instanceof Error) || !("code" in error) || typeof error.code !== "string") return false
-  return error.code.startsWith("SQLITE_BUSY") || error.code.startsWith("SQLITE_LOCKED")
-}
-
 // Subscribe before inspecting SQLite, so a release between inspection and waiting
 // cannot be lost. The bounded fallback also notices process death (no FS event).
 function change(directory: string, signal?: AbortSignal) {
@@ -71,7 +66,6 @@ function change(directory: string, signal?: AbortSignal) {
     // A local FS without watch support still has the bounded fallback.
   }
   signal?.addEventListener("abort", wake, { once: true })
-  if (signal?.aborted) wake()
   return { promise, close }
 }
 
@@ -79,7 +73,7 @@ class ProcessGate implements AdmissionGate {
   private readonly file: string
   private readonly host = hostname()
 
-  constructor(readonly capacity: number, private readonly directory: string, key: string) {
+  constructor(private readonly capacity: number, private readonly directory: string, key: string) {
     this.file = join(directory, `${digest(key)}.sqlite`)
   }
 
@@ -112,7 +106,6 @@ class ProcessGate implements AdmissionGate {
   async acquire(signal?: AbortSignal): Promise<GateRelease> {
     signal?.throwIfAborted()
     mkdirSync(this.directory, { recursive: true, mode: 0o700 })
-    signal?.throwIfAborted()
     const processOwner = identity(process.pid)
     if (!processOwner) throw new Error("KV guard: process admission requires a readable Linux or macOS process identity")
     const owner = processOwner.identity
@@ -141,12 +134,7 @@ class ProcessGate implements AdmissionGate {
         }
         if (acquired) {
           let released: Promise<void> | undefined
-          const release = () => released ??= this.release(id, owner)
-          if (signal?.aborted) {
-            await release()
-            signal.throwIfAborted()
-          }
-          return release
+          return () => released ??= this.release(id, owner)
         }
         await changed.promise
       } finally {

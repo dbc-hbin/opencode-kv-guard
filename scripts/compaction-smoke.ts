@@ -3,8 +3,8 @@ import { mkdtemp, realpath, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
-import { createOpencodeClient } from "@opencode-ai/sdk/client"
 import { z } from "zod"
+import { fixtureEnv, startServer } from "./fixture"
 
 const wire = z.object({
   model: z.string(), stream: z.boolean().optional(), max_tokens: z.number().optional(),
@@ -59,45 +59,20 @@ const config = {
   provider: { [providerID]: { npm: "@ai-sdk/openai-compatible", options: { baseURL: `http://127.0.0.1:${proxy.port}/v1`, apiKey: "local-fixture" }, models: { fixture: { name: "fixture", limit } } } },
   plugin: [[pathToFileURL(resolve("dist/opencode-kv-guard.js")).href, { providers: [providerID], diagnostics: true, compaction: { triggerRatio } }]],
 }
-const env = {
-  ...process.env, HOME: home, PWD: home, OPENCODE_TEST_HOME: home,
-  XDG_CONFIG_HOME: join(home, "config"), XDG_DATA_HOME: join(home, "data"), XDG_CACHE_HOME: join(home, "cache"), XDG_STATE_HOME: join(home, "state"),
-  OPENCODE_CONFIG_DIR: join(home, "config", "opencode"), OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-  OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_DISABLE_EXTERNAL_SKILLS: "true", OPENCODE_DISABLE_CLAUDE_CODE: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_LSP_DOWNLOAD: "true", OPENCODE_DISABLE_FFF: "true", OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "true", OPENCODE_PURE: "false",
-  OPENCODE_SERVER_PASSWORD: "", OPENCODE_SERVER_USERNAME: "",
-}
+const env = fixtureEnv(home, config)
 const deadline = Promise.withResolvers<never>()
 const timer = setTimeout(() => deadline.reject(new Error("Rolling compaction smoke exceeded 120 seconds")), 120_000)
 const children: Bun.Subprocess<"ignore", "pipe", "pipe">[] = []
-const outputs: Promise<string>[] = []
-async function startServer() {
-  const ready = Promise.withResolvers<string>()
-  const child = Bun.spawn([resolve("node_modules/.bin/opencode"), "serve", "--hostname", "127.0.0.1", "--port", "0"], { cwd: home, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
-  children.push(child)
-  const stderr = new Response(child.stderr).text()
-  const stdout = (async () => {
-    let text = ""
-    const decoder = new TextDecoder()
-    const reader = child.stdout.getReader()
-    try {
-      while (true) {
-        const chunk = await reader.read()
-        if (chunk.done) break
-        text += decoder.decode(chunk.value, { stream: true })
-        const match = /opencode server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(text)
-        if (match) ready.resolve(match[1]!)
-      }
-    } finally { reader.releaseLock() }
-    return text
-  })()
-  outputs.push(stdout, stderr)
-  const exited = child.exited.then(async (code) => { throw new Error(`OpenCode server exited (${code}): ${await stderr}`) })
-  const baseUrl = await Promise.race([ready.promise, exited])
-  return { child, client: createOpencodeClient({ baseUrl, directory: home, throwOnError: true }) }
+const outputs: Promise<string[]>[] = []
+async function launch() {
+  const server = startServer(home, env)
+  children.push(server.child)
+  outputs.push(server.output)
+  return { child: server.child, client: await server.client }
 }
 try {
   const result = await Promise.race([(async () => {
-    let runtime = await startServer()
+    let runtime = await launch()
     let client = runtime.client
     const toasts: { title?: string; message: string; variant: string }[] = []
     let toastWaiter: (() => void) | undefined
@@ -153,7 +128,7 @@ try {
         await toastsSettled()
         runtime.child.kill()
         await runtime.child.exited
-        runtime = await startServer()
+        runtime = await launch()
         client = runtime.client
         await watchToasts(client)
       }

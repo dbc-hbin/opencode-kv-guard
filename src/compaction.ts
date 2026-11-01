@@ -1,9 +1,9 @@
 import { basename, isAbsolute } from "node:path"
 import { isGeneratedEnvironment, type WireMessage } from "./prefix"
-import { digest as hash, instruction, record } from "./shared"
+import { digest as hash, instruction, isSha256, record } from "./shared"
 
 export type ChatBody = { model: string; messages: WireMessage[]; tools?: unknown; [key: string]: unknown }
-export type CompactionOptions = false | {
+type CompactionOptions = false | {
   bytesPerToken?: number
   triggerRatio?: number
   targetRatio?: number
@@ -64,10 +64,10 @@ export function isCompactionSnapshot(value: unknown): value is CompactionSnapsho
   if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes)) return false
   const keys = new Set<string>()
   return value.lanes.every((lane) => {
-    if (!record(lane) || Object.keys(lane).some((key) => key !== "key" && key !== "state") || typeof lane.key !== "string" || !/^[a-f0-9]{64}$/.test(lane.key) || keys.has(lane.key) || !record(lane.state)) return false
+    if (!record(lane) || Object.keys(lane).some((key) => key !== "key" && key !== "state") || !isSha256(lane.key) || keys.has(lane.key) || !record(lane.state)) return false
     keys.add(lane.key)
     const state = lane.state
-    if (Object.keys(state).some((key) => !["segments", "covered", "fingerprint", "signature", "reductions"].includes(key)) || !Array.isArray(state.segments) || !Number.isSafeInteger(state.covered) || (state.covered as number) < 1 || typeof state.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(state.fingerprint) || typeof state.signature !== "string" || !/^[a-f0-9]{64}$/.test(state.signature)) return false
+    if (Object.keys(state).some((key) => !["segments", "covered", "fingerprint", "signature", "reductions"].includes(key)) || !Array.isArray(state.segments) || !Number.isSafeInteger(state.covered) || (state.covered as number) < 1 || !isSha256(state.fingerprint) || !isSha256(state.signature)) return false
     let lastArchived = -1
     if (!state.segments.every((segment) => {
       if (!record(segment) || Object.keys(segment).some((key) => key !== "summary" && key !== "archived") || typeof segment.summary !== "string" || !segment.summary.trim() || !Array.isArray(segment.archived) || !segment.archived.length) return false
@@ -188,6 +188,15 @@ function groups(messages: WireMessage[]): Group[] {
     index = end
   }
   return result
+}
+
+// The newest non-environment group and the current turn's newest tool batch
+// are never archived.
+function anchorGroups(messages: WireMessage[], units: Group[], lastUser: number) {
+  return {
+    lastGroup: units.findLast((group) => !isGeneratedEnvironment(messages[group.start]!)),
+    newestToolGroup: units.findLast((group) => group.start > lastUser && Array.isArray(messages[group.start]!.tool_calls) && (messages[group.start]!.tool_calls as unknown[]).length > 0),
+  }
 }
 
 function completeRead(content: unknown) {
@@ -364,7 +373,7 @@ const overflowPatterns = [
   /model_context_window_exceeded/i, /too many tokens/i, /token limit exceeded/i,
 ]
 const overflowExclusions = [/^(throttling error|service unavailable):/i, /rate limit/i, /too many requests/i]
-export function isContextOverflow(message: string) {
+function isContextOverflow(message: string) {
   return !overflowExclusions.some((pattern) => pattern.test(message)) && overflowPatterns.some((pattern) => pattern.test(message))
 }
 
@@ -442,8 +451,12 @@ export class RollingCompaction {
 
   constructor(input?: unknown) { this.options = options(input) }
 
+  private key(body: ChatBody, context: Pick<CompactionContext, "session" | "lane">) {
+    return hash(JSON.stringify([context.session, context.lane, body.model]))
+  }
+
   private retained(body: ChatBody, context: Pick<CompactionContext, "session" | "lane" | "currentUser">) {
-    const state = this.lanes.get(hash(JSON.stringify([context.session, context.lane, body.model])))?.state
+    const state = this.lanes.get(this.key(body, context))?.state
     const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser)
       : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message))
     let leading = 0
@@ -461,8 +474,7 @@ export class RollingCompaction {
     if (archived.has(lastUser)) return { signature }
     const units = groups(body.messages)
     const policyIntervals = intervals(body.messages)
-    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]!))
-    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]!.tool_calls) && (body.messages[group.start]!.tool_calls as unknown[]).length > 0)
+    const { lastGroup, newestToolGroup } = anchorGroups(body.messages, units, lastUser)
     const seenIntervals = new Set<number>()
     for (const segment of state.segments) {
       const interval = policyIntervals[segment.archived[0]!]!
@@ -515,7 +527,7 @@ export class RollingCompaction {
     context.signal?.throwIfAborted()
     // The caller's lane includes provider/endpoint and agent. Add real session
     // and wire model independently, even if sibling agents share affinity.
-    const key = hash(JSON.stringify([context.session, context.lane, body.model]))
+    const key = this.key(body, context)
     let lane = this.lanes.get(key)
     if (!lane) {
       lane = { session: context.session, tail: Promise.resolve() }
@@ -539,7 +551,7 @@ export class RollingCompaction {
   // adopts the result when the committed state and history still match it.
   speculate(body: ChatBody, context: CompactionContext) {
     if (this.options === false) return
-    const key = hash(JSON.stringify([context.session, context.lane, body.model]))
+    const key = this.key(body, context)
     const lane = this.lanes.get(key)
     if (!lane || lane.speculation) return
     const abort = new AbortController()
@@ -709,8 +721,7 @@ export class RollingCompaction {
     }
     const users = body.messages.flatMap((message, index) => index <= lastUser && message.role === "user" && !isGeneratedEnvironment(message) ? [index] : [])
     const recent = users[Math.max(0, users.length - config.keepRecentTurns)]!
-    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start]!))
-    const newestToolGroup = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]!.tool_calls) && (body.messages[group.start]!.tool_calls as unknown[]).length > 0)
+    const { lastGroup, newestToolGroup } = anchorGroups(body.messages, units, lastUser)
     const shake = async (selected: (group: Group) => boolean) => {
       if (!context.artifacts) return
       const taken = new Set(reductions.map((reduction) => reduction.index))
@@ -842,7 +853,6 @@ export class RollingCompaction {
         // unchanged request still fits: send it as is, keeping the cached
         // prefix, rather than failing or rewriting history for no recovery.
         reductions = [...(state?.reductions ?? [])]
-        segments.splice(0, segments.length, ...committed)
         return { body: current, report: { ...report(currentSize, false, !!state, 0, archivedIndices(committed).size), mandatoryOverTarget: true } }
       }
       // Dead-end rescue (as in OMP): shake every remaining tool result,
@@ -941,8 +951,8 @@ export class RollingCompaction {
         if (plannedSize <= aim) break
       }
     }
-    const mandatorySize = estimate(rewritten(body, segments))
     if (plannedSize > limit) {
+      const mandatorySize = estimate(rewritten(body, segments))
       throw new Error(`Compaction cannot fit input budget ${budget}: fixed system/tools/format and message structure require about ${mandatorySize} input tokens plus summary reserve ${touched.size * summaryReserve}, even after removing tool results and attachments, summarizing remaining history and clipping remaining texts. Reduce the fixed input or supply larger actual model limits`)
     }
 

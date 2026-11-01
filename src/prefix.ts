@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import type { Hooks } from "@opencode-ai/plugin"
-import { digest, isSha256 as sha256, record } from "./shared"
+import { digest, instruction, isSha256 as sha256, record } from "./shared"
 
 type Messages = Parameters<NonNullable<Hooks["experimental.chat.messages.transform"]>>[1]["messages"]
 type Part = Messages[number]["parts"][number]
@@ -10,7 +10,6 @@ const generatedEnvironments = new WeakSet<WireMessage>()
 export function isGeneratedEnvironment(message: WireMessage) {
   return generatedEnvironments.has(message)
 }
-
 
 // The compatible wire format drops OpenCode message IDs and may add user-role
 // media messages. Carry the real user provenance through conversion in an
@@ -55,7 +54,7 @@ export class UserTurns {
       } else if (Array.isArray(message.content)) {
         let removedPart = false
         message.content = message.content.filter((part: unknown) => {
-          if (!part || typeof part !== "object" || !("text" in part) || typeof part.text !== "string") return true
+          if (!record(part) || typeof part.text !== "string") return true
           if (message.role === "user" && expected && part.text.startsWith(expected)) current = message
           const owned = part.text.includes(this.prefix)
           part.text = part.text.replace(this.pattern, "")
@@ -198,7 +197,7 @@ export class Environments {
     if (!match || !messages.some((message) => message.role === "user")) return
     // Do not move data across later system/developer instructions, which may
     // intentionally delimit different policy contexts.
-    if (messages.slice(1).some((message) => message.role === "system" || message.role === "developer")) return
+    if (messages.slice(1).some(instruction)) return
 
     const key = digest(JSON.stringify([session, lane]))
     const prior = this.lanes.get(key)

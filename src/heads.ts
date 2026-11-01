@@ -1,9 +1,9 @@
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import type { ChatBody } from "./compaction"
 import { canonical, type WireMessage } from "./prefix"
-import { instruction, isSha256 as sha256, record as object, uuidV4 } from "./shared"
+import { digest, instruction, isSha256 as sha256, record, uuidV4 } from "./shared"
 
-const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex")
+const hash = (value: unknown) => digest(JSON.stringify(canonical(value)))
 const exactKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
 const equal = (a: unknown, b: unknown) => hash(a) === hash(b)
 const key = (session: string, lane: string, model?: string) => hash([session, lane, model ?? null])
@@ -14,7 +14,7 @@ function json(value: unknown, depth = 0): boolean {
   if (value === null || typeof value === "string" || typeof value === "boolean") return true
   if (typeof value === "number") return Number.isFinite(value)
   if (Array.isArray(value)) return value.every((item) => json(item, depth + 1))
-  return object(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null) && Object.values(value).every((item) => json(item, depth + 1))
+  return record(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null) && Object.values(value).every((item) => json(item, depth + 1))
 }
 
 function tools(value: unknown): HeadTool[] | null | false {
@@ -22,7 +22,7 @@ function tools(value: unknown): HeadTool[] | null | false {
   if (!Array.isArray(value)) return false
   const names = new Set<string>()
   for (const tool of value) {
-    if (!object(tool) || !json(tool) || tool.type !== "function" || !object(tool.function) || typeof tool.function.name !== "string" || !tool.function.name || names.has(tool.function.name)) return false
+    if (!record(tool) || !json(tool) || tool.type !== "function" || !record(tool.function) || typeof tool.function.name !== "string" || !tool.function.name || names.has(tool.function.name)) return false
     names.add(tool.function.name)
   }
   return canonical([...value].sort((a, b) => {
@@ -44,8 +44,8 @@ function chain(messages: WireMessage[], prior?: string[], replacements?: Readonl
 }
 
 export type HeadContext = { session: string; lane: string; currentUser?: WireMessage; parentSession?: string; parentLane?: string; reconstruct?: boolean; replacements?: ReadonlyMap<WireMessage, WireMessage>; stableTools?: boolean }
-export type HeadResetReason = "tools-added" | "tools-removed" | "tools-replaced" | "tools-schema-changed" | "tools-availability-changed" | "system-contract-changed" | "unanchored-system-addition" | "history-edited" | "history-reverted"
-export type HeadReport = {
+type HeadResetReason = "tools-added" | "tools-removed" | "tools-replaced" | "tools-schema-changed" | "tools-availability-changed" | "system-contract-changed" | "unanchored-system-addition" | "history-edited" | "history-reverted"
+type HeadReport = {
   status: "initialized" | "stable" | "appended" | "rewound" | "reset" | "unsupported"
   reason?: HeadResetReason | "unsupported-tools"
   notices: number
@@ -60,11 +60,11 @@ type HeadLane = { lane: string; model: string; system: WireMessage[]; tools: Hea
 export type SessionHeadsSnapshot = { version: 1; session: string; lanes: HeadLane[] }
 
 export function isSessionHeadsSnapshot(value: unknown, session: string): value is SessionHeadsSnapshot {
-  if (!object(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes)) return false
+  if (!record(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes)) return false
   const lanes = new Set<string>()
-  const systems = (items: unknown): items is WireMessage[] => Array.isArray(items) && items.every((item) => object(item) && typeof item.role === "string" && instruction(item as WireMessage) && json(item))
+  const systems = (items: unknown): items is WireMessage[] => Array.isArray(items) && items.every((item) => record(item) && typeof item.role === "string" && instruction(item as WireMessage) && json(item))
   return value.lanes.every((lane) => {
-    if (!object(lane) || !(exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices", "toolNotices"])) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(sha256) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices)) return false
+    if (!record(lane) || !(exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices", "toolNotices"])) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(sha256) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices)) return false
     const id = key(session, lane.lane, lane.model)
     if (lanes.has(id)) return false
     lanes.add(id)
@@ -75,7 +75,7 @@ export function isSessionHeadsSnapshot(value: unknown, session: string): value i
       const names = new Set(normalized.map((item) => item.function.name))
       let position = -1
       if (!lane.toolNotices.every((notice) => {
-        if (!object(notice) || !exactKeys(notice, ["anchor", "unavailable", "changed"]) || !sha256(notice.anchor) || !Array.isArray(notice.unavailable) || !notice.unavailable.every((name) => typeof name === "string" && names.has(name))) return false
+        if (!record(notice) || !exactKeys(notice, ["anchor", "unavailable", "changed"]) || !sha256(notice.anchor) || !Array.isArray(notice.unavailable) || !notice.unavailable.every((name) => typeof name === "string" && names.has(name))) return false
         const changed = tools(notice.changed)
         if (!changed || JSON.stringify(changed) !== JSON.stringify(notice.changed) || !changed.every((item) => names.has(item.function.name))) return false
         const index = (lane.chain as string[]).indexOf(notice.anchor)
@@ -86,7 +86,7 @@ export function isSessionHeadsSnapshot(value: unknown, session: string): value i
     }
     let anchor = -1
     return lane.notices.every((notice) => {
-      if (!object(notice) || !exactKeys(notice, ["anchor", "system"]) || !sha256(notice.anchor) || !systems(notice.system) || !notice.system.length) return false
+      if (!record(notice) || !exactKeys(notice, ["anchor", "system"]) || !sha256(notice.anchor) || !systems(notice.system) || !notice.system.length) return false
       const index = (lane.chain as string[]).indexOf(notice.anchor)
       if (index < anchor || index < 0) return false
       anchor = index
@@ -265,16 +265,16 @@ type RequestBinding = { fields: string; length: number; chain: string }
 type AssistantRecord = { request: RequestBinding; assistant: WireMessage }
 type PrefixLane = { lane: string; receipt: string; previous: RequestHashes; records: AssistantRecord[] }
 export type PrefixGuardSnapshot = { version: 1; session: string; lanes: PrefixLane[] }
-export type PrefixContext = { session: string; lane: string; currentUser?: WireMessage; replay?: boolean; observe?: boolean }
+type PrefixContext = { session: string; lane: string; currentUser?: WireMessage; replay?: boolean; observe?: boolean }
 export type AssistantContext = PrefixContext & { outcome: "success" | "failed" | "aborted"; finishReason: string; receipt?: string }
-export type PrefixDivergence = {
+type PrefixDivergence = {
   kind: "request-field-added" | "request-field-removed" | "request-field-changed" | "message-field-added" | "message-field-removed" | "message-field-changed" | "messages-appended" | "history-truncated"
   field?: string
   index?: number
   count?: number
   classification?: "model" | "tools" | "system" | "developer" | "role" | "content" | "tool-calls" | "reasoning" | "other"
 }
-export type PrefixGuardReport = { receipt: string; firstRequest: boolean; sharedMessages: number; previousMessages: number; currentMessages: number; divergences: PrefixDivergence[]; replayed: { index: number; fields: string[] }[] }
+type PrefixGuardReport = { receipt: string; firstRequest: boolean; sharedMessages: number; previousMessages: number; currentMessages: number; divergences: PrefixDivergence[]; replayed: { index: number; fields: string[] }[] }
 
 function messageHashes(message: WireMessage): MessageHashes {
   return { hash: hash(message), role: message.role, fields: Object.fromEntries(Object.entries(message).filter(([, value]) => value !== undefined).map(([field, value]) => [field, hash(value)])) }
@@ -297,14 +297,14 @@ function bound(request: RequestBinding, fields: string, anchors: string[]) {
 }
 
 function plainAssistant(value: unknown): value is WireMessage {
-  if (!object(value) || !json(value) || value.role !== "assistant" || Object.keys(value).some((field) => !["role", "content", "tool_calls", "name", "reasoning_content", "reasoning"].includes(field))) return false
+  if (!record(value) || !json(value) || value.role !== "assistant" || Object.keys(value).some((field) => !["role", "content", "tool_calls", "name", "reasoning_content", "reasoning"].includes(field))) return false
   if (value.content !== undefined && value.content !== null && typeof value.content !== "string") return false
   if (value.name !== undefined && typeof value.name !== "string") return false
   if (["reasoning_content", "reasoning"].some((field) => value[field] !== undefined && typeof value[field] !== "string")) return false
   if (value.tool_calls !== undefined) {
     const ids = new Set<string>()
     if (!Array.isArray(value.tool_calls) || !value.tool_calls.every((call) => {
-      if (!object(call) || !exactKeys(call, ["id", "type", "function"]) || call.type !== "function" || typeof call.id !== "string" || !call.id || ids.has(call.id) || !object(call.function) || !exactKeys(call.function, ["name", "arguments"]) || typeof call.function.name !== "string" || !call.function.name || typeof call.function.arguments !== "string") return false
+      if (!record(call) || !exactKeys(call, ["id", "type", "function"]) || call.type !== "function" || typeof call.id !== "string" || !call.id || ids.has(call.id) || !record(call.function) || !exactKeys(call.function, ["name", "arguments"]) || typeof call.function.name !== "string" || !call.function.name || typeof call.function.arguments !== "string") return false
       ids.add(call.id)
       return true
     })) return false
@@ -313,22 +313,22 @@ function plainAssistant(value: unknown): value is WireMessage {
 }
 
 function isRequestHashes(value: unknown): value is RequestHashes {
-  const fields = (items: unknown): items is Record<string, string> => object(items) && Object.keys(items).every((field) => field.length > 0) && Object.values(items).every(sha256)
-  return object(value) && exactKeys(value, ["fields", "messages"]) && fields(value.fields) && Object.hasOwn(value.fields, "model") && !Object.hasOwn(value.fields, "messages") && Array.isArray(value.messages) && value.messages.every((message) => object(message) && exactKeys(message, ["hash", "role", "fields"]) && sha256(message.hash) && typeof message.role === "string" && !!message.role && fields(message.fields) && message.fields.role === hash(message.role))
+  const fields = (items: unknown): items is Record<string, string> => record(items) && Object.keys(items).every((field) => field.length > 0) && Object.values(items).every(sha256)
+  return record(value) && exactKeys(value, ["fields", "messages"]) && fields(value.fields) && Object.hasOwn(value.fields, "model") && !Object.hasOwn(value.fields, "messages") && Array.isArray(value.messages) && value.messages.every((message) => record(message) && exactKeys(message, ["hash", "role", "fields"]) && sha256(message.hash) && typeof message.role === "string" && !!message.role && fields(message.fields) && message.fields.role === hash(message.role))
 }
 
 export function isPrefixGuardSnapshot(value: unknown, session: string): value is PrefixGuardSnapshot {
-  if (!object(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes)) return false
+  if (!record(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes)) return false
   const lanes = new Set<string>()
   return value.lanes.every((lane) => {
-    if (!object(lane) || !exactKeys(lane, ["lane", "receipt", "previous", "records"]) || typeof lane.lane !== "string" || !lane.lane || lanes.has(lane.lane) || typeof lane.receipt !== "string" || !uuidV4.test(lane.receipt) || !isRequestHashes(lane.previous) || !Array.isArray(lane.records)) return false
+    if (!record(lane) || !exactKeys(lane, ["lane", "receipt", "previous", "records"]) || typeof lane.lane !== "string" || !lane.lane || lanes.has(lane.lane) || typeof lane.receipt !== "string" || !uuidV4.test(lane.receipt) || !isRequestHashes(lane.previous) || !Array.isArray(lane.records)) return false
     lanes.add(lane.lane)
     const previous = lane.previous
     const fields = hash(previous.fields)
     const anchors = structuralChain(previous.messages)
     const records = new Set<string>()
     return lane.records.every((entry) => {
-      if (!object(entry) || !exactKeys(entry, ["request", "assistant"]) || !object(entry.request) || !exactKeys(entry.request, ["fields", "length", "chain"]) || !sha256(entry.request.fields) || !sha256(entry.request.chain) || !Number.isSafeInteger(entry.request.length) || (entry.request.length as number) < 0 || !plainAssistant(entry.assistant)) return false
+      if (!record(entry) || !exactKeys(entry, ["request", "assistant"]) || !record(entry.request) || !exactKeys(entry.request, ["fields", "length", "chain"]) || !sha256(entry.request.fields) || !sha256(entry.request.chain) || !Number.isSafeInteger(entry.request.length) || (entry.request.length as number) < 0 || !plainAssistant(entry.assistant)) return false
       const request = entry.request as RequestBinding
       if (!bound(request, fields, anchors)) return false
       const assistant = previous.messages[request.length]

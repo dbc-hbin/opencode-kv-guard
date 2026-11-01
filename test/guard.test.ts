@@ -272,9 +272,20 @@ describe("stream admission", () => {
   })
 })
 
-test("invalid target options fail before activation", async () => {
-  await expect(plugin({} as PluginInput, {})).rejects.toThrow("providers")
-  await expect(plugin({} as PluginInput, { providers: ["proxy"], maxConcurrent: 0 })).rejects.toThrow("maxConcurrent")
+test.each([
+  [{}, "providers"],
+  [{ providers: [] }, "providers"],
+  [{ providers: ["proxy", ""] }, "providers"],
+  [{ providers: ["proxy"], maxConcurrent: 0 }, "maxConcurrent"],
+  [{ providers: ["proxy"], maxConcurrent: 1.5 }, "maxConcurrent"],
+  [{ providers: ["proxy"], maxOutputTokens: 0 }, "maxOutputTokens"],
+  [{ providers: ["proxy"], maxOutputTokens: "16" }, "maxOutputTokens"],
+  [{ providers: ["proxy"], promptCacheKey: "yes" }, "promptCacheKey must be boolean"],
+  [{ providers: ["proxy"], continueTruncated: 1 }, "continueTruncated must be boolean"],
+  [{ providers: ["proxy"], stateDirectory: "relative/state" }, "stateDirectory"],
+  [{ providers: ["proxy"], unknownFlag: true }, "unknown option unknownFlag"],
+])("invalid target options %j fail before activation", async (options, message) => {
+  await expect(plugin({} as PluginInput, options as never)).rejects.toThrow(message)
 })
 
 test("per-turn OpenCode request IDs preserve the previous environment prefix", async () => {
@@ -384,6 +395,40 @@ test("URL templates bind to the resolved endpoint and unresolved targets do not 
     if (previous === undefined) delete process.env[key]
     else process.env[key] = previous
   }
+})
+
+test("the user system suffix header drives skill catalog compaction and never reaches upstream", async () => {
+  const captured: { body: { messages: WireMessage[]; prompt_cache_key?: unknown }; headers: Headers }[] = []
+  const fetch: Fetch = async (input, init) => {
+    const request = new Request(input, init)
+    captured.push({ body: await request.json() as { messages: WireMessage[] }, headers: request.headers })
+    return new Response("ok")
+  }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://system-suffix.test/v1", fetch } } } }
+  const hooks = await plugin({} as PluginInput, { providers: ["proxy"], compaction: false, promptCacheKey: true })
+  try {
+    await hooks.config!(config)
+    const userSystem = "Personal instructions stay exact."
+    const generated = "Skills provide specialized instructions and workflows for specific tasks.\nUse the skill tool to load a skill when a task matches its description.\n<available_skills>\n  <skill>\n    <name>fixture-skill</name>\n    <description>Fixture description.</description>\n    <location>/private/skills/fixture/SKILL.md</location>\n  </skill>\n</available_skills>"
+    const headers: Record<string, string> = {}
+    await hooks["chat.headers"]!({ sessionID: "session", agent: "build", model: { providerID: "proxy", limit: { context: 100_000, output: 1000 } }, message: { system: userSystem } } as never, { headers })
+    const post = (extra: Record<string, string> = {}) => config.provider.proxy.options.fetch("http://system-suffix.test/v1/chat/completions", {
+      method: "POST", headers: { "x-opencode-session-id": "session", ...headers, ...extra },
+      body: JSON.stringify({ model: "fixture", max_tokens: 1000, tools: [{ type: "function", function: { name: "skill", parameters: { type: "object" } } }], messages: [{ role: "system", content: `Policy.\n${generated}\n${userSystem}` }, { role: "user", content: "Task" }] }),
+    })
+    await (await post()).text()
+    const system = captured[0]!.body.messages[0]!.content as string
+    expect(system).toContain("fixture-skill: Fixture description.")
+    expect(system).not.toContain("/private/skills/")
+    expect(system.endsWith(`\n${userSystem}`)).toBe(true)
+    expect([...captured[0]!.headers.keys()].filter((name) => name.startsWith("x-opencode-kv-guard"))).toEqual([])
+    expect(captured[0]!.body.prompt_cache_key).toBe("session")
+
+    for (const metadata of [{ length: -1, hash: "a".repeat(64) }, { length: 1, hash: "not-a-hash" }, [1]]) {
+      await expect(post({ "x-opencode-kv-guard-system-suffix": JSON.stringify(metadata) })).rejects.toThrow("invalid user system suffix metadata")
+    }
+    expect(captured).toHaveLength(1)
+  } finally { await hooks.dispose!() }
 })
 
 test("real compatible SDK passthrough keys are normalized without losing tenant salt or parent affinity", async () => {
@@ -558,10 +603,38 @@ test("a summary handoff overflow recovers by folding once; a rejected tool_choic
   await hooks.dispose!()
 })
 
+// A streamed main answer whose usage reports the request size, so the next
+// turn's estimate stays inside the speculation band.
+function answered(body: unknown): Response {
+  const size = Buffer.byteLength(JSON.stringify(body))
+  return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+}
+
+async function speculation(baseURL: string, fetch: Fetch, providerOptions: Record<string, unknown> = {}, tools?: unknown[]) {
+  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL, fetch, ...providerOptions } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+  await hooks.config!(config)
+  const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
+  const send = (init: RequestInit) => config.provider.proxy.options.fetch(`${baseURL}/chat/completions`, { method: "POST", ...init })
+  const post = async (userID: string) => {
+    const turn: Messages = [user(userID, "Task")]
+    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
+    const marked = turn[0]!.parts[0]!
+    if (marked.type !== "text") throw new Error("Expected text fixture")
+    const body = { model: "fixture", stream: true, max_tokens: 500, ...(tools ? { tools } : {}), messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
+    // Place the request at 95% of the trigger, inside the speculation band.
+    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
+    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": userID }
+    return send({ headers, body: JSON.stringify(body) })
+  }
+  return { hooks, post, send }
+}
+
 test("a discarded speculative error response releases the endpoint slot", async () => {
   let summaries = 0
   const summarySent = Promise.withResolvers<void>()
-  const fetch: Fetch = async (input, init) => {
+  const { hooks, post } = await speculation("http://speculate.test/v1", async (input, init) => {
     const body = await new Request(input, init).json() as Record<string, unknown>
     if (body.stream === false) {
       summaries++
@@ -569,25 +642,8 @@ test("a discarded speculative error response releases the endpoint slot", async 
       // A 503 body that is never read keeps the admission slot unless cancelled.
       return new Response(new ReadableStream({ pull() {} }), { status: 503, headers: { "content-type": "application/json" } })
     }
-    const size = Buffer.byteLength(JSON.stringify(body))
-    return new Response(`data: ${JSON.stringify({ id: "main", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ id: "main", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
-  }
-  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
-  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculate.test/v1", fetch } } } }
-  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
-  await hooks.config!(config)
-  const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
-  const post = async (userID: string) => {
-    const turn: Messages = [user(userID, "Task")]
-    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
-    const marked = turn[0]!.parts[0]!
-    if (marked.type !== "text") throw new Error("Expected text fixture")
-    const body = { model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
-    // Place the request at 95% of the trigger, inside the speculation band.
-    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
-    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": userID }
-    return config.provider.proxy.options.fetch("http://speculate.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })
-  }
+    return answered(body)
+  })
   await (await post("msg_a")).text()
   // The completed response starts the background summary, which gets 503.
   const bounded = <T>(pending: Promise<T>, fallback: T) => Promise.race([pending, new Promise<T>((resolve) => setTimeout(() => resolve(fallback), 2000))])
@@ -657,36 +713,23 @@ test.each([
 ])("a detached speculative summary observes provider deadlines %j", async ({ timeout, headerTimeout }) => {
   const summarySent = Promise.withResolvers<void>()
   const summaryAborted = Promise.withResolvers<unknown>()
-  const fetch: Fetch = async (input, init) => {
+  const { hooks, post, send } = await speculation("http://speculation-deadline.test/v1", async (input, init) => {
     const request = new Request(input, init)
     const body = await request.json() as Record<string, unknown>
     if (body.stream === false) {
-      return new Promise<Response>((_resolve, reject) => {
-        request.signal.addEventListener("abort", () => { summaryAborted.resolve(request.signal.reason); reject(request.signal.reason) }, { once: true })
-        summarySent.resolve()
-      })
+      const pending = Promise.withResolvers<Response>()
+      request.signal.addEventListener("abort", () => { summaryAborted.resolve(request.signal.reason); pending.reject(request.signal.reason) }, { once: true })
+      summarySent.resolve()
+      return pending.promise
     }
-    const size = Buffer.byteLength(JSON.stringify(body))
-    return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
-  }
-  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
-  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculation-deadline.test/v1", fetch, timeout, headerTimeout } } } }
-  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+    return answered(body)
+  }, { timeout, headerTimeout })
   try {
-    await hooks.config!(config)
-    const turn: Messages = [user("msg_user", "Task")]
-    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
-    const marked = turn[0]!.parts[0]!
-    if (marked.type !== "text") throw new Error("Expected text fixture")
-    const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
-    const body = { model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
-    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
-    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": "msg_user" }
-    await (await config.provider.proxy.options.fetch("http://speculation-deadline.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })).text()
+    await (await post("msg_user")).text()
     await summarySent.promise
     // Another session must get the same endpoint slot without cancelling speculation itself.
-    const next = await config.provider.proxy.options.fetch("http://speculation-deadline.test/v1/chat/completions", {
-      method: "POST", signal: AbortSignal.timeout(2000), headers: { "x-opencode-session-id": "next", "x-opencode-kv-guard-agent": "build" },
+    const next = await send({
+      signal: AbortSignal.timeout(2000), headers: { "x-opencode-session-id": "next", "x-opencode-kv-guard-agent": "build" },
       body: JSON.stringify({ model: "fixture", stream: true, messages: [{ role: "user", content: "Next" }] }),
     })
     expect(await next.text()).toContain("Answer")
@@ -700,7 +743,7 @@ test("a detached speculative summary keeps upstream header vs total timeout sema
   const bodyStarted = Promise.withResolvers<void>()
   const finishBody = Promise.withResolvers<void>()
   const summaryDone = Promise.withResolvers<string>()
-  const fetch: Fetch = async (input, init) => {
+  const { hooks, post } = await speculation("http://speculation-semantics.test/v1", async (input, init) => {
     const request = new Request(input, init)
     const body = await request.json() as Record<string, unknown>
     if (body.stream === false) {
@@ -717,27 +760,16 @@ test("a detached speculative summary keeps upstream header vs total timeout sema
       })
       return new Response(stream, { headers: { "content-type": "application/json" } })
     }
-    const size = Buffer.byteLength(JSON.stringify(body))
-    return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
-  }
-  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
-  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculation-semantics.test/v1", fetch, timeout: 5000, headerTimeout: 25 } } } }
-  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+    return answered(body)
+  }, { timeout: 5000, headerTimeout: 25 })
   try {
-    await hooks.config!(config)
-    const turn: Messages = [user("msg_user", "Task")]
-    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
-    const marked = turn[0]!.parts[0]!
-    if (marked.type !== "text") throw new Error("Expected text fixture")
-    const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
-    const body = { model: "fixture", stream: true, max_tokens: 500, messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
-    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
-    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": "msg_user" }
-    await (await config.provider.proxy.options.fetch("http://speculation-semantics.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })).text()
+    await (await post("msg_user")).text()
     await bodyStarted.promise
     // Elapsed real time is the behavior under test: outlive the 25 ms header
-    // deadline after headers arrived, then end the body. Fake timers cannot
-    // drive the AbortSignal.timeout these deadlines use.
+    // deadline (a setTimeout cleared when headers arrive) while the body is
+    // still within the total timeout, then end the body. The total timeout is
+    // a native AbortSignal.timeout running beside it, so a fake clock would
+    // drive only one of the two deadlines.
     await new Promise((resolve) => setTimeout(resolve, 100))
     finishBody.resolve()
     expect(await summaryDone.promise).toBe("completed")
@@ -752,7 +784,7 @@ test("a detached tool_choice none rejection gives its auto retry fresh deadlines
   const finishErrorBody = Promise.withResolvers<void>()
   const retried = Promise.withResolvers<string>()
   const encoder = new TextEncoder()
-  const fetch: Fetch = async (input, init) => {
+  const { hooks, post } = await speculation("http://speculation-fallback.test/v1", async (input, init) => {
     const request = new Request(input, init)
     const body = await request.json() as Record<string, unknown>
     if (body.stream === false) {
@@ -772,26 +804,14 @@ test("a detached tool_choice none rejection gives its auto retry fresh deadlines
       queueMicrotask(() => retried.resolve("sent"))
       return Response.json({ choices: [{ index: 0, message: { role: "assistant", content: "AUTO_SUMMARY" }, finish_reason: "stop" }] })
     }
-    const size = Buffer.byteLength(JSON.stringify(body))
-    return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: size, completion_tokens: 1, total_tokens: size + 1 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
-  }
-  const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
-  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://speculation-fallback.test/v1", fetch, timeout: 5000, headerTimeout: 25 } } } }
-  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
+    return answered(body)
+  }, { timeout: 5000, headerTimeout: 25 }, [{ type: "function", function: { name: "read", parameters: { type: "object" } } }])
   try {
-    await hooks.config!(config)
-    const turn: Messages = [user("msg_user", "Task")]
-    await hooks["experimental.chat.messages.transform"]!({}, { messages: turn })
-    const marked = turn[0]!.parts[0]!
-    if (marked.type !== "text") throw new Error("Expected text fixture")
-    const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
-    const body = { model: "fixture", stream: true, max_tokens: 500, tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }], messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
-    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
-    const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": "msg_user" }
-    await (await config.provider.proxy.options.fetch("http://speculation-fallback.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })).text()
+    await (await post("msg_user")).text()
     await errorBodyStarted.promise
     // Elapsed real time is the behavior under test: the error body outlives the
-    // 25 ms header deadline. Fake timers cannot drive AbortSignal.timeout.
+    // 25 ms header deadline (a setTimeout) while the native AbortSignal.timeout
+    // total deadline also runs, which a fake clock would not drive.
     await new Promise((resolve) => setTimeout(resolve, 100))
     finishErrorBody.resolve()
     expect(await retried.promise).toBe("sent")
@@ -923,6 +943,38 @@ test("an output-limit finish is continued only once its step completed", async (
   await idle()
   expect(prompts).toHaveLength(1)
   await hooks.dispose!()
+})
+
+test("output-limit continuations stop after three in a row and restart on a real user turn", async () => {
+  const prompts: { body: { parts: { type: string; synthetic: boolean; text: string }[] } }[] = []
+  const toasts: { variant: string }[] = []
+  let stored: unknown[] = []
+  const client = {
+    app: { log: async () => {} },
+    session: { messages: async () => ({ data: stored }), get: async () => ({ data: {} }), promptAsync: async (input: never) => { prompts.push(input); return {} } },
+    tui: { showToast: async (input: { body: { variant: string } }) => { toasts.push(input.body); return {} } },
+  }
+  const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://truncated-limit.test/v1", fetch: (async () => new Response()) as Fetch } } } }
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"] })
+  try {
+    await hooks.config!(config)
+    const idle = () => hooks.event!({ event: { type: "session.idle", properties: { sessionID: "session" } } as never })
+    const real = (id: string) => ({ info: { id, role: "user", agent: "build", model: { providerID: "proxy", modelID: "fixture" } }, parts: [{ type: "text", text: "Task" }] })
+    const truncated = (id: string, parentID: string) => ({ info: { id, role: "assistant", parentID, finish: "length", time: { created: 1, completed: 2 }, providerID: "proxy", modelID: "fixture", mode: "build" }, parts: [] })
+    stored = [real("msg_user"), truncated("msg_a0", "msg_user")]
+    await idle()
+    expect(prompts).toHaveLength(1)
+    // Each continuation is answered by another truncated step.
+    for (let index = 1; index <= 3; index++) {
+      stored.push({ ...real(`msg_c${index}`), parts: prompts.at(-1)!.body.parts }, truncated(`msg_a${index}`, `msg_c${index}`))
+      await idle()
+    }
+    expect(prompts).toHaveLength(3)
+    expect(toasts.map((toast) => toast.variant)).toEqual(["warning"])
+    stored.push(real("msg_next"), truncated("msg_after", "msg_next"))
+    await idle()
+    expect(prompts).toHaveLength(4)
+  } finally { await hooks.dispose!() }
 })
 
 test("/kv-compact compacts only the command's own user message and is cleared when its turn ends", async () => {

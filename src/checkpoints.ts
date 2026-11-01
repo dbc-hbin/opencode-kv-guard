@@ -6,20 +6,19 @@ import { join, resolve } from "node:path"
 import { isCompactionSnapshot, type CompactionSnapshot } from "./compaction"
 import { isEnvironmentsSnapshot, isModeRemindersSnapshot, type EnvironmentsSnapshot, type ModeRemindersSnapshot } from "./prefix"
 import { isSessionHeadsSnapshot, isPrefixGuardSnapshot, type SessionHeadsSnapshot, type PrefixGuardSnapshot } from "./heads"
-import { digest as hash, uuidV4 } from "./shared"
+import { busy, digest as hash, record, uuidV4 } from "./shared"
 
 export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot; heads?: SessionHeadsSnapshot; prefixGuard?: PrefixGuardSnapshot }
-export type CheckpointLoad = { revision: string | null; snapshot: CheckpointSnapshot | null; reason?: "malformed" | "version" | "deleted" }
+type CheckpointLoad = { revision: string | null; snapshot: CheckpointSnapshot | null; reason?: "malformed" | "version" | "deleted" }
 type Row = { revision: string; version: number; payload: string | null; deleted: number }
 const version = 2
 
 export function isCheckpointSnapshot(value: unknown, session: string): value is CheckpointSnapshot {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  const bundle = value as Record<string, unknown>
-  return Object.keys(bundle).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key))
-    && isModeRemindersSnapshot(bundle.modes, session) && isEnvironmentsSnapshot(bundle.environments) && isCompactionSnapshot(bundle.compaction)
-    && (bundle.heads === undefined || isSessionHeadsSnapshot(bundle.heads, session))
-    && (bundle.prefixGuard === undefined || isPrefixGuardSnapshot(bundle.prefixGuard, session))
+  if (!record(value)) return false
+  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key))
+    && isModeRemindersSnapshot(value.modes, session) && isEnvironmentsSnapshot(value.environments) && isCompactionSnapshot(value.compaction)
+    && (value.heads === undefined || isSessionHeadsSnapshot(value.heads, session))
+    && (value.prefixGuard === undefined || isPrefixGuardSnapshot(value.prefixGuard, session))
 }
 
 export class CheckpointConflictError extends Error {
@@ -134,7 +133,7 @@ export class CheckpointStore {
           return
         } finally { db.close() }
       } catch (error) {
-        if (!(error instanceof Error) || !("code" in error) || typeof error.code !== "string" || !/^SQLITE_(BUSY|LOCKED)/.test(error.code)) throw error
+        if (!busy(error)) throw error
         if (!notified) { notified = true; onContention?.() }
         await changed.promise
       } finally {

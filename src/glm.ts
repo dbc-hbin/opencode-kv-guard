@@ -1,14 +1,14 @@
 import type { ChatBody } from "./compaction"
 import { record } from "./shared"
 
-export type ReasoningEffort = "low" | "high" | "max"
+type ReasoningEffort = "low" | "high" | "max"
 export type GLMOptions = {
   models: string[]
   reasoningEffort: ReasoningEffort
   clearThinking: boolean
   cumulativeReasoning: boolean
 }
-export type GLMPolicyReport = {
+type GLMPolicyReport = {
   targeted: boolean
   cumulativeReasoning: boolean
   reasoningEffort?: ReasoningEffort
