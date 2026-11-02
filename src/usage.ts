@@ -1,7 +1,8 @@
 import { isDeepStrictEqual } from "node:util"
+import { randomUUID } from "node:crypto"
 import type { ChatBody } from "./compaction"
 import type { WireMessage } from "./prefix"
-import { digest as hash, record } from "./shared"
+import { digest as hash, isSha256, record, uuidV4 } from "./shared"
 
 type UsageRequest = { readonly startedAt: number }
 export type UsageReport = {
@@ -27,15 +28,32 @@ export type ObserveResponseOptions = {
   signal?: AbortSignal
   label?: string
   transform?: (value: unknown) => unknown
+  onAnchor?: () => void | Promise<void>
   onAssistant?: (assistant: WireMessage) => void
   onReport?: (report: UsageReport) => void | Promise<void>
 }
 
 type Fingerprint = { policy: string; messages: string[] }
 type Anchor = Fingerprint & { promptTokens: number }
-type Lane = { latest: number; anchor?: Anchor }
-type Pending = { lane: string; state: Lane; sequence: number; fingerprint: Fingerprint }
+type Lane = { latest: number; anchor?: Anchor; receipt?: string }
+type Pending = { lane: string; state: Lane; sequence: number; receipt?: string; fingerprint: Fingerprint }
 const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+
+export type UsageSnapshot = { readonly lanes: readonly { readonly lane: string; readonly anchor?: Anchor; readonly receipt?: string }[] }
+
+export function isUsageSnapshot(value: unknown): value is UsageSnapshot {
+  if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes)) return false
+  const lanes = new Set<string>()
+  return value.lanes.every((entry) => {
+    if (!record(entry) || Object.keys(entry).some((key) => !["lane", "anchor", "receipt"].includes(key)) || !isSha256(entry.lane) || lanes.has(entry.lane)) return false
+    lanes.add(entry.lane)
+    if (entry.receipt !== undefined && (typeof entry.receipt !== "string" || !uuidV4.test(entry.receipt))) return false
+    const anchor = entry.anchor
+    if (anchor === undefined) return entry.receipt !== undefined
+    return record(anchor) && Object.keys(anchor).every((key) => ["policy", "messages", "promptTokens"].includes(key))
+      && isSha256(anchor.policy) && Array.isArray(anchor.messages) && anchor.messages.every(isSha256) && count(anchor.promptTokens)
+  })
+}
 
 function fingerprint(body: ChatBody): Fingerprint {
   const { messages, ...policy } = body
@@ -55,10 +73,22 @@ function accountable(message: WireMessage) {
     if (message[key] !== undefined && message[key] !== null && typeof message[key] !== "string") return false
   }
   if (message.content !== undefined && message.content !== null && typeof message.content !== "string") {
-    if (!Array.isArray(message.content) || !message.content.every((part) => record(part) && part.type === "text" && typeof part.text === "string" && Object.keys(part).every((key) => key === "type" || key === "text"))) return false
+    if (!Array.isArray(message.content)) return false
+    if (!message.content.every((part) => {
+      if (!record(part) || part.type !== "text") return false
+      if (typeof part.text !== "string") return false
+      return Object.keys(part).every((key) => key === "type" || key === "text")
+    })) return false
   }
   if (message.tool_calls !== undefined) {
-    if (!Array.isArray(message.tool_calls) || !message.tool_calls.every((call) => record(call) && call.type === "function" && typeof call.id === "string" && Object.keys(call).every((key) => ["id", "type", "function"].includes(key)) && record(call.function) && typeof call.function.name === "string" && typeof call.function.arguments === "string" && Object.keys(call.function).every((key) => key === "name" || key === "arguments"))) return false
+    if (!Array.isArray(message.tool_calls)) return false
+    if (!message.tool_calls.every((call) => {
+      if (!record(call) || call.type !== "function" || typeof call.id !== "string") return false
+      if (Object.keys(call).some((key) => !["id", "type", "function"].includes(key))) return false
+      if (!record(call.function)) return false
+      if (typeof call.function.name !== "string" || typeof call.function.arguments !== "string") return false
+      return Object.keys(call.function).every((key) => key === "name" || key === "arguments")
+    })) return false
   }
   return true
 }
@@ -68,10 +98,58 @@ export class UsageTracker {
   private readonly pending = new WeakMap<UsageRequest, Pending>()
   private sequence = 0
 
+  snapshot(lanes: Iterable<string>): UsageSnapshot {
+    return { lanes: [...lanes].sort().flatMap((lane) => {
+      const state = this.lanes.get(lane)
+      return state && (state.anchor || state.receipt) ? [{
+        lane, ...(state.anchor ? { anchor: structuredClone(state.anchor) } : {}),
+        ...(state.receipt ? { receipt: state.receipt } : {}),
+      }] : []
+    }) }
+  }
+
+  prepare(lane: string) {
+    const state = this.lanes.get(lane) ?? { latest: 0 }
+    state.receipt = randomUUID()
+    this.lanes.set(lane, state)
+    return state.receipt
+  }
+
+  publish(snapshot: UsageSnapshot, receipt: string) {
+    for (const { lane, anchor } of snapshot.lanes) {
+      const state = this.lanes.get(lane)
+      // The checkpoint reload supplies the latest preparation across processes.
+      // An older completion cannot replace a newer request's measured baseline.
+      if (state?.receipt === receipt && anchor) state.anchor = structuredClone(anchor)
+    }
+  }
+
+  restore(snapshot: UsageSnapshot, replace: Iterable<string> = []) {
+    // Restore only this session's anchors. Keep lane objects and dispatch
+    // sequences intact so in-flight responses still obey newest-dispatch wins.
+    for (const lane of replace) {
+      const state = this.lanes.get(lane)
+      if (state) { delete state.anchor; delete state.receipt }
+    }
+    for (const { lane, anchor, receipt } of snapshot.lanes) {
+      let state = this.lanes.get(lane)
+      if (!state) { state = { latest: 0 }; this.lanes.set(lane, state) }
+      if (anchor) state.anchor = structuredClone(anchor)
+      else delete state.anchor
+      if (receipt) state.receipt = receipt
+      else delete state.receipt
+    }
+  }
+
   // Call before dispatch/admission, not when response headers arrive. Otherwise
   // an older slow request could appear newer than a request already completed.
-  begin(body: ChatBody, lane: string): UsageRequest {
+  begin(body: ChatBody, lane: string, receipt?: string): UsageRequest {
+    const request = { startedAt: performance.now() }
     let state = this.lanes.get(lane)
+    // A request can pause between preparation and dispatch while another
+    // preparation reloads this lane. Never borrow that newer request's receipt
+    // or invalidate its anchor with a superseded request body.
+    if (receipt !== state?.receipt) return request
     if (!state) {
       state = { latest: 0 }
       this.lanes.set(lane, state)
@@ -79,15 +157,14 @@ export class UsageTracker {
     const current = fingerprint(body)
     if (state.anchor && !prefix(state.anchor, current)) delete state.anchor
     state.latest = ++this.sequence
-    const request = { startedAt: performance.now() }
-    this.pending.set(request, { lane, state, sequence: state.latest, fingerprint: current })
+    this.pending.set(request, { lane, state, sequence: state.latest, receipt, fingerprint: current })
     return request
   }
 
   record(request: UsageRequest, body: ChatBody, lane: string, promptTokens: number) {
     const pending = this.pending.get(request)
     this.pending.delete(request)
-    if (!pending || !count(promptTokens) || pending.lane !== lane || this.lanes.get(lane) !== pending.state || pending.sequence !== pending.state.latest) return false
+    if (!pending || !count(promptTokens) || pending.lane !== lane || this.lanes.get(lane) !== pending.state || pending.sequence !== pending.state.latest || pending.receipt !== pending.state.receipt) return false
     const current = fingerprint(body)
     if (!prefix(pending.fingerprint, current) || current.messages.length !== pending.fingerprint.messages.length) return false
     pending.state.anchor = { ...pending.fingerprint, promptTokens }
@@ -294,10 +371,12 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
   })
   const json: Uint8Array[] = []
   const finish = (outcome: UsageReport["outcome"]) => {
+    if (outcome !== "complete") signal?.removeEventListener("abort", abort)
     if (reported) return
     reported = true
-    signal?.removeEventListener("abort", abort)
     const anchorRecorded = outcome === "complete" && counts.promptTokens !== undefined && (counts.cachedTokens === undefined || counts.cachedTokens <= counts.promptTokens) && tracker.record(request, prompt, lane, counts.promptTokens)
+    // Durable consumers must commit before EOF, not in the deferred report.
+    const retained = anchorRecorded ? options.onAnchor?.() : undefined
     const report: UsageReport = {
       laneFingerprint: hash(lane), ...(options.label === undefined ? {} : { label: options.label }),
       status: response.status, format, outcome, headerMs,
@@ -326,6 +405,7 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
     if (options.onReport) queueMicrotask(() => {
       try { void Promise.resolve(options.onReport!(report)).catch(() => {}) } catch {}
     })
+    return retained
   }
   let controller: ReadableStreamDefaultController<Uint8Array>
   const reader = response.body?.getReader()
@@ -391,9 +471,11 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
             if (transform) value.enqueue(changed === undefined ? bytes : encoder.encode(changed))
           }
           const complete = terminal && !invalid && choices.size > 0 && [...choices].every((index) => finishedChoices.has(index))
+          await finish(!response.ok || invalid ? "error" : complete ? "complete" : "incomplete")
+          signal?.removeEventListener("abort", abort)
+          if (stopped) return
           stopped = true
           value.close()
-          finish(!response.ok || invalid ? "error" : complete ? "complete" : "incomplete")
         }
       } catch (error) {
         if (stopped) return

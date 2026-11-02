@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { TuiEventBus } from "@opencode-ai/plugin/tui"
-import { createOpencodeClient, type AssistantMessage, type Event } from "@opencode-ai/sdk/v2"
-import { watchSessionUsage } from "../src/tui"
+import { createOpencodeClient, type AssistantMessage, type Event, type Part } from "@opencode-ai/sdk/v2"
+import { responsePerformance, watchSessionUsage } from "../src/tui"
 
 function assistant(id: string, input: number, read = 0, write = 0): AssistantMessage {
   return {
@@ -9,6 +9,80 @@ function assistant(id: string, input: number, read = 0, write = 0): AssistantMes
     path: { cwd: "/fixture", root: "/fixture" }, cost: 0, tokens: { input, output: 0, reasoning: 0, cache: { read, write } },
   }
 }
+
+describe("TUI output throughput", () => {
+  test.each([
+    { output: 60, reasoning: 40, duration: 2000, expected: 50 },
+    { output: 0, reasoning: 100, duration: 2000, expected: 50 },
+    { output: 60, reasoning: 40, duration: 10_000, expected: 10 },
+    { output: 60, reasoning: 40, duration: 100, expected: 1000 },
+    { output: 60, reasoning: 40, duration: 99, expected: undefined },
+    { output: 0, reasoning: 0, duration: 2000, expected: undefined },
+    { output: NaN, reasoning: 0, duration: 2000, expected: undefined },
+    { output: 60, reasoning: 40, duration: Infinity, expected: undefined },
+    { output: 60, reasoning: 40, duration: -1, expected: undefined },
+  ])("uses all reported output over elapsed time: $output + $reasoning / $duration ms", ({ output, reasoning, duration, expected }) => {
+    const message = assistant("reply", 1000, 800)
+    message.tokens.output = output
+    message.tokens.reasoning = reasoning
+    message.time.completed = message.time.created + duration
+    expect(responsePerformance([message], () => []).throughput).toBe(expected)
+  })
+
+  test("uses only the latest assistant and clears an old rate when a new response starts", () => {
+    const completed = assistant("old", 1000)
+    completed.tokens.output = 100
+    completed.time.completed = completed.time.created + 2000
+    const user = { id: "user", sessionID: "session", role: "user", time: { created: 3000 }, agent: "build", model: { providerID: "fixture", modelID: "fixture" } } as const
+    const pending = assistant("new", 0)
+    expect(responsePerformance([], () => []).throughput).toBeUndefined()
+    expect(responsePerformance([user], () => []).throughput).toBeUndefined()
+    expect(responsePerformance([completed, user], () => []).throughput).toBe(50)
+    expect(responsePerformance([completed, user, pending], () => []).throughput).toBeUndefined()
+    pending.tokens.output = 200
+    expect(responsePerformance([completed, user, pending], () => []).throughput).toBeUndefined()
+    pending.time.completed = pending.time.created + 2000
+    expect(responsePerformance([completed, user, pending], () => []).throughput).toBe(100)
+  })
+
+  test("separates first-token latency, generation throughput and end-to-end time using persisted parts", () => {
+    const message = assistant("reply", 1000, 800)
+    message.time = { created: 1000, completed: 6000 }
+    message.tokens.output = 120
+    message.tokens.reasoning = 80
+    const parts: Part[] = [
+      { id: "synthetic", sessionID: "session", messageID: "reply", type: "text", text: "injected", synthetic: true, time: { start: 1000, end: 1000 } },
+      { id: "empty", sessionID: "session", messageID: "reply", type: "text", text: "", time: { start: 1100, end: 1100 } },
+      { id: "reasoning", sessionID: "session", messageID: "reply", type: "reasoning", text: "thinking", time: { start: 2000, end: 3000 } },
+      { id: "answer", sessionID: "session", messageID: "reply", type: "text", text: "answer", time: { start: 4000, end: 5900 } },
+    ]
+    expect(responsePerformance([message], (id) => id === message.id ? parts : [])).toEqual({
+      ttftMs: 1000, throughput: 40, generationThroughput: 50, e2eMs: 5000,
+    })
+    message.time.completed = undefined
+    expect(responsePerformance([message], () => parts)).toEqual({
+      ttftMs: 1000, throughput: undefined, generationThroughput: undefined, e2eMs: undefined,
+    })
+  })
+
+  test("does not invent first-token timing from tools, untimed parts or invalid timestamps", () => {
+    const message = assistant("reply", 1000)
+    message.time = { created: 1000, completed: 6000 }
+    message.tokens.output = 200
+    const text: Part = { id: "text", sessionID: "session", messageID: "reply", type: "text", text: "answer", time: { start: 2000, end: 5900 } }
+    const tool: Part = { id: "tool", sessionID: "session", messageID: "reply", type: "tool", tool: "read", callID: "call", state: { status: "running", input: {}, time: { start: 1500 } } }
+    const candidates: Part[][] = [
+      [], [tool], [tool, text], [{ ...text, time: undefined }],
+      [{ ...text, time: { start: 999 } }], [{ ...text, time: { start: 6001 } }], [{ ...text, time: { start: NaN } }],
+    ]
+    for (const parts of candidates) expect(responsePerformance([message], () => parts)).toEqual({
+      ttftMs: undefined, throughput: 40, generationThroughput: undefined, e2eMs: 5000,
+    })
+    expect(responsePerformance([message], () => [{ ...text, time: { start: 6000 } }])).toEqual({
+      ttftMs: 5000, throughput: 40, generationThroughput: undefined, e2eMs: 5000,
+    })
+  })
+})
 
 function fixture() {
   const listeners = new Set<(event: Event) => void>()

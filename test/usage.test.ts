@@ -146,8 +146,8 @@ function watch(response: Response, options: Omit<ObserveResponseOptions, "onRepo
   const report = Promise.withResolvers<UsageReport>()
   return { response: observeResponse(response, { ...options, onReport: report.resolve }), report: report.promise }
 }
-async function anchor(tracker: UsageTracker, prompt = body(), key = lane, tokens = 100) {
-  const observed = watch(Response.json(final({ prompt_tokens: tokens })), { body: prompt, lane: key, tracker })
+async function anchor(tracker: UsageTracker, prompt = body(), key = lane, tokens = 100, receipt?: string) {
+  const observed = watch(Response.json(final({ prompt_tokens: tokens })), { body: prompt, lane: key, tracker, request: tracker.begin(prompt, key, receipt) })
   await observed.response.text()
   expect((await observed.report).anchorRecorded).toBe(true)
 }
@@ -169,10 +169,15 @@ describe("provider usage anchors", () => {
     expect(tracker.estimate(tools, lane, fallback)).toBe(1_000 + fallback(tools) - fallback(prompt))
   })
 
-  test("requires exact model, template, tools, nonmessage policy, history, tenant and lane", async () => {
-    const tracker = new UsageTracker()
+  test.each([false, true])("requires exact model, template, tools, nonmessage policy, history, tenant and lane (restored=%s)", async (restored) => {
+    let tracker = new UsageTracker()
     const prompt = body()
     await anchor(tracker, prompt)
+    if (restored) {
+      const snapshot = tracker.snapshot([lane])
+      tracker = new UsageTracker()
+      tracker.restore(snapshot)
+    }
     const edited = structuredClone(prompt)
     edited.messages[1]!.content = "Edited"
     const changed = [
@@ -212,6 +217,9 @@ describe("provider usage anchors", () => {
     const next = body([{ role: "assistant", content: "Answer" }, { role: "user", content: "Next" }])
     const olderRequest = tracker.begin(first, lane)
     const newerRequest = tracker.begin(next, lane)
+    // A checkpoint reload while requests are in flight must not reset their
+    // dispatch ordering or replace the lane identity attached to the tickets.
+    tracker.restore({ lanes: [] }, [lane])
     const newer = watch(Response.json(final({ prompt_tokens: 200 })), { body: next, lane, tracker, request: newerRequest })
     await newer.response.text()
     expect((await newer.report).anchorRecorded).toBe(true)
@@ -232,6 +240,26 @@ describe("provider usage anchors", () => {
     expect(await observed.response.text()).toBe("failure")
     expect((await observed.report).anchorRecorded).toBe(false)
     expect(tracker.estimate(body(), lane, fallback)).toBe(fallback(body()))
+  })
+
+  test.each([false, true])("checkpoint reload rejects old measurements before live mutation (delayedDispatch=%s)", async (delayedDispatch) => {
+    const first = new UsageTracker()
+    const receipt = first.prepare(lane)
+    const oldBody = body()
+    const oldRequest = delayedDispatch ? undefined : first.begin(oldBody, lane, receipt)
+    const newer = new UsageTracker()
+    newer.restore(first.snapshot([lane]))
+    const newerReceipt = newer.prepare(lane)
+    const newBody = body([{ role: "assistant", content: "Answer" }, { role: "user", content: "새로운 기록" }])
+    await anchor(newer, newBody, lane, 16_500, newerReceipt)
+    // A preparation reloads another process's checkpoint while the old
+    // response in this instance is still in flight and has no newer dispatch.
+    first.restore(newer.snapshot([lane]), [lane])
+
+    const accepted = first.record(oldRequest ?? first.begin(oldBody, lane, receipt), oldBody, lane, 500)
+
+    expect(accepted).toBe(false)
+    expect(first.estimate(newBody, lane, fallback)).toBe(16_500)
   })
 
   test("delete and clear invalidate in-flight tickets without affecting other lanes", async () => {
@@ -481,6 +509,36 @@ describe("streaming usage observation", () => {
       expect(await observed.json()).toEqual(final())
     }
     await logged.promise
+  })
+
+  test("abort during usage persistence rejects the reader after admission is released", async () => {
+    const entered = Promise.withResolvers<void>()
+    const commit = Promise.withResolvers<void>()
+    const saved = Promise.withResolvers<void>()
+    const signal = new AbortController()
+    let released = false
+    const admitted = await admittedFetch(async () => Response.json(final()), {
+      async acquire() { return () => { released = true } },
+    }, "http://endpoint.test")
+    const observed = observeResponse(admitted, {
+      body: body(), lane, tracker: new UsageTracker(), signal: signal.signal,
+      async onAnchor() { entered.resolve(); await commit.promise; saved.resolve() },
+    })
+    const pending = observed.text()
+    const deadline = Promise.withResolvers<never>()
+    const timer = setTimeout(() => deadline.reject(new Error("Abort did not reach the pending reader")), 1000)
+    const failure = new Error("request aborted during persistence")
+    try {
+      await entered.promise
+      expect(released).toBe(true)
+      signal.abort(failure)
+      await expect(Promise.race([pending, deadline.promise])).rejects.toBe(failure)
+    } finally {
+      clearTimeout(timer)
+      commit.resolve()
+      await saved.promise
+      await pending.catch(() => {})
+    }
   })
 })
 

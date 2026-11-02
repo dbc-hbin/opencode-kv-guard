@@ -646,7 +646,7 @@ class PrefixAudit {
 }
 
 // src/index.ts
-import { randomUUID as randomUUID5 } from "crypto";
+import { randomUUID as randomUUID6 } from "crypto";
 
 // src/compact.ts
 var builtins = [
@@ -1075,7 +1075,10 @@ function isContextOverflow(message) {
 function overflowPromptTokens(message) {
   const match = /(\d[\d,]*) (?:tokens )?(?:in|from) the (?:input )?messages|prompt has (\d[\d,]*) tokens?|input \((\d[\d,]*) tokens\)/i.exec(message);
   const value = match?.slice(1).find((group) => group !== undefined);
-  return value === undefined ? undefined : Number(value.replaceAll(",", ""));
+  if (value === undefined)
+    return;
+  const tokens = Number(value.replaceAll(",", ""));
+  return Number.isSafeInteger(tokens) ? tokens : undefined;
 }
 async function providerError(response) {
   if (![400, 413, 422].includes(response.status))
@@ -1762,7 +1765,7 @@ Produce the historical checkpoint using only the messages at these zero-based po
 
 // src/checkpoints.ts
 import { Database as Database2 } from "bun:sqlite";
-import { randomUUID as randomUUID4 } from "crypto";
+import { randomUUID as randomUUID5 } from "crypto";
 import { constants, watch as watch2 } from "fs";
 import { chmod, lstat, mkdir, open } from "fs/promises";
 import { join as join2, resolve as resolve2 } from "path";
@@ -2216,150 +2219,26 @@ class PrefixGuard {
   }
 }
 
-// src/checkpoints.ts
-var version = 2;
-function isCheckpointSnapshot(value, session) {
-  if (!record(value))
-    return false;
-  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key)) && isModeRemindersSnapshot(value.modes, session) && isEnvironmentsSnapshot(value.environments) && isCompactionSnapshot(value.compaction) && (value.heads === undefined || isSessionHeadsSnapshot(value.heads, session)) && (value.prefixGuard === undefined || isPrefixGuardSnapshot(value.prefixGuard, session));
-}
-
-class CheckpointConflictError extends Error {
-  constructor() {
-    super("KV guard checkpoint revision conflict; reload the session before preparing another request");
-  }
-}
-
-class CheckpointStore {
-  directory;
-  constructor(root, project, scope) {
-    if (!root || !project || !scope)
-      throw new Error("Checkpoint root, project and policy scope must be nonempty");
-    this.directory = join2(resolve2(root), digest(project), digest(scope));
-  }
-  async database(session) {
-    if (!session)
-      throw new Error("Checkpoint session must be nonempty");
-    const root = resolve2(this.directory, "../..");
-    for (const directory of [root, resolve2(this.directory, ".."), this.directory]) {
-      await mkdir(directory, { recursive: true, mode: 448 });
-      const stat = await lstat(directory);
-      if (!stat.isDirectory() || stat.isSymbolicLink() || process.getuid && stat.uid !== process.getuid())
-        throw new Error("Checkpoint directory must be owned by the current user and must not be a symlink");
-      await chmod(directory, 448);
-    }
-    const path = join2(this.directory, `${digest(session)}.sqlite`);
-    const file = await open(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 384);
-    try {
-      const stat = await file.stat();
-      if (!stat.isFile() || process.getuid && stat.uid !== process.getuid())
-        throw new Error("Checkpoint file must be a regular file owned by the current user");
-      await file.chmod(384);
-    } finally {
-      await file.close();
-    }
-    const db = new Database2(path, { strict: true });
-    try {
-      db.exec("PRAGMA busy_timeout = 0; PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON");
-      db.exec("CREATE TABLE IF NOT EXISTS checkpoint (id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, version INTEGER NOT NULL, payload TEXT, deleted INTEGER NOT NULL CHECK (deleted IN (0, 1)))");
-      return db;
-    } catch (error) {
-      db.close();
-      throw error;
-    }
-  }
-  row(db) {
-    const row = db.query("SELECT revision, version, payload, deleted FROM checkpoint WHERE id = 1").get();
-    if (row && (typeof row.revision !== "string" || !uuidV4.test(row.revision) || row.deleted !== 0 && row.deleted !== 1))
-      throw new Error("KV guard checkpoint database has an invalid revision or deletion marker");
-    return row;
-  }
-  async load(session) {
-    const db = await this.database(session);
-    try {
-      const row = this.row(db);
-      if (!row)
-        return { revision: null, snapshot: null };
-      if (row.deleted)
-        return { revision: row.revision, snapshot: null, reason: "deleted" };
-      if (row.version !== version)
-        return { revision: row.revision, snapshot: null, reason: "version" };
-      let snapshot;
-      try {
-        snapshot = typeof row.payload === "string" ? JSON.parse(row.payload) : null;
-      } catch {
-        return { revision: row.revision, snapshot: null, reason: "malformed" };
-      }
-      if (!isCheckpointSnapshot(snapshot, session))
-        return { revision: row.revision, snapshot: null, reason: "malformed" };
-      return { revision: row.revision, snapshot };
-    } finally {
-      db.close();
-    }
-  }
-  async save(session, snapshot, expectedRevision) {
-    if (!isCheckpointSnapshot(snapshot, session))
-      throw new Error("KV guard refuses an invalid checkpoint snapshot");
-    const payload = JSON.stringify(snapshot);
-    const db = await this.database(session);
-    try {
-      return db.transaction(() => {
-        const row = this.row(db);
-        if (row?.deleted)
-          throw new Error("KV guard refuses to save a deleted session checkpoint");
-        if ((row?.revision ?? null) !== expectedRevision)
-          throw new CheckpointConflictError;
-        const revision = randomUUID4();
-        db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, ?, 0) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = excluded.payload, deleted = 0").run(revision, version, payload);
-        return revision;
-      }).immediate();
-    } finally {
-      db.close();
-    }
-  }
-  async delete(session, onContention) {
-    let notified = false;
-    for (;; ) {
-      const changed = Promise.withResolvers();
-      const journal = `${digest(session)}.sqlite-journal`;
-      let watcher;
-      const timer = setTimeout(changed.resolve, 250);
-      try {
-        try {
-          watcher = watch2(this.directory, (_event, filename) => {
-            if (filename === journal)
-              changed.resolve();
-          });
-          watcher.on("error", changed.resolve);
-        } catch {}
-        const db = await this.database(session);
-        try {
-          db.transaction(() => {
-            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, NULL, 1) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = NULL, deleted = 1").run(randomUUID4(), version);
-          }).immediate();
-          return;
-        } finally {
-          db.close();
-        }
-      } catch (error) {
-        if (!busy(error))
-          throw error;
-        if (!notified) {
-          notified = true;
-          onContention?.();
-        }
-        await changed.promise;
-      } finally {
-        clearTimeout(timer);
-        watcher?.close();
-      }
-    }
-  }
-}
-
 // src/usage.ts
 import { isDeepStrictEqual } from "util";
+import { randomUUID as randomUUID4 } from "crypto";
 var count = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+function isUsageSnapshot(value) {
+  if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes))
+    return false;
+  const lanes = new Set;
+  return value.lanes.every((entry) => {
+    if (!record(entry) || Object.keys(entry).some((key) => !["lane", "anchor", "receipt"].includes(key)) || !isSha256(entry.lane) || lanes.has(entry.lane))
+      return false;
+    lanes.add(entry.lane);
+    if (entry.receipt !== undefined && (typeof entry.receipt !== "string" || !uuidV4.test(entry.receipt)))
+      return false;
+    const anchor = entry.anchor;
+    if (anchor === undefined)
+      return entry.receipt !== undefined;
+    return record(anchor) && Object.keys(anchor).every((key) => ["policy", "messages", "promptTokens"].includes(key)) && isSha256(anchor.policy) && Array.isArray(anchor.messages) && anchor.messages.every(isSha256) && count(anchor.promptTokens);
+  });
+}
 function fingerprint(body) {
   const { messages, ...policy } = body;
   return { policy: digest(JSON.stringify(policy)), messages: messages.map((message) => digest(JSON.stringify(message))) };
@@ -2377,11 +2256,31 @@ function accountable(message) {
       return false;
   }
   if (message.content !== undefined && message.content !== null && typeof message.content !== "string") {
-    if (!Array.isArray(message.content) || !message.content.every((part) => record(part) && part.type === "text" && typeof part.text === "string" && Object.keys(part).every((key) => key === "type" || key === "text")))
+    if (!Array.isArray(message.content))
+      return false;
+    if (!message.content.every((part) => {
+      if (!record(part) || part.type !== "text")
+        return false;
+      if (typeof part.text !== "string")
+        return false;
+      return Object.keys(part).every((key) => key === "type" || key === "text");
+    }))
       return false;
   }
   if (message.tool_calls !== undefined) {
-    if (!Array.isArray(message.tool_calls) || !message.tool_calls.every((call) => record(call) && call.type === "function" && typeof call.id === "string" && Object.keys(call).every((key) => ["id", "type", "function"].includes(key)) && record(call.function) && typeof call.function.name === "string" && typeof call.function.arguments === "string" && Object.keys(call.function).every((key) => key === "name" || key === "arguments")))
+    if (!Array.isArray(message.tool_calls))
+      return false;
+    if (!message.tool_calls.every((call) => {
+      if (!record(call) || call.type !== "function" || typeof call.id !== "string")
+        return false;
+      if (Object.keys(call).some((key) => !["id", "type", "function"].includes(key)))
+        return false;
+      if (!record(call.function))
+        return false;
+      if (typeof call.function.name !== "string" || typeof call.function.arguments !== "string")
+        return false;
+      return Object.keys(call.function).every((key) => key === "name" || key === "arguments");
+    }))
       return false;
   }
   return true;
@@ -2391,8 +2290,58 @@ class UsageTracker {
   lanes = new Map;
   pending = new WeakMap;
   sequence = 0;
-  begin(body, lane) {
+  snapshot(lanes) {
+    return { lanes: [...lanes].sort().flatMap((lane) => {
+      const state = this.lanes.get(lane);
+      return state && (state.anchor || state.receipt) ? [{
+        lane,
+        ...state.anchor ? { anchor: structuredClone(state.anchor) } : {},
+        ...state.receipt ? { receipt: state.receipt } : {}
+      }] : [];
+    }) };
+  }
+  prepare(lane) {
+    const state = this.lanes.get(lane) ?? { latest: 0 };
+    state.receipt = randomUUID4();
+    this.lanes.set(lane, state);
+    return state.receipt;
+  }
+  publish(snapshot, receipt) {
+    for (const { lane, anchor } of snapshot.lanes) {
+      const state = this.lanes.get(lane);
+      if (state?.receipt === receipt && anchor)
+        state.anchor = structuredClone(anchor);
+    }
+  }
+  restore(snapshot, replace = []) {
+    for (const lane of replace) {
+      const state = this.lanes.get(lane);
+      if (state) {
+        delete state.anchor;
+        delete state.receipt;
+      }
+    }
+    for (const { lane, anchor, receipt } of snapshot.lanes) {
+      let state = this.lanes.get(lane);
+      if (!state) {
+        state = { latest: 0 };
+        this.lanes.set(lane, state);
+      }
+      if (anchor)
+        state.anchor = structuredClone(anchor);
+      else
+        delete state.anchor;
+      if (receipt)
+        state.receipt = receipt;
+      else
+        delete state.receipt;
+    }
+  }
+  begin(body, lane, receipt) {
+    const request = { startedAt: performance.now() };
     let state = this.lanes.get(lane);
+    if (receipt !== state?.receipt)
+      return request;
     if (!state) {
       state = { latest: 0 };
       this.lanes.set(lane, state);
@@ -2401,14 +2350,13 @@ class UsageTracker {
     if (state.anchor && !prefix(state.anchor, current))
       delete state.anchor;
     state.latest = ++this.sequence;
-    const request = { startedAt: performance.now() };
-    this.pending.set(request, { lane, state, sequence: state.latest, fingerprint: current });
+    this.pending.set(request, { lane, state, sequence: state.latest, receipt, fingerprint: current });
     return request;
   }
   record(request, body, lane, promptTokens) {
     const pending = this.pending.get(request);
     this.pending.delete(request);
-    if (!pending || !count(promptTokens) || pending.lane !== lane || this.lanes.get(lane) !== pending.state || pending.sequence !== pending.state.latest)
+    if (!pending || !count(promptTokens) || pending.lane !== lane || this.lanes.get(lane) !== pending.state || pending.sequence !== pending.state.latest || pending.receipt !== pending.state.receipt)
       return false;
     const current = fingerprint(body);
     if (!prefix(pending.fingerprint, current) || current.messages.length !== pending.fingerprint.messages.length)
@@ -2686,11 +2634,13 @@ function observeResponse(response, options) {
   });
   const json = [];
   const finish = (outcome) => {
+    if (outcome !== "complete")
+      signal?.removeEventListener("abort", abort);
     if (reported)
       return;
     reported = true;
-    signal?.removeEventListener("abort", abort);
     const anchorRecorded = outcome === "complete" && counts.promptTokens !== undefined && (counts.cachedTokens === undefined || counts.cachedTokens <= counts.promptTokens) && tracker.record(request, prompt, lane, counts.promptTokens);
+    const retained = anchorRecorded ? options.onAnchor?.() : undefined;
     const report = {
       laneFingerprint: digest(lane),
       ...options.label === undefined ? {} : { label: options.label },
@@ -2729,6 +2679,7 @@ function observeResponse(response, options) {
           Promise.resolve(options.onReport(report)).catch(() => {});
         } catch {}
       });
+    return retained;
   };
   let controller;
   const reader = response.body?.getReader();
@@ -2802,9 +2753,12 @@ function observeResponse(response, options) {
               value.enqueue(changed === undefined ? bytes : encoder.encode(changed));
           }
           const complete = terminal && !invalid && choices.size > 0 && [...choices].every((index) => finishedChoices.has(index));
+          await finish(!response.ok || invalid ? "error" : complete ? "complete" : "incomplete");
+          signal?.removeEventListener("abort", abort);
+          if (stopped)
+            return;
           stopped = true;
           value.close();
-          finish(!response.ok || invalid ? "error" : complete ? "complete" : "incomplete");
         }
       } catch (error) {
         if (stopped)
@@ -2830,6 +2784,147 @@ function observeResponse(response, options) {
   if (transform)
     headers.delete("content-length");
   return new Response(stream, { status: response.status, statusText: response.statusText, headers });
+}
+
+// src/checkpoints.ts
+var version = 2;
+function isCheckpointSnapshot(value, session) {
+  if (!record(value))
+    return false;
+  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard", "usage"].includes(key)) && isModeRemindersSnapshot(value.modes, session) && isEnvironmentsSnapshot(value.environments) && isCompactionSnapshot(value.compaction) && (value.heads === undefined || isSessionHeadsSnapshot(value.heads, session)) && (value.prefixGuard === undefined || isPrefixGuardSnapshot(value.prefixGuard, session)) && (value.usage === undefined || isUsageSnapshot(value.usage));
+}
+
+class CheckpointConflictError extends Error {
+  constructor() {
+    super("KV guard checkpoint revision conflict; reload the session before preparing another request");
+  }
+}
+
+class CheckpointStore {
+  directory;
+  constructor(root, project, scope) {
+    if (!root || !project || !scope)
+      throw new Error("Checkpoint root, project and policy scope must be nonempty");
+    this.directory = join2(resolve2(root), digest(project), digest(scope));
+  }
+  async database(session) {
+    if (!session)
+      throw new Error("Checkpoint session must be nonempty");
+    const root = resolve2(this.directory, "../..");
+    for (const directory of [root, resolve2(this.directory, ".."), this.directory]) {
+      await mkdir(directory, { recursive: true, mode: 448 });
+      const stat = await lstat(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || process.getuid && stat.uid !== process.getuid())
+        throw new Error("Checkpoint directory must be owned by the current user and must not be a symlink");
+      await chmod(directory, 448);
+    }
+    const path = join2(this.directory, `${digest(session)}.sqlite`);
+    const file = await open(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 384);
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || process.getuid && stat.uid !== process.getuid())
+        throw new Error("Checkpoint file must be a regular file owned by the current user");
+      await file.chmod(384);
+    } finally {
+      await file.close();
+    }
+    const db = new Database2(path, { strict: true });
+    try {
+      db.exec("PRAGMA busy_timeout = 0; PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON");
+      db.exec("CREATE TABLE IF NOT EXISTS checkpoint (id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, version INTEGER NOT NULL, payload TEXT, deleted INTEGER NOT NULL CHECK (deleted IN (0, 1)))");
+      return db;
+    } catch (error) {
+      db.close();
+      throw error;
+    }
+  }
+  row(db) {
+    const row = db.query("SELECT revision, version, payload, deleted FROM checkpoint WHERE id = 1").get();
+    if (row && (typeof row.revision !== "string" || !uuidV4.test(row.revision) || row.deleted !== 0 && row.deleted !== 1))
+      throw new Error("KV guard checkpoint database has an invalid revision or deletion marker");
+    return row;
+  }
+  async load(session) {
+    const db = await this.database(session);
+    try {
+      const row = this.row(db);
+      if (!row)
+        return { revision: null, snapshot: null };
+      if (row.deleted)
+        return { revision: row.revision, snapshot: null, reason: "deleted" };
+      if (row.version !== version)
+        return { revision: row.revision, snapshot: null, reason: "version" };
+      let snapshot;
+      try {
+        snapshot = typeof row.payload === "string" ? JSON.parse(row.payload) : null;
+      } catch {
+        return { revision: row.revision, snapshot: null, reason: "malformed" };
+      }
+      if (!isCheckpointSnapshot(snapshot, session))
+        return { revision: row.revision, snapshot: null, reason: "malformed" };
+      return { revision: row.revision, snapshot };
+    } finally {
+      db.close();
+    }
+  }
+  async save(session, snapshot, expectedRevision) {
+    if (!isCheckpointSnapshot(snapshot, session))
+      throw new Error("KV guard refuses an invalid checkpoint snapshot");
+    const payload = JSON.stringify(snapshot);
+    const db = await this.database(session);
+    try {
+      return db.transaction(() => {
+        const row = this.row(db);
+        if (row?.deleted)
+          throw new Error("KV guard refuses to save a deleted session checkpoint");
+        if ((row?.revision ?? null) !== expectedRevision)
+          throw new CheckpointConflictError;
+        const revision = randomUUID5();
+        db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, ?, 0) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = excluded.payload, deleted = 0").run(revision, version, payload);
+        return revision;
+      }).immediate();
+    } finally {
+      db.close();
+    }
+  }
+  async delete(session, onContention) {
+    let notified = false;
+    for (;; ) {
+      const changed = Promise.withResolvers();
+      const journal = `${digest(session)}.sqlite-journal`;
+      let watcher;
+      const timer = setTimeout(changed.resolve, 250);
+      try {
+        try {
+          watcher = watch2(this.directory, (_event, filename) => {
+            if (filename === journal)
+              changed.resolve();
+          });
+          watcher.on("error", changed.resolve);
+        } catch {}
+        const db = await this.database(session);
+        try {
+          db.transaction(() => {
+            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, NULL, 1) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = NULL, deleted = 1").run(randomUUID5(), version);
+          }).immediate();
+          return;
+        } finally {
+          db.close();
+        }
+      } catch (error) {
+        if (!busy(error))
+          throw error;
+        if (!notified) {
+          notified = true;
+          onContention?.();
+        }
+        await changed.promise;
+      } finally {
+        clearTimeout(timer);
+        watcher?.close();
+      }
+    }
+  }
 }
 
 // src/glm.ts
@@ -3504,7 +3599,7 @@ var plugin = async ({ client, project, directory, worktree }, options = {}) => {
   const deleted = new Set;
   const lastExchanges = new Map;
   const nativeCompactions = new Set;
-  const manualMarker = `\x1Ekv-guard-compact:${randomUUID5()}:`;
+  const manualMarker = `\x1Ekv-guard-compact:${randomUUID6()}:`;
   const manualPattern = new RegExp(`${manualMarker}([a-f0-9-]{36})\x1F`);
   const manualPending = new Map;
   const manualCompactions = new Map;
@@ -3639,6 +3734,11 @@ The previous response stopped at the output token limit before finishing. Contin
         if (!await compaction.restore(session, snapshot.compaction) || !reminders.restore(session, snapshot.modes) || !environments.restore(session, snapshot.environments) || !heads.restore(session, snapshot.heads ?? { version: 1, session, lanes: [] }) || !prefixGuard.restore(session, snapshot.prefixGuard ?? { version: 1, session, lanes: [] })) {
           throw new Error("KV guard: checkpoint cannot be restored during concurrent state changes");
         }
+        const lanes = sessionLanes.get(session) ?? new Set;
+        usage.restore(snapshot.usage ?? { lanes: [] }, lanes);
+        for (const { lane } of snapshot.usage?.lanes ?? [])
+          lanes.add(lane);
+        sessionLanes.set(session, lanes);
         if (loaded.reason)
           await log("Checkpoint cache miss", { reason: loaded.reason });
       }
@@ -3649,7 +3749,7 @@ The previous response stopped at the output token limit before finishing. Contin
         if (deleted.has(session))
           throw new Error("KV guard: session was deleted during preparation");
         if (store && loaded) {
-          const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) };
+          const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session), usage: usage.snapshot(sessionLanes.get(session) ?? []) };
           if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty))
             await store.save(session, snapshot, loaded.revision);
         }
@@ -3830,6 +3930,7 @@ The previous response stopped at the output token limit before finishing. Contin
               await log("Skill catalog compression", { ...compacted.report });
           }
           let replayReceipt;
+          let usageReceipt;
           const sendSummary = async (outgoing, attempt = (body) => send(body, "summary")) => {
             if (outgoing.tool_choice !== "none")
               return attempt(outgoing);
@@ -3852,7 +3953,8 @@ The previous response stopped at the output token limit before finishing. Contin
             if (session && agent && label === "main" && !internalAgents.includes(agent))
               lastExchanges.delete(session);
             const requestLane = label === "summary" ? `${lane}:summary` : lane;
-            const ticket = usage.begin(outgoing, requestLane);
+            const receipt = usageReceipt;
+            const ticket = usage.begin(outgoing, requestLane, label === "main" ? receipt : undefined);
             let admissionWaitMs = 0;
             const gate = {
               async acquire(waitSignal) {
@@ -3871,6 +3973,10 @@ The previous response stopped at the output token limit before finishing. Contin
               signal: requestSignal,
               label,
               transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
+              onAnchor: store && session && receipt && label === "main" && options.usageAccounting !== false ? () => {
+                const completed = usage.snapshot([lane]);
+                return checkpoint(session, () => usage.publish(completed, receipt), true).catch(() => log("Usage checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}));
+              } : undefined,
               onAssistant: session && agent && label === "main" && (options.prefixGuard !== false || manualHandoff && !internalAgents.includes(agent)) ? (assistant) => {
                 if (manualHandoff && !internalAgents.includes(agent) && expectedUser)
                   lastExchanges.set(session, { target: target.id, headScope, lane, userID: expectedUser, body: outgoing, assistant });
@@ -4102,6 +4208,8 @@ ${instructions}`
               replayReceipt = guarded.report.receipt;
               await log("Prefix guard comparison", { ...guarded.report });
             }
+            if (store && session && agent && options.usageAccounting !== false)
+              usageReceipt = usage.prepare(lane);
           };
           const incoming = { ...body, messages: [...body.messages] };
           const observePrefix = async () => {
@@ -4156,7 +4264,7 @@ ${instructions}`
       const part = output.parts.find((part) => part.type === "text");
       if (part?.type !== "text")
         return;
-      const nonce = randomUUID5();
+      const nonce = randomUUID6();
       part.text = manualMarker + nonce + "\x1F" + part.text;
       manualPending.set(nonce, input.sessionID);
     },

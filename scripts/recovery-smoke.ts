@@ -15,6 +15,7 @@ const providerID = "opencode-fixture"
 const limit = { context: 32768, output: 512 }
 const requests: Wire[] = []
 let overflowArmed = false
+let invalidOverflowArmed = false
 let handoffOverflowArmed = false
 let truncateNext = 0
 const proxy = Bun.serve({
@@ -31,6 +32,10 @@ const proxy = Bun.serve({
     // Usage follows the plugin's own bytes/4 estimate, so only the overflow
     // report below disagrees with it.
     const tokens = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 4)
+    if (invalidOverflowArmed) {
+      invalidOverflowArmed = false
+      return Response.json({ error: { message: `prompt has ${"9".repeat(400)} tokens, but the configured context size is ${limit.context} tokens` } }, { status: 400 })
+    }
     if (overflowArmed) {
       overflowArmed = false
       // vLLM's wording; the server's tokenizer counts more than the estimate.
@@ -83,6 +88,14 @@ try {
     assert.ok(JSON.stringify(resent[1]!.messages).includes("RECOVERY_SUMMARY_MARKER"))
     assert.ok(JSON.stringify(resent[1]!.messages).includes("OVERFLOW_TURN"))
 
+    invalidOverflowArmed = true
+    const beforeInvalid = requests.length
+    const invalidAnswer = await prompt("INVALID_OVERFLOW_TURN")
+    assert.equal(invalidAnswer.data?.info.error, undefined, JSON.stringify(invalidAnswer.data?.info.error))
+    const invalidRecovery = requests.slice(beforeInvalid).filter((request) => request.stream !== false)
+    assert.equal(invalidRecovery.length, 2, "an unsafe token count must still allow one overflow recovery")
+    assert.ok(JSON.stringify(invalidRecovery[1]!.messages).includes("INVALID_OVERFLOW_TURN"))
+
     // 1b. The rolling summary handoff itself overflows before the main
     // request is sent. Recovery must fold without the prefix and send once.
     // Usage stays at bytes/4, so the next turn crosses the trigger again only
@@ -129,7 +142,7 @@ try {
     await warned
     const capRequests = 4
     assert.equal(mainRequests() - beforeCap, capRequests, "the original response plus three continuations")
-    return { version: "1.19.4", overflowSummaryRequests: summaries.length, overflowMainRequests: resent.length, handoffOverflowTurn: handoffTurn, truncatedContinuations: afterTruncated.length - 1, cappedContinuations: capRequests - 1 }
+    return { version: "1.19.4", overflowSummaryRequests: summaries.length, overflowMainRequests: resent.length, invalidOverflowMainRequests: invalidRecovery.length, handoffOverflowTurn: handoffTurn, truncatedContinuations: afterTruncated.length - 1, cappedContinuations: capRequests - 1 }
   })(), deadline.promise])
   console.log(JSON.stringify(result, null, 2))
 } finally {

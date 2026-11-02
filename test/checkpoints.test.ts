@@ -18,6 +18,79 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const empty = (): CheckpointSnapshot => ({ modes: { messages: [] }, environments: { lanes: [] }, compaction: { lanes: [] } })
 
 test.each([
+  { prefixGuard: true, stale: false }, { prefixGuard: false, stale: false },
+  { prefixGuard: true, stale: true }, { prefixGuard: false, stale: true },
+])("resumed Korean history keeps newest measured usage (prefixGuard=$prefixGuard, stale=$stale)", async ({ prefixGuard, stale }) => {
+  const stateDirectory = await root()
+  const sent: ChatBody[] = []
+  const entered = Promise.withResolvers<void>()
+  const delayed = Promise.withResolvers<Response>()
+  const start = async () => {
+    const hooks = await plugin({ directory: "/usage-resume", worktree: "/usage-resume" } as PluginInput, {
+      providers: ["proxy"], stateDirectory, crossProcess: false, maxConcurrent: 2, prefixGuard, prefixHandoff: false,
+    })
+    const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
+      baseURL: "http://usage-resume.test/v1",
+      fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body: ChatBody = JSON.parse(String(init?.body))
+        sent.push(body)
+        if (stale && sent.length === 1) { entered.resolve(); return delayed.promise }
+        return Response.json({ choices: [{ index: 0, message: { role: "assistant", content: "Answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 16_500 } })
+      },
+    } } } }
+    await hooks.config!(config)
+    return {
+      hooks,
+      async send(messages: WireMessage[], id: string) {
+        const last = messages.at(-1)
+        if (typeof last?.content !== "string") throw new Error("Expected user text")
+        const transformed = { messages: [user(id, last.content)] }
+        await hooks["experimental.chat.messages.transform"]!({}, transformed)
+        const part = transformed.messages[0]?.parts[0]
+        if (part?.type !== "text") throw new Error("Expected marked user text")
+        const response = await config.provider.proxy.options.fetch("http://usage-resume.test/v1/chat/completions", {
+          method: "POST", headers: {
+            "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build",
+            "x-opencode-kv-guard-user": id, "x-opencode-kv-guard-limits": JSON.stringify({ context: 20_000 }),
+          },
+          body: JSON.stringify({ model: "fixture", messages: [...messages.slice(0, -1), { role: "user", content: part.text }], max_tokens: 1000, stream: true }),
+        })
+        await response.text()
+      },
+    }
+  }
+  let history: WireMessage[] = [
+    { role: "system", content: "Policy" },
+    { role: "user", content: "한국어".repeat(1000) },
+    { role: "assistant", content: "분석결과".repeat(1000) },
+    { role: "user", content: "계속" },
+  ]
+  const first = await start()
+  const pending = first.send(history, "one")
+  if (stale) {
+    await entered.promise
+    const concurrent = await start()
+    history = [...history, { role: "assistant", content: "Answer" }, { role: "user", content: "새로운 기록".repeat(1000) }]
+    try { await concurrent.send(history, "two") } finally {
+      delayed.resolve(Response.json({ choices: [{ index: 0, message: { role: "assistant", content: "Answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 500 } }))
+      await pending
+      await concurrent.hooks.dispose!()
+    }
+  }
+  await pending
+  await first.hooks.dispose!()
+  expect(sent.map((body) => body.stream)).toEqual(stale ? [true, true] : [true])
+  const beforeResume = sent.length
+  const resumed = await start()
+  try {
+    await resumed.send([...history, { role: "assistant", content: "Answer" }, { role: "user", content: "이어서" }], "three")
+    expect(sent[beforeResume]?.stream).toBe(false)
+    expect(sent.at(-1)?.stream).toBe(true)
+    expect(sent.at(-1)?.messages.some((message) => message.content === history[1]?.content)).toBe(false)
+  } finally { await resumed.hooks.dispose!() }
+})
+
+test.each([
   { label: "unchanged configuration", before: {}, after: {} },
   {
     label: "reordered configuration",
@@ -597,6 +670,18 @@ describe("filesystem checkpoint CAS", () => {
     const broken = new Database(path(directory))
     try { broken.query("UPDATE checkpoint SET payload = ? WHERE id = 1").run("{") } finally { broken.close() }
     expect(await store.load("session")).toMatchObject({ revision: malformed.revision, snapshot: null, reason: "malformed" })
+    const entry = { lane: hash("lane"), anchor: { policy: hash("policy"), messages: [hash("message")], promptTokens: 16500 } }
+    for (const usage of [
+      { lanes: [{ ...entry, anchor: { ...entry.anchor, promptTokens: -1 } }] },
+      { lanes: [{ ...entry, anchor: { ...entry.anchor, messages: ["not-a-hash"] } }] },
+      { lanes: [{ ...entry, receipt: "invalid-generation" }] },
+      { lanes: [{ lane: entry.lane }] },
+      { lanes: [entry, entry] },
+    ]) {
+      const invalid = new Database(path(directory))
+      try { invalid.query("UPDATE checkpoint SET payload = ? WHERE id = 1").run(JSON.stringify({ ...empty(), usage })) } finally { invalid.close() }
+      expect(await store.load("session")).toMatchObject({ revision: malformed.revision, snapshot: null, reason: "malformed" })
+    }
     await store.save("session", empty(), malformed.revision)
     const newer = new Database(path(directory))
     try { newer.exec("UPDATE checkpoint SET version = 999 WHERE id = 1") } finally { newer.close() }

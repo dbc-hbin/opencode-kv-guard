@@ -1609,6 +1609,10 @@ describe("provider overflow errors", () => {
     ["prompt has 12,345 tokens, but the configured context size is 8,192 tokens", 12345],
     ["input (9001 tokens) is longer than the model's context length (8192 tokens)", 9001],
     ["1,024 tokens from the input messages exceed the limit", 1024],
+    ["prompt has 0 tokens", 0],
+    [`prompt has ${Number.MAX_SAFE_INTEGER} tokens`, Number.MAX_SAFE_INTEGER],
+    [`prompt has ${BigInt(Number.MAX_SAFE_INTEGER) + 2n} tokens`, undefined],
+    [`prompt has ${"9".repeat(400)} tokens`, undefined],
     ["prompt is too long", undefined],
   ])("overflowPromptTokens(%j) is %p", (message, tokens) => {
     expect(overflowPromptTokens(message)).toBe(tokens)

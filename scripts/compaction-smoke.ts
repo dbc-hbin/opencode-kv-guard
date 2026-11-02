@@ -105,7 +105,7 @@ try {
     let restartAfter: number | undefined
     let summariesAtRestart = 0
     for (let turn = 0; turn < turns; turn++) {
-      const text = `USER_TURN_${turn}: retain the current instruction.\n` + `detail_${turn} `.repeat(1500)
+      const text = `USER_TURN_${turn}: retain the current instruction.\n` + (turn === 0 ? "한국어 기록 " : `detail_${turn} `).repeat(1500)
       const response = await client.session.prompt({ path: { id: sessionID }, body: { model: { providerID, modelID: "fixture" }, parts: [{ type: "text", text }] } })
       assert.ok(response.data, JSON.stringify(response.error))
       assert.equal(response.data.info.error, undefined, JSON.stringify(response.data.info.error))
@@ -114,7 +114,16 @@ try {
         const first = requests[0]!
         const withoutCompaction = { ...first, messages: [...first.messages, { role: "assistant", content: answers[0] }, { role: "user", content: text }] }
         assert.ok(Math.ceil(Buffer.byteLength(JSON.stringify(withoutCompaction)) / 4) < Math.floor((limit.context - limit.output) * triggerRatio), "the byte estimate alone must not trigger this compaction")
-        assert.ok(summaries > 0, "reported usage must trigger compaction by the second user turn")
+        assert.ok(summaries > 0, "persisted usage must trigger compaction on the first resumed user turn")
+      }
+      if (turn === 0) {
+        // Resume immediately after the response, without a disposal hook, before
+        // any summary exists. Bytes/4 alone stays below the trigger.
+        runtime.child.kill()
+        await runtime.child.exited
+        runtime = await launch()
+        client = runtime.client
+        await watchToasts(client)
       }
       if (restartAfter !== undefined && turn === restartAfter + 1) {
         assert.equal(summaries, summariesAtRestart, "a fresh OpenCode process must reuse the completed checkpoint without resummarizing")
@@ -167,7 +176,7 @@ try {
     for (let index = 0; index < main.length; index++) {
       assert.ok(JSON.stringify(main[index]!.messages).includes(`USER_TURN_${index}: retain the current instruction.`), "current instruction must not be summarized away")
     }
-    return { version: "1.19.4", mainRequests: normal, summaryRequests: summaries, prefixSharingHandoffs: handoffs.length, usageTriggeredEarlyCompaction: true, perTurnRequestIDsPreserved: new Set(requestIDs).size, restartAfterTurn: restartAfter, checkpointReusedAcrossProcess: true, requestsWithSummary: compacted.length, requestsReusingSummaryWithoutNewInference: reuses, wireMessageChars: lengths, originalUserTurnsPreserved: turns, compactionToasts: compactingToasts.length }
+    return { version: "1.19.4", mainRequests: normal, summaryRequests: summaries, prefixSharingHandoffs: handoffs.length, usageTriggeredEarlyCompaction: true, usageRestoredAcrossProcess: true, perTurnRequestIDsPreserved: new Set(requestIDs).size, restartAfterTurn: restartAfter, checkpointReusedAcrossProcess: true, requestsWithSummary: compacted.length, requestsReusingSummaryWithoutNewInference: reuses, wireMessageChars: lengths, originalUserTurnsPreserved: turns, compactionToasts: compactingToasts.length }
   })(), deadline.promise])
   console.log(JSON.stringify(result, null, 2))
 } finally {

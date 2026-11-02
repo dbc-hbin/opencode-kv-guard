@@ -7,18 +7,20 @@ import { isCompactionSnapshot, type CompactionSnapshot } from "./compaction"
 import { isEnvironmentsSnapshot, isModeRemindersSnapshot, type EnvironmentsSnapshot, type ModeRemindersSnapshot } from "./prefix"
 import { isSessionHeadsSnapshot, isPrefixGuardSnapshot, type SessionHeadsSnapshot, type PrefixGuardSnapshot } from "./heads"
 import { busy, digest as hash, record, uuidV4 } from "./shared"
+import { isUsageSnapshot, type UsageSnapshot } from "./usage"
 
-export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot; heads?: SessionHeadsSnapshot; prefixGuard?: PrefixGuardSnapshot }
+export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot; heads?: SessionHeadsSnapshot; prefixGuard?: PrefixGuardSnapshot; usage?: UsageSnapshot }
 type CheckpointLoad = { revision: string | null; snapshot: CheckpointSnapshot | null; reason?: "malformed" | "version" | "deleted" }
 type Row = { revision: string; version: number; payload: string | null; deleted: number }
 const version = 2
 
 export function isCheckpointSnapshot(value: unknown, session: string): value is CheckpointSnapshot {
   if (!record(value)) return false
-  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard"].includes(key))
+  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard", "usage"].includes(key))
     && isModeRemindersSnapshot(value.modes, session) && isEnvironmentsSnapshot(value.environments) && isCompactionSnapshot(value.compaction)
     && (value.heads === undefined || isSessionHeadsSnapshot(value.heads, session))
     && (value.prefixGuard === undefined || isPrefixGuardSnapshot(value.prefixGuard, session))
+    && (value.usage === undefined || isUsageSnapshot(value.usage))
 }
 
 export class CheckpointConflictError extends Error {

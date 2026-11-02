@@ -217,6 +217,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         if (!await compaction.restore(session, snapshot.compaction) || !reminders.restore(session, snapshot.modes) || !environments.restore(session, snapshot.environments) || !heads.restore(session, snapshot.heads ?? { version: 1, session, lanes: [] }) || !prefixGuard.restore(session, snapshot.prefixGuard ?? { version: 1, session, lanes: [] })) {
           throw new Error("KV guard: checkpoint cannot be restored during concurrent state changes")
         }
+        const lanes = sessionLanes.get(session) ?? new Set<string>()
+        usage.restore(snapshot.usage ?? { lanes: [] }, lanes)
+        for (const { lane } of snapshot.usage?.lanes ?? []) lanes.add(lane)
+        sessionLanes.set(session, lanes)
         if (loaded.reason) await log("Checkpoint cache miss", { reason: loaded.reason })
       }
       const result = await action()
@@ -224,7 +228,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
         if (!completedResponse) disposed.signal.throwIfAborted()
         if (deleted.has(session)) throw new Error("KV guard: session was deleted during preparation")
         if (store && loaded) {
-          const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session) }
+          const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session), usage: usage.snapshot(sessionLanes.get(session) ?? []) }
           if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty)) await store.save(session, snapshot, loaded.revision)
         }
         return result
@@ -390,6 +394,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             if (compacted.report) await log("Skill catalog compression", { ...compacted.report })
           }
           let replayReceipt: string | undefined
+          let usageReceipt: string | undefined
           // Summary handoffs keep the cached tools and ask for no tool calls.
           // A server that rejects tool_choice "none" (other than as overflow)
           // gets "auto" plus the summary instruction, and is remembered so
@@ -412,7 +417,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           const send = async (outgoing: ChatBody, label: "main" | "summary", requestSignal = signal) => {
             if (session && agent && label === "main" && !internalAgents.includes(agent)) lastExchanges.delete(session)
             const requestLane = label === "summary" ? `${lane}:summary` : lane
-            const ticket = usage.begin(outgoing, requestLane)
+            const receipt = usageReceipt
+            const ticket = usage.begin(outgoing, requestLane, label === "main" ? receipt : undefined)
             let admissionWaitMs = 0
             const gate: AdmissionGate = {
               async acquire(waitSignal) {
@@ -426,6 +432,13 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             return observeResponse(response, {
               body: outgoing, lane: requestLane, tracker: usage, request: ticket, signal: requestSignal, label,
               transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
+              onAnchor: store && session && receipt && label === "main" && options.usageAccounting !== false ? () => {
+                // Capture before checkpoint reload can replace the live anchor.
+                // The same session queue drains these writes on disposal.
+                const completed = usage.snapshot([lane])
+                return checkpoint(session, () => usage.publish(completed, receipt), true)
+                  .catch(() => log("Usage checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}))
+              } : undefined,
               onAssistant: session && agent && label === "main" && (options.prefixGuard !== false || manualHandoff && !internalAgents.includes(agent)) ? (assistant) => {
                 if (manualHandoff && !internalAgents.includes(agent) && expectedUser) lastExchanges.set(session, { target: target.id, headScope, lane, userID: expectedUser, body: outgoing, assistant })
                 if (options.prefixGuard === false) return
@@ -638,6 +651,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               replayReceipt = guarded.report.receipt
               await log("Prefix guard comparison", { ...guarded.report })
             }
+            if (store && session && agent && options.usageAccounting !== false) usageReceipt = usage.prepare(lane)
           }
           // Preparation rewrites the body and splices its messages; keep the
           // incoming list so an overflow retry prepares the same history again.

@@ -381,7 +381,9 @@ function isContextOverflow(message: string) {
 export function overflowPromptTokens(message: string) {
   const match = /(\d[\d,]*) (?:tokens )?(?:in|from) the (?:input )?messages|prompt has (\d[\d,]*) tokens?|input \((\d[\d,]*) tokens\)/i.exec(message)
   const value = match?.slice(1).find((group) => group !== undefined)
-  return value === undefined ? undefined : Number(value.replaceAll(",", ""))
+  if (value === undefined) return undefined
+  const tokens = Number(value.replaceAll(",", ""))
+  return Number.isSafeInteger(tokens) ? tokens : undefined
 }
 
 // A provider error response read once. `response()` rebuilds it unchanged.
