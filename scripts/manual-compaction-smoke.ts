@@ -8,6 +8,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import { fixtureEnv, sse, startServer, type Wire } from "./fixture"
+import { handoffPrompt, summarizationSystem } from "../src/compaction-prompts"
 
 const home = await realpath(await mkdtemp(join(tmpdir(), "opencode-manual-compaction-")))
 const providerID = "opencode-fixture"
@@ -23,8 +24,7 @@ const proxy = Bun.serve({
     requests.push(body)
     // The plugin's handoff is the only non-streaming request in this scenario.
     if (body.stream === false) return Response.json({ id: "handoff", object: "chat.completion", created: 1, model: "fixture", choices: [{ index: 0, message: { role: "assistant", content: handoffSummary }, finish_reason: "stop" }], usage: { prompt_tokens: 900, completion_tokens: 20, total_tokens: 920, prompt_tokens_details: { cached_tokens: 800 } } })
-    const last = JSON.stringify(body.messages.at(-1)?.content ?? "")
-    if (last.includes("Here is the conversation so far")) return sse(nativeSummary, "stop")
+    if (body.messages[0]?.content === summarizationSystem) return sse(nativeSummary, "stop")
     // Report a prompt size proportional to the request, so usage-anchored
     // budgeting sees realistic counts.
     return sse(`Answer ${requests.length}.`, "stop", Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 4))
@@ -60,9 +60,8 @@ try {
     assert.deepEqual(handoff.tools, lastMain.tools, "handoff must keep the cached tool catalog")
     const instruction = String(handoff.messages.at(-1)?.content)
     assert.ok(!instruction.includes("Here is the conversation so far") && !instruction.includes("[User]: USER_TURN_0"), "the serialized transcript must be replaced by the cached prefix")
-    assert.ok(instruction.includes("Create a new anchored summary"), "native summary instructions must be preserved")
-    const nativePrompt = "Here is the conversation so far"
-    assert.ok(!requests.slice(mainCount).some((request) => request.stream !== false && JSON.stringify(request.messages.at(-1)?.content).includes(nativePrompt)), "the native compaction request must not reach the provider")
+    assert.equal(instruction, handoffPrompt(false), "native /compact must ship the OMP handoff template")
+    assert.ok(!requests.slice(mainCount).some((request) => request.messages[0]?.content === summarizationSystem), "a successful handoff must not dispatch a separate soft summary")
 
     const stored = (await client.session.messages({ path: { id: sessionID } })).data!
     const summaryMessage = stored.findLast((message) => message.info.role === "assistant" && message.info.summary)
@@ -76,7 +75,7 @@ try {
     await client.session.summarize({ path: { id: sessionID }, body: { providerID, modelID: "fixture" } })
     const second = requests.slice(beforeSecond)
     assert.ok(second.every((request) => request.stream !== false), "a stale exchange must not produce a handoff")
-    assert.ok(second.some((request) => JSON.stringify(request.messages.at(-1)?.content).includes(nativePrompt)), "fallback must send the unchanged native compaction request")
+    assert.ok(second.some((request) => request.messages[0]?.content === summarizationSystem && String(request.messages.at(-1)?.content).includes("<previous-summary>\n" + handoffSummary)), "fallback must use OMP soft summary with prior state")
     const after = (await client.session.messages({ path: { id: sessionID } })).data!
     assert.ok(after.some((message) => message.parts.some((part) => part.type === "text" && part.text.includes("NATIVE_SUMMARY_MARKER"))), "native fallback summary must be stored")
 
@@ -96,7 +95,7 @@ try {
     assert.ok(summaries.length > 0, "/kv-compact must make a rolling summary request")
     const main = rolling.findLast((request) => request.stream !== false)!
     const wire = JSON.stringify(main.messages)
-    assert.ok(wire.includes("Historical conversation summary") && wire.includes("HANDOFF_SUMMARY_MARKER"), "the command turn must carry the rolling summary")
+    assert.ok(wire.includes("<summary>") && wire.includes("HANDOFF_SUMMARY_MARKER"), "the command turn must carry the rolling summary")
     assert.ok(!wire.includes("USER_TURN_3"), "older turns must be folded on the wire")
     assert.ok(String(main.messages.at(-1)?.content).includes("compacted on request"), "the command prompt must be the current instruction")
     assert.ok(!wire.includes("kv-guard-compact"), "the command correlation nonce must not reach the provider")

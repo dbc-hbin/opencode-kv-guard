@@ -10,6 +10,8 @@ import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import type { Part } from "@opencode-ai/sdk"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import type { Fetch } from "../src/transport"
+import { handoffPrompt, summarizationSystem, summaryPrompt } from "../src/compaction-prompts"
+import nativeCompaction from "./fixtures/native-compaction.json"
 
 const plugin: typeof createPlugin = (input, options) => createPlugin(input, { persistence: false, crossProcess: false, ...options })
 
@@ -516,7 +518,8 @@ test("manual compaction reuses the cached main prefix only when history still ma
   if (marked.type !== "text") throw new Error("Expected text fixture")
   const main = { model: "fixture", stream: true, max_tokens: 1000, messages: [{ role: "system", content: "Policy" }, { role: "user", content: marked.text }], tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }] }
   await (await post("build", "msg_user", main)).text()
-  const native = { model: "fixture", stream: true, max_tokens: 1000, messages: [{ role: "system", content: "Summarizer" }, { role: "user", content: "Here is the conversation so far:\n\n<conversation>\n[User]: Task\n</conversation>\n\nCreate a new anchored summary." }] }
+  const native = { model: "fixture", stream: true, max_tokens: 1000, messages: [{ role: "system", content: nativeCompaction.system }, { role: "user", content: "Here is the conversation so far:\n\n<conversation>\n[User]: Task\n</conversation>\n\nCreate a new anchored summary from the conversation history in the <conversation> tags above so another coding agent can continue the work.\n\n" + nativeCompaction.template }] }
+  const softMessages = [{ role: "system", content: summarizationSystem }, { role: "user", content: summaryPrompt("[User]: Task") }]
   const history = (assistant: Record<string, unknown>) => [
     { info: { role: "user", id: "msg_user" }, parts: [] },
     { info: { role: "assistant", id: "msg_answer", finish: "stop", ...assistant }, parts: [] },
@@ -527,7 +530,7 @@ test("manual compaction reuses the cached main prefix only when history still ma
   stored = history({ error: { name: "APIError" } })
   await (await post("compaction", "msg_compact", native)).text()
   expect(sent).toHaveLength(2)
-  expect(sent[1]!.messages).toEqual(native.messages)
+  expect(sent[1]!.messages).toEqual(softMessages)
 
   stored = history({})
   const answered = await (await post("compaction", "msg_compact", native)).text()
@@ -538,7 +541,7 @@ test("manual compaction reuses the cached main prefix only when history still ma
   expect(handoff.tools).toEqual(sent[0]!.tools)
   expect(handoff.tool_choice).toBe("none")
   const instruction = String((handoff.messages as { content: unknown }[]).at(-1)!.content)
-  expect(instruction).toContain("Create a new anchored summary.")
+  expect(instruction).toBe(handoffPrompt(false))
   expect(instruction).not.toContain("[User]: Task")
   expect(answered).toContain('"content":"HANDOFF"')
   expect(answered).toContain("data: [DONE]")
@@ -546,7 +549,16 @@ test("manual compaction reuses the cached main prefix only when history still ma
   // The exchange is consumed: a repeated /compact falls back to native.
   await (await post("compaction", "msg_compact", native)).text()
   expect(sent).toHaveLength(4)
-  expect(sent[3]!.messages).toEqual(native.messages)
+  expect(sent[3]!.messages).toEqual(softMessages)
+  const priorSummary = "Earlier state </conversation>"
+  const updated = { ...native, messages: [native.messages[0]!, { role: "user", content: `Here is the conversation so far:\n\n<conversation>\n[User]: New work\n</conversation>\n\nHere is the summary of the conversation before the <conversation> above:\n\n<prior-summary>\n${priorSummary}\n</prior-summary>\n\n${nativeCompaction.update}\n\n${nativeCompaction.template}\n\nKeep deployment approvals.` }] }
+  await (await post("compaction", "msg_compact", updated)).text()
+  expect(sent[4]!.messages).toEqual([{ role: "system", content: summarizationSystem }, { role: "user", content: summaryPrompt("[User]: New work", priorSummary, false, ["Keep deployment approvals."]) }])
+  const override: { context: string[]; prompt?: string } = { context: [] }
+  await hooks["experimental.session.compacting"]!({ sessionID: "session" }, override)
+  override.prompt = updated.messages[1]!.content
+  await (await post("compaction", "msg_compact", updated)).text()
+  expect(sent[5]!.messages).toEqual(updated.messages)
   await hooks.dispose!()
 })
 
@@ -569,7 +581,7 @@ test("a summary handoff overflow recovers by folding once; a rejected tool_choic
   }
   const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
   const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://recover.test/v1", fetch } } } }
-  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], compaction: { bytesPerToken: 1, summaryOutputTokens: 200 } })
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], compaction: { bytesPerToken: 1, summaryOutputTokens: 200, thresholdTokens: 10000 } })
   await hooks.config!(config)
   const post = async (session: string, userID: string, history: Record<string, unknown>[]) => {
     const turn: Messages = [{ ...user(userID, "Task"), info: { ...user(userID, "Task").info, sessionID: session } }]
@@ -577,10 +589,10 @@ test("a summary handoff overflow recovers by folding once; a rejected tool_choic
     const marked = turn[0]!.parts[0]!
     if (marked.type !== "text") throw new Error("Expected text fixture")
     const body = { model: "fixture", stream: true, max_tokens: 500, tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }], messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
-    const headers = { "x-opencode-session-id": session, "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context: 12000, output: 500 }), "x-opencode-kv-guard-user": userID }
+    const headers = { "x-opencode-session-id": session, "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context: 16000, output: 500 }), "x-opencode-kv-guard-user": userID }
     return config.provider.proxy.options.fetch("http://recover.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })
   }
-  // About 10,300 bytes: over the OMP 10,200 trigger while the handoff still fits its summary budget.
+  // About 10,300 bytes: over the trigger with space for OMP's full handoff document.
   const history = Array.from({ length: 14 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(320) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(320) }]).flat()
 
   const recovered = await post("overflow-session", "msg_a", history)
@@ -615,7 +627,7 @@ async function speculation(baseURL: string, fetch: Fetch, providerOptions: Recor
   const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL, fetch, ...providerOptions } } } }
   const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], speculativeCompaction: true, compaction: { bytesPerToken: 1 } })
   await hooks.config!(config)
-  const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(300) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(300) }]).flat()
+  const history = Array.from({ length: 6 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(900) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(900) }]).flat()
   const send = (init: RequestInit) => config.provider.proxy.options.fetch(`${baseURL}/chat/completions`, { method: "POST", ...init })
   const post = async (userID: string) => {
     const turn: Messages = [user(userID, "Task")]

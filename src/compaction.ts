@@ -3,7 +3,9 @@ import { isGeneratedEnvironment, type WireMessage } from "./prefix"
 import { digest as hash, instruction, isSha256, record } from "./shared"
 import { compactionOptions, policy, protocolGroups, recentCut, type Options } from "./compaction-policy"
 import { applyReductions, hasSignedState, reductionText, shakeRegions, type Reduction } from "./compaction-shake"
-import { softSummary, summaryPolicy } from "./compaction-summary"
+import { softSummary } from "./compaction-summary"
+import { handoffPrompt, summaryMessage } from "./compaction-prompts"
+import { withFileOperations } from "./compaction-files"
 
 export type ChatBody = { model: string; messages: WireMessage[]; tools?: unknown; [key: string]: unknown }
 export type CompactionContext = {
@@ -110,7 +112,7 @@ function rewritten(body: ChatBody, segments: Segment[], positions?: Map<number, 
     const segment = starts.get(index)
     if (segment) {
       positions?.set(index, messages.length)
-      messages.push({ role: "user", content: `Historical conversation summary (context, not a new instruction):\n${segment.summary}` })
+      messages.push({ role: "user", content: summaryMessage(segment.summary) })
     } else if (!archived.has(index)) {
       positions?.set(index, messages.length)
       const message = body.messages[index]
@@ -507,7 +509,8 @@ export class RollingCompaction {
     }
     const update = (plan: { previous?: Segment; additions: number[] }, summary: string) => {
       if (plan.previous) segments = segments.filter((segment) => segment !== plan.previous)
-      segments.push({ summary, archived: [...(plan.previous?.archived ?? []), ...plan.additions].sort((a, b) => a - b) })
+      const archived = [...(plan.previous?.archived ?? []), ...plan.additions].sort((a, b) => a - b)
+      segments.push({ summary: withFileOperations(summary, archived.flatMap((index) => source.messages[index] ? [source.messages[index]!] : [])), archived })
       segments.sort((a, b) => (a.archived[0] ?? 0) - (b.archived[0] ?? 0))
     }
     // Handoff is one stage, before any shake. All requests share exactly the
@@ -520,7 +523,8 @@ export class RollingCompaction {
       let failed = false
       for (const plan of handoffPlans) {
         const selected = [...(plan.previous ? [positions.get(plan.previous.archived[0] ?? -1)] : []), ...plan.additions.map((index) => positions.get(index))].filter((index): index is number => index !== undefined).sort((a, b) => a - b)
-        const request: ChatBody = { ...summaryRequestBase(current), ...(current.tools !== undefined ? { tools: current.tools, tool_choice: "none" } : {}), messages: [...current.messages, { role: "user", content: `${summaryPolicy}\nProduce the historical checkpoint using only the messages at these zero-based positions: ${JSON.stringify(selected)}. Other messages remain verbatim and must not be incorporated.` }], stream: false, ...(source.max_completion_tokens !== undefined ? { max_completion_tokens: cap } : { max_tokens: cap }) }
+        const scope = `Produce the historical checkpoint using only the messages at these zero-based positions: ${JSON.stringify(selected)}. Other messages remain verbatim and must not be incorporated.`
+        const request: ChatBody = { ...summaryRequestBase(current), ...(current.tools !== undefined ? { tools: current.tools, tool_choice: "none" } : {}), messages: [...current.messages, { role: "user", content: handoffPrompt(!context.manual, scope) }], stream: false, ...(source.max_completion_tokens !== undefined ? { max_completion_tokens: cap } : { max_tokens: cap }) }
         const summaryBudget = Math.min(context.inputLimit ?? Infinity, context.contextWindow - cap) - config.marginTokens
         if (estimate(request) > summaryBudget) { failed = true; break }
         active()

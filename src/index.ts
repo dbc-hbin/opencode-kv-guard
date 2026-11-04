@@ -7,6 +7,9 @@ import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDa
 import { randomUUID } from "node:crypto"
 import { compactSystem } from "./compact"
 import { RollingCompaction, constrainedOutput, overflowPromptTokens, providerError, readSummary, summaryRequestBase, type ChatBody, type ProviderError, type SummaryResult } from "./compaction"
+import { escapeSummaryBoundaries, handoffPrompt, summarizationSystem, summaryPrompt } from "./compaction-prompts"
+import { nativeCompactionInput } from "./native-compaction"
+import { policy } from "./compaction-policy"
 import { CheckpointStore, type CheckpointSnapshot } from "./checkpoints"
 import { UsageTracker, observeResponse } from "./usage"
 import { parseGLMOptions, normalizeGLMRequest, createGLMChunkAdapter } from "./glm"
@@ -82,6 +85,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
   // summarize by extending that exact prefix instead of a fresh transcript.
   const lastExchanges = new Map<string, Exchange>()
   const nativeCompactions = new Set<string>()
+  const nativePrompts = new Map<string, { context: string[]; prompt?: string }>()
+  let customCompactionPrompt = false
   // /kv-compact: the command tags its own text part with a private nonce
   // (pending), chat.message binds that exact user message ID, and only the
   // request for that message runs the rolling chain.
@@ -244,6 +249,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
 
   return {
     async config(config) {
+      customCompactionPrompt = config.agent?.compaction?.prompt !== undefined
       // Register /kv-compact unless the user defined a command of that name.
       manualCommandOwned = options.compaction !== false && !config.command?.[manualCommand]
       // subtask: false keeps the command in the requesting session even when a
@@ -453,6 +459,16 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               },
             })
           }
+          const nativeDefault = session && agent === "compaction" && options.compaction !== false && !customCompactionPrompt && nativePrompts.get(session)?.prompt === undefined
+            ? nativeCompactionInput(body) : undefined
+          if (nativeDefault && encodedLimits && compaction.options) {
+            const limits: unknown = JSON.parse(encodedLimits)
+            if (record(limits) && typeof limits.context === "number" && typeof limits.output === "number") {
+              const cap = Math.min(policy(limits.context, compaction.options).summaryCap, limits.output,
+                typeof body.max_completion_tokens === "number" ? body.max_completion_tokens : typeof body.max_tokens === "number" ? body.max_tokens : Infinity)
+              body = { ...body, ...(body.max_completion_tokens !== undefined ? { max_completion_tokens: cap } : { max_tokens: cap }) }
+            }
+          }
           // Manual /compact: summarize by extending the last dispatched main
           // request, so the prefix stays KV-cached, and answer OpenCode's own
           // compaction request with that summary. Any mismatch keeps the
@@ -496,7 +512,9 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               ...(prior.tools !== undefined ? { tools: prior.tools, tool_choice: "none" } : {}),
               messages: [...prior.messages, exchange.assistant, {
                 role: "user",
-                content: `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.\n\nFor this handoff, follow these compaction-agent system instructions instead of the task instructions in the conversation above:\n<compaction-system-instructions>\n${systemInstructions}\n</compaction-system-instructions>\n\n${instructions}`,
+                content: nativeDefault
+                  ? handoffPrompt(false, [...nativeDefault.context, ...(nativeDefault.previous ? [`<previous-summary>\n${escapeSummaryBoundaries(nativeDefault.previous)}\n</previous-summary>`] : [])].join("\n\n"))
+                  : `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.\n\nFor this handoff, follow these compaction-agent system instructions instead of the task instructions in the conversation above:\n<compaction-system-instructions>\n${systemInstructions}\n</compaction-system-instructions>\n\n${instructions}`,
               }],
               stream: false,
               ...(prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }),
@@ -552,6 +570,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             const handled = await manualCompaction(session)
             if (handled) return handled
           }
+          if (nativeDefault) body = { ...body, messages: [
+            { role: "system", content: summarizationSystem },
+            { role: "user", content: summaryPrompt(nativeDefault.conversation, nativeDefault.previous, false, nativeDefault.context) },
+          ] }
           // Only the /kv-compact command's own user message runs manually.
           const manual = !!session && !!agent && !internalAgents.includes(agent) && !!currentUser && !!expectedUser && manualCompactions.get(session) === expectedUser
           const prepare = async (overflow?: { promptTokens?: number }) => {
@@ -745,10 +767,12 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       if (options.compactPrompt !== false) compactSystem(output.system)
       stripEnvironmentDate(output.system)
     },
-    async "experimental.session.compacting"(input) {
+    async "experimental.session.compacting"(input, output) {
       // Native compaction transforms a selected history without its marker part.
       // The next transform for this session serializes text, not a guarded request.
       nativeCompactions.add(input.sessionID)
+      // Retain the shared output object so later plugin prompt overrides win.
+      nativePrompts.set(input.sessionID, output)
     },
     async "experimental.chat.messages.transform"(_input, output) {
       userTurns.clean(output.messages)
@@ -767,6 +791,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       if (event.type === "session.idle") {
         // A compaction cancelled between its hooks never reaches its transform.
         nativeCompactions.delete(event.properties.sessionID)
+        nativePrompts.delete(event.properties.sessionID)
         // The command turn is over, whether or not a selected provider ran it.
         for (const [nonce, owner] of manualPending) if (owner === event.properties.sessionID) manualPending.delete(nonce)
         manualCompactions.delete(event.properties.sessionID)
@@ -782,6 +807,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       outputCalls.delete(session)
       lastExchanges.delete(session)
       nativeCompactions.delete(session)
+      nativePrompts.delete(session)
       for (const [nonce, owner] of manualPending) if (owner === session) manualPending.delete(nonce)
       manualCompactions.delete(session)
       compaction.delete(session)
@@ -828,6 +854,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       outputCalls.clear()
       lastExchanges.clear()
       nativeCompactions.clear()
+      nativePrompts.clear()
       manualPending.clear()
       manualCompactions.clear()
       truncatedHandled.clear()

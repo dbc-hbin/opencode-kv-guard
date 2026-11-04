@@ -118,6 +118,16 @@ There is no automatic middle-clipping of user instructions or tool-call argument
 
 Handoff preserves the input prefix for the summary call; applying its result intentionally changes the archived region. Between maintenance boundaries, committed summary bytes and retained messages are replayed unchanged. Shake also invalidates the prefix from its first changed message onward. Structural prefix equality is not a guarantee of server cache residency or a replacement for provider-reported cached-token usage.
 
+### Prompts and summary context
+
+`src/prompts/compaction/` contains the original OMP handoff document, automatic threshold focus, summarization system, initial/update/split-turn requests, summary replay wrapper and file-operation template from the pinned revision. The port includes OMP's default post-render whitespace/XML/table formatting. Attribution is in `THIRD_PARTY_NOTICES`.
+
+Soft requests use OMP's generic role-labelled transcript rather than JSON-encoded wire messages. Tool results are limited to 2,000 characters in this summary input only; retained live messages remain exact. Plaintext reasoning is included, but provider signatures, encrypted fields and media bytes are not serialized. `<conversation>` and `<previous-summary>` boundaries are escaped inside untrusted data. The first window uses the initial prompt, subsequent windows use the update prompt, and a split turn starts with the dedicated prefix prompt before merging into the history summary.
+
+Rolling summaries also retain a source-derived, grouped `<files>` list with Read/Write/RW markers, read-selector normalization, URL exclusion and OMP's 20-file display limit. OpenCode's `filePath` argument is accepted alongside `path`. Subsequent folds reconstruct this list from archived tool calls rather than relying on the model to copy it correctly.
+
+Provider-specific transcript dialects/reasoning-effort catalogs are not inferred from arbitrary compatible-model aliases; the adapter uses OMP's generic text format and preserves the verified outgoing model/template controls. OMP's short PR-description summary is UI metadata with no consumer in this plugin, so no additional inference is made solely to generate it.
+
 ### Options and migration
 
 Options inside `compaction`:
@@ -138,7 +148,7 @@ Remove the old `triggerRatio`, `targetRatio` and `keepRecentTurns` settings. The
 
 ### Wire, state and failure contracts
 
-The OpenCode adapter preserves system/developer authority boundaries. Archived history remains in its original policy interval rather than moving instructions or merging them into lower-authority summaries. Unlike the previous planner, it does not reserve an entire maximum-sized summary for every interval before attempting inference: intervals are generated sequentially and the actual rewritten request is checked. This adaptation is not a claim of byte-identical OMP prompts or tokenizer output.
+The OpenCode adapter preserves system/developer authority boundaries. Archived history remains in its original policy interval rather than moving instructions or merging them into lower-authority summaries. Unlike the previous planner, it does not reserve an entire maximum-sized summary for every interval before attempting inference: intervals are generated sequentially and the actual rewritten request is checked. Handoff selects that interval through the original template's additional-focus field. The prompt assets match OMP; the complete wire request and tokenizer remain host/provider adaptations.
 
 Only complete, nonempty assistant text with `finish_reason: stop` and no tool calls is accepted as a summary. Interrupted, malformed and truncated output is never committed as memory. A fitting prefix handoff requests `tool_choice: "none"`; providers rejecting that option retain the existing one-time `"auto"` compatibility retry. Strategy fallthrough does not execute tool calls returned by a summarizer. User cancellation and checkpoint publication conflicts still prevent dispatch.
 
@@ -151,7 +161,7 @@ Usage accounting remains provider-anchored only for an identical measured prefix
 ### Manual and speculative entry points
 
 - `/kv-compact` runs the same portable chain on its command turn without waiting for the trigger or replacing stored history. It uses the token-based retained tail. With no eligible work it reports `Nothing to compact`.
-- `/compact` remains OpenCode-native. When the last completed exchange still matches, the plugin answers the native compaction request using an exact prefix handoff, including native summary instructions. If that prefix does not fit, it falls back to OpenCode's independent native summary request; it no longer shakes the cached prefix to force this fast path.
+- `/compact` keeps OpenCode's history selection, storage and continuation behavior. For the recognized 1.19.4 default policy/template, it uses the OMP handoff prompt on a matching cached exchange, or OMP initial/update soft prompts on the independent-summary fallback. Previous summaries and plugin context are preserved. Exact default fingerprints prevent replacing unknown/custom templates; configured compaction-agent prompts and explicit plugin prompt overrides retain precedence. This native path retains OpenCode's serialization/streaming boundary and applies the OMP summary ceiling without raising an explicitly smaller output cap.
 - `speculativeCompaction` prepares the same policy's result below the trigger and adopts it only while source and committed state still match. It does not use a separate compression target or custom optimization algorithm.
 
 Compaction toasts report summary completion, saved shake output and rescue. Notification failure does not affect inference. The plugin never recursively invokes `client.session.summarize()` from a running request hook, which would wait on the same session loop.
