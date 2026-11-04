@@ -35,7 +35,7 @@ const config = {
   agent: { title: { disable: true } },
   compaction: { auto: false, prune: false },
   provider: { [providerID]: { npm: "@ai-sdk/openai-compatible", options: { baseURL: `http://127.0.0.1:${proxy.port}/v1`, apiKey: "local-fixture" }, models: { fixture: { name: "fixture", limit } } } },
-  plugin: [[pathToFileURL(resolve("dist/opencode-kv-guard.js")).href, { providers: [providerID], diagnostics: true }]],
+  plugin: [[pathToFileURL(resolve("dist/opencode-kv-guard.js")).href, { providers: [providerID], diagnostics: true, compaction: { keepRecentTokens: 1000 } }]],
 }
 const { child, client: started, output } = startServer(home, fixtureEnv(home, config))
 const deadline = Promise.withResolvers<never>()

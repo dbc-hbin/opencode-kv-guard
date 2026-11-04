@@ -580,7 +580,7 @@ test("a summary handoff overflow recovers by folding once; a rejected tool_choic
     const headers = { "x-opencode-session-id": session, "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context: 12000, output: 500 }), "x-opencode-kv-guard-user": userID }
     return config.provider.proxy.options.fetch("http://recover.test/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) })
   }
-  // About 10,300 bytes: over the 9,775 trigger while the handoff still fits its summary budget.
+  // About 10,300 bytes: over the OMP 10,200 trigger while the handoff still fits its summary budget.
   const history = Array.from({ length: 14 }, (_, index) => [{ role: "user", content: `old ${index} ` + "x".repeat(320) }, { role: "assistant", content: `reply ${index} ` + "y".repeat(320) }]).flat()
 
   const recovered = await post("overflow-session", "msg_a", history)
@@ -624,7 +624,7 @@ async function speculation(baseURL: string, fetch: Fetch, providerOptions: Recor
     if (marked.type !== "text") throw new Error("Expected text fixture")
     const body = { model: "fixture", stream: true, max_tokens: 500, ...(tools ? { tools } : {}), messages: [{ role: "system", content: "Policy" }, ...history, { role: "user", content: marked.text }] }
     // Place the request at 95% of the trigger, inside the speculation band.
-    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85) + 500
+    const context = Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 0.95 / 0.85)
     const headers = { "x-opencode-session-id": "session", "x-opencode-kv-guard-agent": "build", "x-opencode-kv-guard-limits": JSON.stringify({ context, output: 500 }), "x-opencode-kv-guard-user": userID }
     return send({ headers, body: JSON.stringify(body) })
   }
@@ -987,7 +987,7 @@ test("/kv-compact compacts only the command's own user message and is cleared wh
   }
   const client = { app: { log: async () => {} }, session: { get: async () => ({ data: {} }) }, tui: { showToast: async () => ({}) } }
   const config: Record<string, any> = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://kv-compact.test/v1", fetch } } } }
-  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], compaction: { bytesPerToken: 1 } })
+  const hooks = await plugin({ client } as unknown as PluginInput, { providers: ["proxy"], compaction: { bytesPerToken: 1, keepRecentTokens: 500 } })
   await hooks.config!(config as never)
   const registered = config.command["kv-compact"]
   expect(registered.subtask).toBe(false)

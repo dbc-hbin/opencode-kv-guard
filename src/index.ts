@@ -6,7 +6,7 @@ import { processEndpointGate } from "./process-gate"
 import { canonical, Environments, ModeReminders, PrefixAudit, stripEnvironmentDate, UserTurns } from "./prefix"
 import { randomUUID } from "node:crypto"
 import { compactSystem } from "./compact"
-import { ContextOverflowError, RollingCompaction, constrainedOutput, shakeToFit, overflowPromptTokens, providerError, readSummary, summaryRequestBase, type ChatBody, type ProviderError, type SummaryResult } from "./compaction"
+import { RollingCompaction, constrainedOutput, overflowPromptTokens, providerError, readSummary, summaryRequestBase, type ChatBody, type ProviderError, type SummaryResult } from "./compaction"
 import { CheckpointStore, type CheckpointSnapshot } from "./checkpoints"
 import { UsageTracker, observeResponse } from "./usage"
 import { parseGLMOptions, normalizeGLMRequest, createGLMChunkAdapter } from "./glm"
@@ -20,7 +20,7 @@ const agentHeader = "x-opencode-kv-guard-agent"
 const limitsHeader = "x-opencode-kv-guard-limits"
 const userHeader = "x-opencode-kv-guard-user"
 const systemSuffixHeader = "x-opencode-kv-guard-system-suffix"
-// User command that runs the plugin's rolling chain (reductions, shake, soft
+// User command that runs the plugin's OMP chain (handoff, shake, soft
 // summary, rescue) on its own turn, without OpenCode's native history rewrite.
 const manualCommand = "kv-compact"
 const manualCommandPrompt = "The conversation context was just compacted on request. Reply with one short sentence confirming it and stating the current task, if any. Do not call tools or continue the task until the next instruction."
@@ -116,12 +116,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
       },
       finished(report?: Record<string, unknown>) {
         if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0 || report?.speculative === true) show("Session compacted", "success")
-        else if (typeof report?.shook === "number" && report.shook > 0) show(`Removed ${report.shook} large tool result${report.shook === 1 ? "" : "s"} from context; full output saved`, "success")
+        else if (typeof report?.shook === "number" && report.shook > 0) show(`Removed ${report.shook} large context region${report.shook === 1 ? "" : "s"}; full output saved`, "success")
         if (report?.rescue === true) show("Context was still too large: recent tool results and attachments were removed to fit", "warning")
-        if (typeof report?.clipped === "number" && report.clipped > 0) show(`Context was still too large: the middle of ${report.clipped} recent message${report.clipped === 1 ? "" : "s"} was cut; ${report.clipStorageFailed === true ? "the full text could not be saved" : "full text saved"}`, "warning")
         if (report?.shakeStorageFailed === true) show("Could not save some tool outputs to disk; those results were kept in context", "warning")
         if (report?.manualNoop === true) show("Nothing to compact", "info")
-        if (report?.mandatoryOverTarget === true) show("Context is near the limit and cannot be compacted further; reduce attachments, tools or large tool output", "warning")
       },
     }
   }
@@ -509,20 +507,15 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             const fallback = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / bytesPerToken)
             const measure = (candidate: ChatBody) => options.usageAccounting === false ? fallback(candidate) : usage.estimate(candidate, exchange.lane, fallback)
             const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - config.marginTokens
-            // Like the dead-end rescue, shake tool results and media from the
-            // end until the handoff fits, keeping the longest cached prefix.
-            const fitted = shakeToFit(handoff, (candidate) => measure(candidate) <= budget, { path: (text) => toolArtifacts.contentPath(text), save: (path, text) => toolArtifacts.saveContent(path, text) }, bytesPerToken)
-            if (!fitted) {
-              await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: measure(handoff), budget })
+            // Preserve the exact cached prefix. An oversized handoff falls
+            // through to OpenCode's independent native summary request.
+            const size = measure(handoff)
+            if (size > budget) {
+              await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: size, budget })
               return undefined
             }
-            try { for (const { path, text } of fitted.saves) await toolArtifacts.saveContent(path, text) } catch (error) {
-              await log("Manual compaction kept the native request", { reason: "raw output storage failed", error: error instanceof Error ? error.message : String(error) })
-              return undefined
-            }
-            const size = measure(fitted.body)
             const notice = compactionNotice(sessionID)
-            const response = await notice.summary(() => sendSummary(fitted.body))
+            const response = await notice.summary(() => sendSummary(handoff))
             if (!response.ok) {
               const error = await providerError(response)
               // The handoff is longer than OpenCode's own serialized request;
@@ -540,7 +533,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             }
             notice.finished({ summaryRequests: 1 })
             lastExchanges.delete(sessionID)
-            await log("Manual compaction via prefix handoff", { estimated: size, budget, cachedMessages: prior.messages.length + 1, shook: fitted.saves.length })
+            await log("Manual compaction via prefix handoff", { estimated: size, budget, cachedMessages: prior.messages.length + 1 })
             const id = typeof summary.completion.id === "string" ? summary.completion.id : `kv-guard-${hash(summary.content).slice(0, 16)}`
             const created = Math.floor(Date.now() / 1000)
             const usageField = summary.completion.usage !== undefined ? { usage: summary.completion.usage } : {}
@@ -608,6 +601,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
               const compactionContext = {
                 session, lane, contextWindow: limits.context,
                 inputLimit: "input" in limits && typeof limits.input === "number" && limits.input > 0 ? limits.input : undefined,
+                modelOutputLimit: typeof limits.output === "number" && limits.output > 0 ? limits.output : undefined,
                 outputLimit: output, signal,
                 allowSummary, currentUser, prefixHandoff: options.prefixHandoff !== false,
                 restoreReasoning: options.prefixGuard === false ? undefined : (effective: ChatBody) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
@@ -664,8 +658,8 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
           }
           const canRecover = !!session && !!agent && !!encodedLimits && options.compaction !== false && !internalAgents.includes(agent)
           // Overflow recovery prepares the same history once more with the
-          // provider's report applied, then resends. Used when either the main
-          // request or a summary handoff that extends it overflows.
+          // provider's report applied, then resends. Summary handoff overflow
+          // advances to shake/soft inside the compaction engine.
           const recover = async (error: ProviderError) => {
             const overflow = { promptTokens: overflowPromptTokens(error.text) }
             body = { ...incoming, messages: [...incoming.messages] }
@@ -681,13 +675,7 @@ const plugin: Plugin = async ({ client, project, directory, worktree }, options 
             await observePrefix()
             return send(body, "main")
           }
-          let failed: Response | undefined
-          try {
-            failed = session && agent ? await checkpoint(session, () => prepare()) : await prepare()
-          } catch (error) {
-            if (!(error instanceof ContextOverflowError) || !canRecover) throw error
-            return recover(error.error)
-          }
+          const failed = session && agent ? await checkpoint(session, () => prepare()) : await prepare()
           if (failed) return failed
           await observePrefix()
           const response = await send(body, "main")

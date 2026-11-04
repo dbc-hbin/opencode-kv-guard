@@ -54,7 +54,9 @@ const config = {
   agent: { title: { disable: true } },
   compaction: { auto: false, prune: false },
   provider: { [providerID]: { npm: "@ai-sdk/openai-compatible", options: { baseURL: `http://127.0.0.1:${proxy.port}/v1`, apiKey: "local-fixture" }, models: { fixture: { name: "fixture", limit, variants: { careful: { temperature: 0.1 } } } } } },
-  plugin: [[pathToFileURL(resolve("dist/opencode-kv-guard.js")).href, { providers: [providerID], diagnostics: true }]],
+  // Keep the first controlled overflow below the policy trigger so it tests
+  // provider-driven recovery, not rejection immediately after a completed pass.
+  plugin: [[pathToFileURL(resolve("dist/opencode-kv-guard.js")).href, { providers: [providerID], diagnostics: true, compaction: { thresholdPercent: 75 } }]],
 }
 const { child, client: started, output } = startServer(home, fixtureEnv(home, config))
 const deadline = Promise.withResolvers<never>()

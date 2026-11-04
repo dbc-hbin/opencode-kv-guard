@@ -28,6 +28,7 @@ test.each([
   const start = async () => {
     const hooks = await plugin({ directory: "/usage-resume", worktree: "/usage-resume" } as PluginInput, {
       providers: ["proxy"], stateDirectory, crossProcess: false, maxConcurrent: 2, prefixGuard, prefixHandoff: false,
+      compaction: { thresholdTokens: 16000 },
     })
     const config = { provider: { proxy: { npm: "@ai-sdk/openai-compatible", options: {
       baseURL: "http://usage-resume.test/v1",
@@ -101,7 +102,7 @@ test.each([
     label: "explicit effective defaults",
     before: { compaction: {}, shrinkToolOutputs: {} },
     after: {
-      compaction: { marginTokens: 0, keepRecentTurns: 1, targetRatio: 0.8, triggerRatio: 0.85, bytesPerToken: 4 },
+      compaction: { marginTokens: 0, keepRecentTokens: 20000, bytesPerToken: 4 },
       shrinkToolOutputs: { maxLines: 400, maxBytes: 16384 },
     },
   },
@@ -289,9 +290,9 @@ test.each(["summary", "reasoning", "replay-pressure", "restored-pressure"])("rea
   if (stage === "reasoning" || stage === "restored-pressure") expect(captured[0]!.messages[2]!.reasoning_content).toBeUndefined()
   if (stage === "summary") expect(summaries).toBeGreaterThan(0)
   const count = summaries
-  const second = [...original, { role: "assistant", content: "Answer" }, { role: "user", content: stage === "replay-pressure" ? "n".repeat(1800) : "Next" }]
+  const second = [...original, { role: "assistant", content: "Answer" }, { role: "user", content: stage === "replay-pressure" ? "n".repeat(2200) : "Next" }]
   await send(second, "two")
-  if (stage === "replay-pressure") expect(summaries).toBeGreaterThan(count)
+  if (stage.endsWith("pressure")) expect(summaries).toBeGreaterThan(count)
   else expect(summaries).toBe(count)
   if (stage === "summary" || stage === "reasoning") expect(captured[1]!.messages.findLast((message) => message.role === "assistant")?.reasoning_content).toBe("Recent reasoning")
   if (stage === "reasoning") expect(captured[1]!.messages[2]!.reasoning_content).toBeUndefined()
@@ -315,7 +316,7 @@ test.each(["policy", "environment"])("anchored %s survives compaction retiring t
       baseURL: "http://retired-proof.test/v1",
       fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
         const body = JSON.parse(String(init?.body)) as ChatBody
-        if (body.stream === false) throw new Error("Tiny source history needs no semantic summary")
+        if (body.stream === false) return success()
         captured.push(body)
         return Response.json({ choices: [{ index: 0, message: {
           role: "assistant", content: captured.length === 1 ? "Answer" : "Second",
@@ -417,7 +418,7 @@ function history(): ChatBody {
 }
 
 function context(completeSummary: CompactionContext["completeSummary"], overrides: Partial<CompactionContext> = {}): CompactionContext {
-  return { session: "session", lane: "fixture-lane", contextWindow: 5000, outputLimit: 500, completeSummary, ...overrides }
+  return { session: "session", lane: "fixture-lane", contextWindow: 5000, outputLimit: 500, modelOutputLimit: 500, completeSummary, ...overrides }
 }
 
 function forwarded(result: CompactionResult) {

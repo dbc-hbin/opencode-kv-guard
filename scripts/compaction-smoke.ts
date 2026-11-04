@@ -16,7 +16,7 @@ const requestIDs: (string | null)[] = []
 const answers: string[] = []
 const providerID = "opencode-fixture"
 const limit = { context: 32768, output: 512 }
-const triggerRatio = 0.85
+const trigger = limit.context - Math.max(Math.floor(limit.context * 0.15), 16384)
 let summaries = 0
 let normal = 0
 const summaryCountAtMain: number[] = []
@@ -45,7 +45,7 @@ const proxy = Bun.serve({
     // The first controlled response reports substantially more tokens than the
     // local byte estimator. The next turn must react to that observed usage.
     const promptTokens = normal === 1
-      ? Math.floor((limit.context - (body.max_tokens ?? limit.output)) * triggerRatio) - 1
+      ? trigger - 1
       : Math.ceil(Buffer.byteLength(JSON.stringify(body)) / 4)
     const usage = `data: ${JSON.stringify({ id: `main-${normal}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: 480, total_tokens: promptTokens + 480, prompt_tokens_details: { cached_tokens: normal > 1 ? Math.min(promptTokens, 1024) : 0 } } })}\n\n`
     const bytes = chunk({ role: "assistant", content: text }) + chunk({}, "stop") + usage + "data: [DONE]\n\n"
@@ -57,7 +57,7 @@ const config = {
   agent: { title: { disable: true } },
   compaction: { auto: false, prune: false },
   provider: { [providerID]: { npm: "@ai-sdk/openai-compatible", options: { baseURL: `http://127.0.0.1:${proxy.port}/v1`, apiKey: "local-fixture" }, models: { fixture: { name: "fixture", limit } } } },
-  plugin: [[pathToFileURL(resolve("dist/opencode-kv-guard.js")).href, { providers: [providerID], diagnostics: true, compaction: { triggerRatio } }]],
+  plugin: [[pathToFileURL(resolve("dist/opencode-kv-guard.js")).href, { providers: [providerID], diagnostics: true }]],
 }
 const env = fixtureEnv(home, config)
 const deadline = Promise.withResolvers<never>()
@@ -113,7 +113,7 @@ try {
       if (turn === 1) {
         const first = requests[0]!
         const withoutCompaction = { ...first, messages: [...first.messages, { role: "assistant", content: answers[0] }, { role: "user", content: text }] }
-        assert.ok(Math.ceil(Buffer.byteLength(JSON.stringify(withoutCompaction)) / 4) < Math.floor((limit.context - limit.output) * triggerRatio), "the byte estimate alone must not trigger this compaction")
+        assert.ok(Math.ceil(Buffer.byteLength(JSON.stringify(withoutCompaction)) / 4) < trigger, "the byte estimate alone must not trigger this compaction")
         assert.ok(summaries > 0, "persisted usage must trigger compaction on the first resumed user turn")
       }
       if (turn === 0) {
