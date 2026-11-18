@@ -1,180 +1,145 @@
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import type { Message, Part } from "@opencode-ai/sdk/v2"
-import { createEffect, createMemo, createSignal, Index, onCleanup } from "solid-js"
+import type { TokenUsageInfo } from "@opencode/client"
+import type { Plugin } from "@opencode/plugin/tui"
+import { createEffect, createSignal, onCleanup } from "solid-js"
 
-type CacheUsage = { read: number; prompt: number }
+type SessionCacheRates = { readonly last: number | undefined; readonly session: number | undefined }
+type UsageByStep = Map<string, TokenUsageInfo | undefined>
 
-function cacheUsage(message: Message): CacheUsage {
-  if (message.role !== "assistant") return { read: 0, prompt: 0 }
-  // OpenCode subtracts cache reads and writes from input (session.ts).
-  return { read: message.tokens.cache.read, prompt: message.tokens.input + message.tokens.cache.read + message.tokens.cache.write }
+type HistorySource = {
+  readonly client: {
+    readonly message: Pick<Plugin.Context["client"]["message"], "list">
+    readonly session: Pick<Plugin.Context["client"]["session"], "get">
+  }
+  readonly data: Pick<Plugin.Context["data"], "listen">
 }
 
-export function responsePerformance(messages: ReadonlyArray<Message>, parts: (messageID: string) => ReadonlyArray<Part>) {
-  const message = messages.findLast((message) => message.role === "assistant")
-  if (!message) return { ttftMs: undefined, throughput: undefined, generationThroughput: undefined, e2eMs: undefined }
-  const elapsed = message.time.completed === undefined ? undefined : message.time.completed - message.time.created
-  const e2eMs = elapsed !== undefined && Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : undefined
-  // Tool argument streaming has no persisted start timestamp. Do not mistake
-  // a later text/reasoning part, or tool execution start, for its first token.
-  const first = parts(message.id).find((part) => {
-    switch (part.type) {
-      case "tool": return true
-      case "reasoning": return part.text.length > 0
-      case "text": return !part.synthetic && !part.ignored && part.text.length > 0
-      default: return false
-    }
-  })
-  const start = first?.type === "text" || first?.type === "reasoning" ? first.time?.start : undefined
-  let ttftMs: number | undefined
-  if (start !== undefined) {
-    const lead = start - message.time.created
-    if (Number.isFinite(lead) && lead >= 0) ttftMs = lead
-  }
-  if (message.time.completed !== undefined) {
-    if (e2eMs === undefined) ttftMs = undefined
-    else if (ttftMs !== undefined && ttftMs > e2eMs) ttftMs = undefined
-  }
-  // OMP's status-line rate uses reported output / elapsed request time, with
-  // a 100 ms minimum. OpenCode stores reasoning separately from output.
-  const output = message.tokens.output + message.tokens.reasoning
-  const rate = (duration: number | undefined) => {
-    if (!Number.isFinite(output) || output <= 0 || duration === undefined || duration < 100) return undefined
-    const value = output * 1000 / duration
-    return Number.isFinite(value) && value > 0 ? value : undefined
-  }
-  return {
-    ttftMs,
-    throughput: rate(e2eMs),
-    generationThroughput: rate(e2eMs !== undefined && ttftMs !== undefined ? e2eMs - ttftMs : undefined),
-    e2eMs,
-  }
-}
+type SidebarHost = HistorySource & Readonly<{
+  theme: { readonly text: Pick<Plugin.Context["theme"]["text"], "base" | "muted"> }
+  ui: Pick<Plugin.Context["ui"], "slot">
+}>
 
-export function watchSessionUsage(api: Pick<TuiPluginApi, "client" | "event">, sessionID: string, update: (usage: CacheUsage) => void, failed?: (error: unknown) => void) {
-  const messages = new Map<string, CacheUsage>()
-  const changed = new Set<string>()
-  let ready = false
-  let active = true
-  let read = 0
-  let prompt = 0
-  const put = (id: string, usage?: CacheUsage) => {
-    const previous = messages.get(id)
-    read += (usage?.read ?? 0) - (previous?.read ?? 0)
-    prompt += (usage?.prompt ?? 0) - (previous?.prompt ?? 0)
-    if (usage) messages.set(id, usage)
-    else messages.delete(id)
-    if (ready) update({ read, prompt })
-  }
-  // The TUI state keeps only 100 messages; omit limit to load the whole session.
-  // A failed load is retried on the next update for this session; until one
-  // succeeds, event-only totals are incomplete and are not reported.
-  let loading = false
-  const load = () => {
-    if (loading || ready || !active) return
-    loading = true
-    void api.client.session.messages({ sessionID }, { throwOnError: true }).then(({ data }) => {
-      loading = false
-      if (!active) return
-      for (const { info } of data) {
-        if (!changed.has(info.id)) put(info.id, cacheUsage(info))
+export function watchSessionUsage(source: HistorySource, sessionID: string, update: (rates?: SessionCacheRates) => void) {
+  const { client, data } = source
+  let current: AbortController | undefined
+  let history: UsageByStep | undefined
+  const live: UsageByStep = new Map()
+
+  const publish = (usage: UsageByStep) => {
+    let last: number | undefined
+    let read = 0
+    let prompt = 0
+    for (const tokens of usage.values()) {
+      if (!tokens) {
+        last = undefined
+        continue
       }
-      changed.clear()
-      ready = true
-      update({ read, prompt })
-    }, (error: unknown) => {
-      // Clear before reporting so a reaction to the failure can retry at once.
-      loading = false
-      failed?.(error)
+      const input = tokens.input + tokens.cache.read + tokens.cache.write
+      last = input ? Math.round(tokens.cache.read * 100 / input) : undefined
+      read += tokens.cache.read
+      prompt += input
+    }
+    update({ last, session: prompt ? Math.round(read * 100 / prompt) : undefined })
+  }
+
+  const refresh = () => {
+    current?.abort()
+    const request = new AbortController()
+    current = request
+    history = undefined
+    live.clear()
+    update(undefined)
+
+    void (async () => {
+      const options = { signal: request.signal }
+      const { revert } = await client.session.get({ sessionID }, options)
+      // Revert is exclusive, and IDs (including fork copies) are not ordered by sequence.
+      let visible = !revert
+      const newestFirst: UsageByStep = new Map()
+      const query = { sessionID, limit: 200, type: revert ? undefined : "assistant" as const }
+      let page = await client.message.list({ ...query, order: "desc" }, options)
+      while (!request.signal.aborted) {
+        for (const message of page.data) {
+          if (visible && message.type === "assistant" && (message.tokens || message.time.completed !== undefined)) {
+            newestFirst.set(message.id, message.tokens)
+          }
+          if (message.id === revert?.messageID) visible = true
+        }
+        const cursor = page.cursor.next
+        if (!cursor) break
+        page = await client.message.list({ ...query, cursor }, options)
+      }
+      // The boundary can disappear if the server commits during the read.
+      if (!visible) return
+      return { usage: new Map([...newestFirst].reverse()), reverted: Boolean(revert) }
+    })().then((snapshot) => {
+      if (request.signal.aborted) return
+      current = undefined
+      if (!snapshot) return
+      history = snapshot.usage
+      if (!snapshot.reverted) for (const [id, tokens] of live) history.set(id, tokens)
+      live.clear()
+      publish(history)
+    }, () => {
+      // Do not show partial totals. A later session event or reconnect retries the read.
+      if (!request.signal.aborted) current = undefined
     })
   }
-  // Subscribe before fetching so streaming updates/removals win over the snapshot.
-  const offUpdate = api.event.on("message.updated", ({ properties: { info } }) => {
-    if (info.sessionID !== sessionID) return
-    if (!ready) changed.add(info.id)
-    put(info.id, cacheUsage(info))
-    load()
+
+  // Subscribe before paging: live usage replaces any overlapping snapshot row.
+  const off = data.listen(({ details: event }) => {
+    switch (event.type) {
+      case "server.connected":
+        refresh()
+        return
+      case "session.revert.staged":
+      case "session.revert.cleared":
+      case "session.revert.committed":
+        if (event.data.sessionID === sessionID) refresh()
+        return
+      case "session.step.ended":
+      case "session.step.failed": {
+        if (event.data.sessionID !== sessionID) return
+        const { assistantMessageID, tokens } = event.data
+        if (!current && !history) refresh()
+        if (history) {
+          history.set(assistantMessageID, tokens)
+          publish(history)
+        } else {
+          live.set(assistantMessageID, tokens)
+        }
+        return
+      }
+    }
   })
-  const offRemove = api.event.on("message.removed", ({ properties }) => {
-    if (properties.sessionID !== sessionID) return
-    if (!ready) changed.add(properties.messageID)
-    put(properties.messageID)
-  })
-  load()
+  refresh()
   return () => {
-    active = false
-    offUpdate()
-    offRemove()
+    off()
+    current?.abort()
   }
 }
 
-function View(props: { api: TuiPluginApi; session_id: string }) {
-  const [usage, setUsage] = createSignal<CacheUsage>()
-  createEffect(() => {
-    setUsage(undefined)
-    onCleanup(watchSessionUsage(props.api, props.session_id, setUsage))
-  })
-  const stats = createMemo(() => {
-    let lastRead = 0
-    let lastPrompt = 0
-    const messages = props.api.state.session.messages(props.session_id)
-    for (const message of messages) {
-      if (message.role !== "assistant") continue
-      const current = cacheUsage(message)
-      lastRead = current.read
-      lastPrompt = current.prompt
-    }
-    const total = usage()
-    const performance = responsePerformance(messages, props.api.state.part)
-    return {
-      last: lastPrompt > 0 ? `${Math.round((lastRead / lastPrompt) * 100)}%` : "-",
-      session: total && total.prompt > 0 ? `${Math.round((total.read / total.prompt) * 100)}%` : "-",
-      read: total?.read ?? 0,
-      prompt: total?.prompt ?? 0,
-      performance: [
-        { label: "TTFT", value: performance.ttftMs === undefined ? "-" : `${(performance.ttftMs / 1000).toFixed(2)} s` },
-        { label: "Throughput", value: performance.throughput === undefined ? "-" : `${performance.throughput.toFixed(1)} tok/s` },
-        { label: "Gen Throughput", value: performance.generationThroughput === undefined ? "-" : `${performance.generationThroughput.toFixed(1)} tok/s` },
-        { label: "E2E delay", value: performance.e2eMs === undefined ? "-" : `${(performance.e2eMs / 1000).toFixed(2)} s` },
-      ],
-    }
-  })
+function View(props: { readonly context: SidebarHost; readonly sessionID: string }) {
+  const [rates, setRates] = createSignal<SessionCacheRates>()
+  createEffect(() => onCleanup(watchSessionUsage(props.context, props.sessionID, (value) => setRates(value))))
+  const display = (rate?: number) => rate === undefined ? "-" : `${rate}%`
 
   return (
     <box>
-      <text fg={props.api.theme.current.text}>
-        <b>Cache</b>
-      </text>
-      <text fg={props.api.theme.current.textMuted}>{stats().last} last request</text>
-      <text fg={props.api.theme.current.textMuted}>{stats().session} session</text>
-      <text fg={props.api.theme.current.textMuted}>
-        {stats().read.toLocaleString()} / {stats().prompt.toLocaleString()} cached
-      </text>
-      <text marginTop={1} fg={props.api.theme.current.text}>
-        <b>Performance</b>
-      </text>
-      <Index each={stats().performance}>{(metric) => (
-        <box flexDirection="row" justifyContent="space-between">
-          <text fg={props.api.theme.current.textMuted}>{metric().label}</text>
-          <text fg={props.api.theme.current.textMuted}>{metric().value}</text>
-        </box>
-      )}</Index>
+      <text fg={props.context.theme.text.base}><b>Input cache</b></text>
+      <text fg={props.context.theme.text.muted}>Last request: {display(rates()?.last)}</text>
+      <text fg={props.context.theme.text.muted}>Session: {display(rates()?.session)}</text>
     </box>
   )
 }
 
-const tui: TuiPlugin = async (api) => {
-  api.slots.register({
-    // Builtin Context is 100 and MCP is 200: place the rate directly after Context.
-    order: 150,
-    slots: {
-      sidebar_content(_ctx, props) {
-        return <View api={api} session_id={props.session_id} />
-      },
-    },
-  })
-}
-
-const plugin: TuiPluginModule = { id: "opencode-kv-guard:cache-rate", tui }
+const plugin = {
+  id: "opencode-kv-guard:cache-rate",
+  setup(context: SidebarHost) {
+    context.ui.slot({
+      append: "sidebar.content",
+      render: (props) => <View context={context} sessionID={props.sessionID} />,
+    })
+  },
+} satisfies Plugin.Definition
 
 export default plugin

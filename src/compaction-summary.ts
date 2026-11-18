@@ -1,7 +1,7 @@
-import type { ChatBody, CompactionContext } from "./compaction"
+import type { CompactionContext } from "./compaction"
 import { providerError, readSummary, summaryRequestBase } from "./compaction"
 import type { WireMessage } from "./prefix"
-import { record } from "./shared"
+import { record, type ChatBody } from "./shared"
 import { summarizationSystem, summaryPrompt } from "./compaction-prompts"
 
 // OMP's generic transcript format, adapted from its internal message union to
@@ -42,6 +42,7 @@ type SummaryInput = {
   cap: number
   margin: number
   count: (value: unknown) => number
+  promptCount: (body: ChatBody) => number
   active: () => void
   onRequest: () => void
 }
@@ -88,7 +89,7 @@ export async function softSummary(input: SummaryInput): Promise<{ summary: strin
     }
     // Server input limits include adapter scaffolding and the carried summary.
     // Repack before dispatch rather than silently changing the main output cap.
-    if (count(request) > hardBudget) {
+    if (input.promptCount(request) > hardBudget) {
       const halved = Math.floor(Math.min(window.budget, count(sent)) / 2)
       if (halved < 1) throw new Error(`Compaction summarizer cannot fit input budget ${hardBudget}; no summary state was committed`)
       pending.splice(0, 1, ...pack(window.entries, halved))

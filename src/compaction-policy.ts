@@ -1,5 +1,6 @@
+import { basename, isAbsolute } from "node:path"
 import type { WireMessage } from "./prefix"
-import { record } from "./shared"
+import { instruction, record } from "./shared"
 
 // Policy port: can1357/oh-my-pi@1c291b87e4b889398cc4b8e4ccdfa650b56a0486,
 // packages/agent/src/compaction/compaction.ts. Provider limits stay separate.
@@ -63,6 +64,42 @@ export function policy(window: number, config: Options) {
   return { reserve, summaryReserve, trigger, target, keepRecentTokens: Math.min(config.keepRecentTokens, Math.max(1, tailBudget)), summaryCap: Math.max(1, Math.min(Math.floor(0.8 * summaryReserve), 16384, config.summaryOutputTokens ?? Infinity)) }
 }
 
+export function authority(message: WireMessage) {
+  if (instruction(message)) return true
+  if (message.role !== "user") return false
+  // The compatible provider serializes host instruction updates as user text.
+  // Preserve their original positions without granting them a privileged role.
+  const part = Array.isArray(message.content) && message.content.length === 1 ? message.content[0] : undefined
+  const text = record(part) && part.type === "text" ? part.text : message.content
+  if (typeof text !== "string") return false
+  if (text.startsWith("<system-update>\n") && text.endsWith("\n</system-update>")) return true
+  // Core's read tool can inject a separate synthetic message for nearby AGENTS.md.
+  const file = /^Instructions from: ([^\n]+)\n/.exec(text)?.[1]
+  return file !== undefined && isAbsolute(file) && basename(file) === "AGENTS.md"
+}
+
+function toolMedia(message: WireMessage | undefined) {
+  if (message?.role !== "user" || !Array.isArray(message.content)) return false
+  const [marker, ...media] = message.content
+  return record(marker) && marker.type === "text" && marker.text === "Attached media from tool result:"
+    && media.some((part) => record(part) && (part.type === "image_url" || part.type === "file"))
+}
+
+export function conversationUser(message: WireMessage) {
+  return message.role === "user" && !authority(message) && !toolMedia(message)
+}
+
+export function hasOpaqueContent(message: WireMessage) {
+  if (message.role !== "user" && message.role !== "assistant" && message.role !== "tool") return true
+  const content = message.content
+  if (!Array.isArray(content)) return content != null && typeof content !== "string"
+  return content.some((part) => !record(part) || !(
+    part.type === "text" && typeof part.text === "string"
+    || part.type === "thinking" && typeof part.thinking === "string"
+    || part.type === "image_url" || part.type === "image" || part.type === "input_image"
+  ))
+}
+
 export type Group = { start: number; end: number }
 export function protocolGroups(messages: WireMessage[]): Group[] {
   const result: Group[] = []
@@ -84,6 +121,7 @@ export function protocolGroups(messages: WireMessage[]): Group[] {
         end++
       }
       if (pending.size) throw new Error(`Cannot compact incomplete tool batch at message ${index}; missing results: ${[...pending].join(", ")}`)
+      if (end > index + 1 && toolMedia(messages[end])) end++
     }
     result.push({ start: index, end })
     index = end

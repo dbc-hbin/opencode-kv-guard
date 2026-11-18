@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto"
 import type { WireMessage } from "./prefix"
 
+export type ChatBody = { model: string; messages: WireMessage[]; tools?: unknown; [key: string]: unknown }
+
 export const digest = (value: string) => createHash("sha256").update(value).digest("hex")
 export const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
 export const isSha256 = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)

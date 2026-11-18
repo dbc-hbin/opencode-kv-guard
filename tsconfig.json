@@ -9,7 +9,7 @@
     "jsxImportSource": "@opentui/solid",
     "skipLibCheck": true,
     "types": ["bun"],
-    "lib": ["ESNext", "DOM", "DOM.Iterable"]
+    "lib": ["ESNext", "DOM", "DOM.Iterable", "DOM.AsyncIterable"]
   },
   "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "scripts/**/*.ts"]
 }

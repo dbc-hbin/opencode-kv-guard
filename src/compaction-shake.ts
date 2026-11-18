@@ -1,17 +1,23 @@
 import type { WireMessage } from "./prefix"
-import { isGeneratedEnvironment } from "./prefix"
-import { instruction, record } from "./shared"
+import { authority, hasOpaqueContent } from "./compaction-policy"
+import { digest, record } from "./shared"
 
 export type ShakeReduction = { index: number; kind: "shake"; path: string; tokens: number }
+  | { readonly index: number; readonly kind: "read"; readonly path: string; readonly tokens: number }
   | { index: number; kind: "block"; path: string; tokens: number; part: number; start: number; end: number }
 export type Reduction = ShakeReduction | { index: number; kind: "media" }
 export type ShakeRegion = Omit<Extract<ShakeReduction, { kind: "shake" }>, "path"> & { text: string }
   | Omit<Extract<ShakeReduction, { kind: "block" }>, "path"> & { text: string }
 
 export const shakePlaceholder = (path: string, tokens: number) => `[Content removed from context (~${tokens} tokens); full output: ${JSON.stringify(path)}]`
+export const readPlaceholder = (path: string) => `[Earlier read compacted; full output: ${JSON.stringify(path)}]`
 
-function protectedResult(message: WireMessage, calls: Map<unknown, Record<string, unknown>>) {
-  const call = calls.get(message.tool_call_id)
+export function contentArtifactName(text: string) {
+  const hash = digest(text)
+  return `tool_${hash.slice(0, 12)}_kvguard_${hash.slice(12)}`
+}
+
+function protectedResult(message: WireMessage, call: Record<string, unknown> | undefined) {
   if (!call || !record(call.function)) return false
   if (call.function.name === "skill") return true
   if (call.function.name !== "read" || typeof call.function.arguments !== "string") return false
@@ -19,6 +25,7 @@ function protectedResult(message: WireMessage, calls: Map<unknown, Record<string
   try { args = JSON.parse(call.function.arguments) } catch { return false }
   const path = record(args) ? args.path ?? args.filePath : undefined
   if (typeof path === "string" && (/^(skill|artifact):\/\//.test(path)
+    || /(?:^|[/\\])tool_[a-f0-9]{12}_kvguard_[a-f0-9]{52}(?::|$)/.test(path)
     || /(?:^|[/\\])tool_kvguard_(?:[a-f0-9]{48}|[a-f0-9]{64})(?::|$)/.test(path)
     || /(?:^|[/\\])tool-output[/\\]tool_[A-Za-z0-9_-]+(?::|$)/.test(path))) return true
   const details = record(message.details) ? message.details : undefined
@@ -77,16 +84,21 @@ export function shakeRegions(messages: WireMessage[], config: { protectTokens: n
     after[index] = accumulated
     accumulated += config.costs?.[index] ?? config.count(messages[index])
   }
+  // Call IDs need only be unique within a batch; a later occurrence must not
+  // change whether an earlier read of a skill or artifact is protected.
   const calls = new Map<unknown, Record<string, unknown>>()
-  for (const message of messages) if (Array.isArray(message.tool_calls)) for (const call of message.tool_calls) if (record(call)) calls.set(call.id, call)
   const regions: ShakeRegion[] = []
   messages.forEach((message, index) => {
-    if (index === config.currentUser || config.archived.has(index) || instruction(message) || isGeneratedEnvironment(message) || hasSignedState(message)) return
+    if (message.role !== "tool") {
+      calls.clear()
+      if (Array.isArray(message.tool_calls)) for (const call of message.tool_calls) if (record(call)) calls.set(call.id, call)
+    }
+    if (index === config.currentUser || config.archived.has(index) || authority(message) || hasOpaqueContent(message) || hasSignedState(message)) return
     if (config.reductions.some((reduction) => reduction.index === index && reduction.kind !== "media")) return
     const useless = message.useless === true && message.isError !== true
     if (!useless && (after[index] ?? 0) < config.protectTokens) return
     if (message.role === "tool") {
-      if (message.prunedAt !== undefined || protectedResult(message, calls)) return
+      if (message.prunedAt !== undefined || protectedResult(message, calls.get(message.tool_call_id))) return
       const fragments = typeof message.content === "string" ? [message.content] : Array.isArray(message.content)
         ? message.content.flatMap((part) => record(part) && part.type === "text" && typeof part.text === "string" && part.text.length ? [part.text] : []) : []
       if (!fragments.length) return
@@ -107,6 +119,7 @@ export function shakeRegions(messages: WireMessage[], config: { protectTokens: n
 }
 
 export function reductionText(message: WireMessage, reduction: ShakeReduction) {
+  if (reduction.kind === "read") return typeof message.content === "string" ? message.content : undefined
   if (reduction.kind === "shake") {
     if (typeof message.content === "string") return message.content
     if (Array.isArray(message.content)) return message.content.flatMap((part) => record(part) && part.type === "text" && typeof part.text === "string" && part.text.length ? [part.text] : []).join("\n")
@@ -126,6 +139,9 @@ export function applyReductions(messages: WireMessage[], reductions: Reduction[]
     if (!original) continue
     const message = { ...original }
     switch (reduction.kind) {
+      case "read":
+        message.content = readPlaceholder(reduction.path)
+        break
       case "shake": {
         const replacement = shakePlaceholder(reduction.path, reduction.tokens)
         let replaced = false

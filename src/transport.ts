@@ -1,82 +1,51 @@
 export type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
-export type GateRelease = () => void | Promise<void>
-export type AdmissionGate = { acquire(signal?: AbortSignal): Promise<GateRelease> }
-
-type Waiter = { grant: (release: () => void) => void; signal?: AbortSignal; abort: () => void }
-
-export class Gate implements AdmissionGate {
-  private active = 0
-  private waiting: Waiter[] = []
-
-  constructor(readonly capacity: number) {}
-
-  acquire(signal?: AbortSignal): Promise<() => void> {
-    const { promise, resolve: grant, reject } = Promise.withResolvers<() => void>()
-    const waiter: Waiter = {
-      grant, signal,
-      abort: () => {
-        this.waiting = this.waiting.filter((item) => item !== waiter)
-        reject(signal!.reason)
-      },
-    }
-    if (signal?.aborted) reject(signal.reason)
-    else {
-      signal?.addEventListener("abort", waiter.abort, { once: true })
-      this.waiting.push(waiter)
-      this.drain()
-    }
-    return promise
-  }
-
-  private drain() {
-    while (this.active < this.capacity && this.waiting.length) {
-      const waiter = this.waiting.shift()!
-      waiter.signal?.removeEventListener("abort", waiter.abort)
-      this.active++
-      let released = false
-      waiter.grant(() => {
-        if (released) return
-        released = true
-        this.active--
-        this.drain()
-      })
-    }
-  }
-}
-
-// Shared by project instances importing this module, never by other OS processes.
-const gates = new Map<string, Gate>()
-export function endpointKey(baseURL: string) {
-  const url = new URL(baseURL)
-  return `${url.origin}${url.pathname.replace(/\/+$/, "")}${url.search}`
-}
-
-export function endpointGate(baseURL: string, capacity: number) {
-  const key = endpointKey(baseURL)
-  const existing = gates.get(key)
-  if (existing) {
-    if (existing.capacity !== capacity) throw new Error("KV guard: conflicting maxConcurrent for endpoint")
-    return existing
-  }
-  const gate = new Gate(capacity)
-  gates.set(key, gate)
-  return gate
-}
-
-export async function admittedFetch(fetch: Fetch, gate: AdmissionGate, input: RequestInfo | URL, init?: RequestInit) {
-  const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
-  const release = await gate.acquire(signal ?? undefined)
-  let response: Response
+// Error inspection must not re-encode the original response. Oversized errors are passed through without
+// classification; the bytes already read are replayed before the upstream tail.
+export async function inspectErrorBody(response: Response, limit = 64 * 1024): Promise<{ response: Response; bytes?: Uint8Array<ArrayBuffer> }> {
+  if (!response.body) return { response, bytes: new Uint8Array() }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  const init = { status: response.status, statusText: response.statusText, headers: response.headers }
+  let length = 0
   try {
-    signal?.throwIfAborted()
-    response = await fetch(input, init)
+    for (;;) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      chunks.push(chunk.value)
+      length += chunk.value.byteLength
+      if (length > limit) {
+        return { response: new Response(new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            const buffered = chunks.shift()
+            if (buffered) {
+              controller.enqueue(buffered)
+              return
+            }
+            const next = await reader.read()
+            if (next.done) controller.close()
+            else controller.enqueue(next.value)
+          },
+          cancel: (reason) => reader.cancel(reason),
+        }, { highWaterMark: 0 }), init) }
+      }
+    }
   } catch (error) {
-    await release()
+    await reader.cancel(error).catch(() => {})
     throw error
   }
+  const bytes = new Uint8Array(length)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return { response: new Response(bytes, init), bytes }
+}
+
+export function cancellableResponse(response: Response, signal: AbortSignal, onClose?: () => void) {
   if (!response.body) {
-    await release()
+    onClose?.()
     return response
   }
 
@@ -84,7 +53,7 @@ export async function admittedFetch(fetch: Fetch, gate: AdmissionGate, input: Re
   try {
     reader = response.body.getReader()
   } catch (error) {
-    await release()
+    onClose?.()
     throw error
   }
   let finished = false
@@ -93,29 +62,29 @@ export async function admittedFetch(fetch: Fetch, gate: AdmissionGate, input: Re
   const finish = (cancel = false, reason?: unknown) => {
     if (completion) return completion
     finished = true
-    signal?.removeEventListener("abort", abort)
+    signal.removeEventListener("abort", abort)
     // Publish completion before cancellation invokes upstream callbacks.
     completion = Promise.resolve().then(async () => {
       try {
         if (cancel) await reader.cancel(reason)
       } finally {
-        await release()
+        onClose?.()
       }
     })
     return completion
   }
   const abort = () => {
     if (finished) return
-    void finish(true, signal!.reason).then(
-      () => controller.error(signal!.reason),
+    void finish(true, signal.reason).then(
+      () => controller.error(signal.reason),
       (error) => controller.error(error),
     )
   }
   const body = new ReadableStream<Uint8Array>({
     start(value) {
       controller = value
-      signal?.addEventListener("abort", abort, { once: true })
-      if (signal?.aborted) abort()
+      signal.addEventListener("abort", abort, { once: true })
+      if (signal.aborted) abort()
     },
     async pull(value) {
       let item: Awaited<ReturnType<typeof reader.read>>
@@ -126,8 +95,8 @@ export async function admittedFetch(fetch: Fetch, gate: AdmissionGate, input: Re
         try {
           await finish()
           value.error(error)
-        } catch (releaseError) {
-          value.error(releaseError)
+        } catch (closeError) {
+          value.error(closeError)
         }
         return
       }

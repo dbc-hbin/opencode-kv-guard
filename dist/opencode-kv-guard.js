@@ -1,162 +1,16 @@
 // @bun
+var __require = import.meta.require;
+
 // src/index.ts
-import { homedir as homedir2 } from "os";
-import { isAbsolute as isAbsolute3, join as join4 } from "path";
+import { Plugin } from "@opencode/plugin";
 
-// src/transport.ts
-class Gate {
-  capacity;
-  active = 0;
-  waiting = [];
-  constructor(capacity) {
-    this.capacity = capacity;
-  }
-  acquire(signal) {
-    const { promise, resolve: grant, reject } = Promise.withResolvers();
-    const waiter = {
-      grant,
-      signal,
-      abort: () => {
-        this.waiting = this.waiting.filter((item) => item !== waiter);
-        reject(signal.reason);
-      }
-    };
-    if (signal?.aborted)
-      reject(signal.reason);
-    else {
-      signal?.addEventListener("abort", waiter.abort, { once: true });
-      this.waiting.push(waiter);
-      this.drain();
-    }
-    return promise;
-  }
-  drain() {
-    while (this.active < this.capacity && this.waiting.length) {
-      const waiter = this.waiting.shift();
-      waiter.signal?.removeEventListener("abort", waiter.abort);
-      this.active++;
-      let released = false;
-      waiter.grant(() => {
-        if (released)
-          return;
-        released = true;
-        this.active--;
-        this.drain();
-      });
-    }
-  }
-}
-var gates = new Map;
-function endpointKey(baseURL) {
-  const url = new URL(baseURL);
-  return `${url.origin}${url.pathname.replace(/\/+$/, "")}${url.search}`;
-}
-function endpointGate(baseURL, capacity) {
-  const key = endpointKey(baseURL);
-  const existing = gates.get(key);
-  if (existing) {
-    if (existing.capacity !== capacity)
-      throw new Error("KV guard: conflicting maxConcurrent for endpoint");
-    return existing;
-  }
-  const gate = new Gate(capacity);
-  gates.set(key, gate);
-  return gate;
-}
-async function admittedFetch(fetch, gate, input, init) {
-  const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-  const release = await gate.acquire(signal ?? undefined);
-  let response;
-  try {
-    signal?.throwIfAborted();
-    response = await fetch(input, init);
-  } catch (error) {
-    await release();
-    throw error;
-  }
-  if (!response.body) {
-    await release();
-    return response;
-  }
-  let reader;
-  try {
-    reader = response.body.getReader();
-  } catch (error) {
-    await release();
-    throw error;
-  }
-  let finished = false;
-  let completion;
-  let controller;
-  const finish = (cancel = false, reason) => {
-    if (completion)
-      return completion;
-    finished = true;
-    signal?.removeEventListener("abort", abort);
-    completion = Promise.resolve().then(async () => {
-      try {
-        if (cancel)
-          await reader.cancel(reason);
-      } finally {
-        await release();
-      }
-    });
-    return completion;
-  };
-  const abort = () => {
-    if (finished)
-      return;
-    finish(true, signal.reason).then(() => controller.error(signal.reason), (error) => controller.error(error));
-  };
-  const body = new ReadableStream({
-    start(value) {
-      controller = value;
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted)
-        abort();
-    },
-    async pull(value) {
-      let item;
-      try {
-        item = await reader.read();
-      } catch (error) {
-        if (finished)
-          return;
-        try {
-          await finish();
-          value.error(error);
-        } catch (releaseError) {
-          value.error(releaseError);
-        }
-        return;
-      }
-      if (finished)
-        return;
-      if (item.done) {
-        try {
-          await finish();
-          value.close();
-        } catch (error) {
-          value.error(error);
-        }
-      } else {
-        value.enqueue(item.value);
-      }
-    },
-    async cancel(reason) {
-      await finish(true, reason);
-    }
-  }, { highWaterMark: 0 });
-  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
-}
+// src/options.ts
+import { homedir } from "os";
+import { isAbsolute as isAbsolute2, join } from "path";
+import { Schema as Schema2 } from "effect";
 
-// src/process-gate.ts
-import { Database } from "bun:sqlite";
-import { execFileSync } from "child_process";
-import { randomUUID } from "crypto";
-import { mkdirSync, readFileSync, watch } from "fs";
-import { hostname } from "os";
-import { join, resolve } from "path";
+// src/compaction-policy.ts
+import { basename, isAbsolute } from "path";
 
 // src/shared.ts
 import { createHash } from "crypto";
@@ -166,533 +20,6 @@ var isSha256 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(val
 var instruction = (message) => message.role === "system" || message.role === "developer";
 var busy = (error) => error instanceof Error && ("code" in error) && typeof error.code === "string" && /^SQLITE_(BUSY|LOCKED)/.test(error.code);
 var uuidV4 = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
-
-// src/process-gate.ts
-function absent(pid) {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    return error instanceof Error && "code" in error && error.code === "ESRCH";
-  }
-}
-function identity(pid) {
-  try {
-    if (process.platform === "linux") {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      const start = fields[19];
-      const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-      return start && boot ? { identity: `${boot}:${start}`, dead: fields[0] === "Z" || fields[0] === "X" } : undefined;
-    }
-    if (process.platform === "darwin") {
-      const fields = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart=", "-o", "stat="], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        env: { ...process.env, LC_ALL: "C", TZ: "UTC" }
-      }).trim().split(/\s+/);
-      const state = fields.pop();
-      const start = fields.join(" ");
-      return start && state ? { identity: start, dead: state.includes("Z") } : undefined;
-    }
-  } catch {}
-}
-function dead(lease) {
-  if (absent(lease.pid))
-    return true;
-  const current = identity(lease.pid);
-  return current !== undefined && (current.dead || current.identity !== lease.identity);
-}
-function change(directory, signal) {
-  let watcher;
-  const { promise, resolve } = Promise.withResolvers();
-  const wake = () => resolve();
-  const timer = setTimeout(wake, 250);
-  const close = () => {
-    watcher?.close();
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", wake);
-  };
-  try {
-    watcher = watch(directory, wake);
-    watcher.on("error", wake);
-  } catch {}
-  signal?.addEventListener("abort", wake, { once: true });
-  return { promise, close };
-}
-
-class ProcessGate {
-  capacity;
-  directory;
-  file;
-  host = hostname();
-  constructor(capacity, directory, key) {
-    this.capacity = capacity;
-    this.directory = directory;
-    this.file = join(directory, `${digest(key)}.sqlite`);
-  }
-  transaction(action) {
-    const db = new Database(this.file, { create: true });
-    let transaction = false;
-    try {
-      db.exec("PRAGMA busy_timeout = 0");
-      db.exec("BEGIN IMMEDIATE");
-      transaction = true;
-      db.exec("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK (id = 1), capacity INTEGER NOT NULL, host TEXT NOT NULL)");
-      db.exec("CREATE TABLE IF NOT EXISTS leases (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, identity TEXT NOT NULL)");
-      db.query("INSERT OR IGNORE INTO settings (id, capacity, host) VALUES (1, ?, ?)").run(this.capacity, this.host);
-      const settings = db.query("SELECT capacity, host FROM settings WHERE id = 1").get();
-      if (settings.host !== this.host)
-        throw new Error("KV guard: process admission directory belongs to another host");
-      if (settings.capacity !== this.capacity)
-        throw new Error("KV guard: conflicting maxConcurrent for process endpoint");
-      const value = action(db);
-      db.exec("COMMIT");
-      transaction = false;
-      return value;
-    } finally {
-      try {
-        if (transaction)
-          db.exec("ROLLBACK");
-      } finally {
-        db.close();
-      }
-    }
-  }
-  async acquire(signal) {
-    signal?.throwIfAborted();
-    mkdirSync(this.directory, { recursive: true, mode: 448 });
-    const processOwner = identity(process.pid);
-    if (!processOwner)
-      throw new Error("KV guard: process admission requires a readable Linux or macOS process identity");
-    const owner = processOwner.identity;
-    const id = randomUUID();
-    for (;; ) {
-      signal?.throwIfAborted();
-      const changed = change(this.directory, signal);
-      try {
-        let acquired = false;
-        try {
-          acquired = this.transaction((db) => {
-            const leases = db.query("SELECT id, pid, identity FROM leases").all();
-            let active = leases.length;
-            for (const lease of leases) {
-              if (lease.pid === process.pid && lease.identity === owner)
-                continue;
-              if (!dead(lease))
-                continue;
-              db.query("DELETE FROM leases WHERE id = ? AND pid = ? AND identity = ?").run(lease.id, lease.pid, lease.identity);
-              active--;
-            }
-            if (active >= this.capacity)
-              return false;
-            db.query("INSERT INTO leases (id, pid, identity) VALUES (?, ?, ?)").run(id, process.pid, owner);
-            return true;
-          });
-        } catch (error) {
-          if (!busy(error))
-            throw error;
-        }
-        if (acquired) {
-          let released;
-          return () => released ??= this.release(id, owner);
-        }
-        await changed.promise;
-      } finally {
-        changed.close();
-      }
-    }
-  }
-  async release(id, owner) {
-    for (;; ) {
-      const changed = change(this.directory);
-      try {
-        try {
-          this.transaction((db) => {
-            db.query("DELETE FROM leases WHERE id = ? AND pid = ? AND identity = ?").run(id, process.pid, owner);
-          });
-          return;
-        } catch (error) {
-          if (!busy(error))
-            throw error;
-        }
-        await changed.promise;
-      } finally {
-        changed.close();
-      }
-    }
-  }
-}
-function processEndpointGate(baseURL, capacity, directory) {
-  if (!Number.isSafeInteger(capacity) || capacity < 1)
-    throw new Error("KV guard: maxConcurrent must be a positive safe integer");
-  if (!directory)
-    throw new Error("KV guard: process admission requires a shared directory");
-  return new ProcessGate(capacity, resolve(directory), endpointKey(baseURL));
-}
-
-// src/prefix.ts
-import { randomUUID as randomUUID2 } from "crypto";
-var generatedEnvironments = new WeakSet;
-function isGeneratedEnvironment(message) {
-  return generatedEnvironments.has(message);
-}
-
-class UserTurns {
-  prefix = `\x1Ekv-guard-user:${randomUUID2()}:`;
-  pattern = new RegExp(`${this.prefix}[a-f0-9]{64}\x1F`, "g");
-  marker(session, message) {
-    return this.prefix + digest(JSON.stringify([session, message])) + "\x1F";
-  }
-  clean(messages) {
-    for (const message of messages) {
-      if (message.info.role !== "user")
-        continue;
-      message.parts = message.parts.filter((part) => {
-        if (part.type !== "text" || !part.text.includes(this.prefix))
-          return true;
-        part.text = part.text.replace(this.pattern, "");
-        return part.text !== "";
-      });
-    }
-  }
-  mark(messages, providers) {
-    const current = messages.findLast((message) => message.info.role === "user");
-    if (!current || current.info.role !== "user" || !providers.has(current.info.model.providerID))
-      return;
-    const marker = this.marker(current.info.sessionID, current.info.id);
-    const part = current.parts.find((part) => part.type === "text" && !part.ignored && part.text !== "");
-    if (part?.type === "text")
-      part.text = marker + part.text;
-    else
-      current.parts.push({
-        type: "text",
-        id: `prt_${digest(marker)}`,
-        sessionID: current.info.sessionID,
-        messageID: current.info.id,
-        text: marker,
-        synthetic: true
-      });
-  }
-  consume(messages, expected) {
-    let current;
-    for (const message of messages) {
-      if (typeof message.content === "string") {
-        if (message.role === "user" && expected && message.content.startsWith(expected))
-          current = message;
-        message.content = message.content.replace(this.pattern, "");
-      } else if (Array.isArray(message.content)) {
-        let removedPart = false;
-        message.content = message.content.filter((part) => {
-          if (!record(part) || typeof part.text !== "string")
-            return true;
-          if (message.role === "user" && expected && part.text.startsWith(expected))
-            current = message;
-          const owned = part.text.includes(this.prefix);
-          part.text = part.text.replace(this.pattern, "");
-          if (owned && part.text === "") {
-            removedPart = true;
-            return false;
-          }
-          return true;
-        });
-        if (removedPart && Array.isArray(message.content) && message.content.length === 1) {
-          const only = message.content[0];
-          if (only?.type === "text" && typeof only.text === "string") {
-            const { type: _type, text, ...metadata } = only;
-            Object.assign(message, metadata, { content: text });
-          }
-        }
-      }
-    }
-    return current;
-  }
-}
-var modeReminders = {
-  "455db97e0d21e8097c2afb539d167b4b2483e99b585dbc4fff23cafd4a3029b8": true,
-  "5e3db616a685a3dfaaf95fb86ae6e2acfbdf520bda60f7b27f727d2a88ba8a25": true
-};
-var isModeReminder = (part) => part.type === "text" && part.synthetic === true && !part.ignored && modeReminders[digest(part.text)] === true;
-function isModeRemindersSnapshot(value, session) {
-  if (!record(value) || Object.keys(value).some((key) => key !== "messages") || !Array.isArray(value.messages))
-    return false;
-  const ids = new Set;
-  const parts = new Set;
-  return value.messages.every((message) => {
-    if (!record(message) || Object.keys(message).some((key) => !["id", "base", "parts"].includes(key)) || typeof message.id !== "string" || !message.id || ids.has(message.id) || !isSha256(message.base) || !Array.isArray(message.parts) || !message.parts.length)
-      return false;
-    ids.add(message.id);
-    return message.parts.every((part) => {
-      if (!record(part) || Object.keys(part).some((key) => !["type", "id", "sessionID", "messageID", "text", "synthetic"].includes(key)) || part.type !== "text" || typeof part.id !== "string" || !part.id || parts.has(part.id) || part.sessionID !== session || part.messageID !== message.id || part.synthetic !== true || typeof part.text !== "string" || modeReminders[digest(part.text)] !== true)
-        return false;
-      parts.add(part.id);
-      return true;
-    });
-  });
-}
-
-class ModeReminders {
-  sessions = new Map;
-  apply(messages, providers) {
-    const last = messages.findLast((message) => message.info.role === "user");
-    if (!last || last.info.role !== "user" || !providers.has(last.info.model.providerID))
-      return;
-    const session = last.info.sessionID;
-    const records = this.sessions.get(session) ?? new Map;
-    this.sessions.set(session, records);
-    const present = new Set(messages.map((message) => message.info.id));
-    for (const id of records.keys())
-      if (!present.has(id))
-        records.delete(id);
-    for (const message of messages) {
-      if (message.info.role !== "user")
-        continue;
-      const parts = message.parts.filter(isModeReminder);
-      const base = digest(JSON.stringify(message.parts.filter((part) => !isModeReminder(part))));
-      if (message === last) {
-        if (parts.length)
-          records.set(message.info.id, { base, parts: structuredClone(parts) });
-        else
-          records.delete(message.info.id);
-        continue;
-      }
-      const prior = records.get(message.info.id);
-      if (!prior)
-        continue;
-      if (prior.base !== base) {
-        records.delete(message.info.id);
-        continue;
-      }
-      if (!parts.length)
-        message.parts.push(...structuredClone(prior.parts));
-    }
-  }
-  snapshot(session) {
-    return { messages: [...this.sessions.get(session) ?? []].map(([id, value]) => ({
-      id,
-      base: value.base,
-      parts: value.parts.map((part) => {
-        if (part.type !== "text")
-          throw new Error("Mode reminder state contains a non-text part");
-        return { type: "text", id: part.id, sessionID: part.sessionID, messageID: part.messageID, text: part.text, synthetic: true };
-      })
-    })) };
-  }
-  restore(session, value) {
-    if (!isModeRemindersSnapshot(value, session))
-      return false;
-    this.sessions.set(session, new Map(value.messages.map(({ id, base, parts }) => [id, { base, parts: structuredClone(parts) }])));
-    return true;
-  }
-  delete(sessionID) {
-    this.sessions.delete(sessionID);
-  }
-  clear() {
-    this.sessions.clear();
-  }
-}
-var environment = /(You are powered by the model named [^\n]+\. The exact model ID is [^\n]+\n)(Here is some useful information about the environment you are running in:\n<env>\n  Working directory: [^\n]+\n  Workspace root folder: [^\n]+\n  Is directory a git repo: (?:yes|no)\n  Platform: [^\n]+(?:\n  Today's date: [^\n]+)?\n<\/env>)/;
-var environmentBlock = /^Here is some useful information about the environment you are running in:\n<env>\n  Working directory: [^\n]+\n  Workspace root folder: [^\n]+\n  Is directory a git repo: (?:yes|no)\n  Platform: [^\n]+\n<\/env>$/;
-function isEnvironmentsSnapshot(value) {
-  if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes))
-    return false;
-  const lanes = new Set;
-  return value.lanes.every((lane) => {
-    if (!record(lane) || Object.keys(lane).some((key) => !["key", "chain", "checkpoints"].includes(key)) || !isSha256(lane.key) || lanes.has(lane.key) || !Array.isArray(lane.chain) || !lane.chain.every(isSha256) || !Array.isArray(lane.checkpoints) || !lane.checkpoints.length)
-      return false;
-    lanes.add(lane.key);
-    const anchors = new Set;
-    let position = 0;
-    return lane.checkpoints.every((checkpoint) => {
-      if (!record(checkpoint) || Object.keys(checkpoint).some((key) => !["anchor", "position", "environment"].includes(key)) || !isSha256(checkpoint.anchor) || anchors.has(checkpoint.anchor) || !Number.isSafeInteger(checkpoint.position) || checkpoint.position < position || checkpoint.position < 1 || typeof checkpoint.environment !== "string" || !environmentBlock.test(checkpoint.environment))
-        return false;
-      if (lane.chain[checkpoint.position - 1] !== checkpoint.anchor)
-        return false;
-      anchors.add(checkpoint.anchor);
-      position = checkpoint.position;
-      return true;
-    });
-  });
-}
-function stripEnvironmentDate(system) {
-  for (let index = 0;index < system.length; index++) {
-    system[index] = system[index].replace(environment, (_match, identity, env) => identity + env.replace(/\n  Today's date: [^\n]+/, ""));
-  }
-}
-
-class Environments {
-  lanes = new Map;
-  apply(messages, session, lane, options = {}) {
-    const system = messages[0];
-    if (system?.role !== "system" || typeof system.content !== "string")
-      return;
-    const match = environment.exec(system.content);
-    if (!match || !messages.some((message) => message.role === "user"))
-      return;
-    if (messages.slice(1).some(instruction))
-      return;
-    const key = digest(JSON.stringify([session, lane]));
-    const prior = this.lanes.get(key);
-    let sourcePrefix = "";
-    const sourceAnchors = messages.slice(1).map((message) => sourcePrefix = digest(sourcePrefix + `
-` + JSON.stringify(message)));
-    let prefix = "";
-    const anchors = messages.slice(1).map((message, index) => {
-      const source = digest(prefix + `
-` + JSON.stringify(message));
-      const replacement = options.replacements?.get(message);
-      const repaired = replacement && digest(prefix + `
-` + JSON.stringify(replacement));
-      prefix = repaired && source !== prior?.chain[index] && repaired === prior?.chain[index] ? repaired : source;
-      return prefix;
-    });
-    if (!anchors.length)
-      return;
-    const present = new Set(anchors);
-    const checkpoints = (prior?.checkpoints ?? []).filter((checkpoint) => options.reconstruct ? checkpoint.position < messages.length : present.has(checkpoint.anchor)).map((checkpoint) => ({
-      ...checkpoint,
-      anchor: sourceAnchors[checkpoint.position - 1]
-    }));
-    const current = match[2].replace(/\n  Today's date: [^\n]+/, "");
-    if (checkpoints.at(-1)?.environment !== current) {
-      if (checkpoints.at(-1)?.position === messages.length - 1)
-        checkpoints.pop();
-      checkpoints.push({ anchor: sourceAnchors.at(-1), position: messages.length - 1, environment: current });
-    }
-    if (!options.reconstruct)
-      this.lanes.set(key, { session, chain: sourceAnchors, checkpoints });
-    const leading = { ...system, content: system.content.replace(environment, "$1") };
-    const result = [leading];
-    for (let index = 1;index < messages.length; index++) {
-      result.push(messages[index]);
-      for (const checkpoint of checkpoints) {
-        if (checkpoint.position !== index)
-          continue;
-        const reminder = {
-          role: "user",
-          content: `<system-reminder>
-${checkpoint.environment}
-</system-reminder>`
-        };
-        generatedEnvironments.add(reminder);
-        result.push(reminder);
-      }
-    }
-    messages.splice(0, messages.length, ...result);
-  }
-  snapshot(session) {
-    return { lanes: [...this.lanes].flatMap(([key, lane]) => lane.session === session ? [{ key, chain: [...lane.chain], checkpoints: structuredClone(lane.checkpoints) }] : []) };
-  }
-  restore(session, value) {
-    if (!isEnvironmentsSnapshot(value))
-      return false;
-    this.delete(session);
-    for (const lane of value.lanes) {
-      if (!this.lanes.has(lane.key))
-        this.lanes.set(lane.key, { session, chain: [...lane.chain], checkpoints: structuredClone(lane.checkpoints) });
-    }
-    return true;
-  }
-  delete(sessionID) {
-    for (const [key, value] of this.lanes)
-      if (value.session === sessionID)
-        this.lanes.delete(key);
-  }
-  clear() {
-    this.lanes.clear();
-  }
-}
-function canonical(value) {
-  if (Array.isArray(value))
-    return value.map(canonical);
-  if (value === null || typeof value !== "object")
-    return value;
-  return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => [key, canonical(item)]));
-}
-
-class PrefixAudit {
-  lanes = new Map;
-  observe(body, session, lane) {
-    const next = {
-      session,
-      system: digest(JSON.stringify(body.messages.filter((message) => message.role === "system"))),
-      tools: digest(JSON.stringify(body.tools ?? [])),
-      messages: body.messages.filter((message) => message.role !== "system").map((message) => digest(JSON.stringify(message)))
-    };
-    const previous = this.lanes.get(lane);
-    this.lanes.set(lane, next);
-    if (!previous)
-      return { firstRequest: true };
-    let sharedMessages = 0;
-    while (sharedMessages < previous.messages.length && previous.messages[sharedMessages] === next.messages[sharedMessages])
-      sharedMessages++;
-    return {
-      systemChanged: previous.system !== next.system,
-      toolsChanged: previous.tools !== next.tools,
-      historyRewritten: sharedMessages < previous.messages.length,
-      sharedMessages,
-      previousMessages: previous.messages.length,
-      currentMessages: next.messages.length
-    };
-  }
-  delete(sessionID) {
-    for (const [key, value] of this.lanes)
-      if (value.session === sessionID)
-        this.lanes.delete(key);
-  }
-  clear() {
-    this.lanes.clear();
-  }
-}
-
-// src/index.ts
-import { randomUUID as randomUUID6 } from "crypto";
-
-// src/compact.ts
-var builtins = [
-  [8212, "8324e4cf58eb45d4d9d6fd120f5e8da59e0548de48e7e6aefcdfbf2923f40b4e"],
-  [8528, "962fbf3cb3ec659c9a5244425ee2e7bb141ad4428f489a630a7738566880dc6a"],
-  [11078, "a384d7b485829c1fe43bd6deaae10466db2c16b8cba045764538974f737958ba"],
-  [15372, "921750803b0314b88b8adc996e2afcf1a61fd7d9dd6dfcf812baeadac1468cf3"],
-  [9274, "83a66a46a5febbc21454161d5f053638b22d25d95e09d77b8f6da33debc848ad"],
-  [4076, "46d386ea8dd8db5734d06f6ec1d04c566f1224b1afa5bc5b0ccefd6f853281f9"],
-  [8683, "ade9199b00df5aa3b51bb02b8e8c711f3e0de224345aef7df9f31d3ea08a5bc7"],
-  [9118, "0c57a9de48efcc578ac6f9623f919713fffdc430e43ab6e8e65d336935932987"],
-  [9114, "9a23cf76db64366821b001a08f13d475626e093c45c72d997b573588d0d03bd1"],
-  [7362, "c30bca40693a47965e25ceac3f02d3709712af7abeab1278bba53a9efcffa928"],
-  [7748, "0019dc1d018d08c1b5a065d10896e22d2615d33580088f44aefc3a042a46ebe2"]
-];
-var compactPrompt = `You are OpenCode, a coding agent. Fulfill the user's intent end to end with minimal, correct changes; answer questions without unsolicited edits.
-
-Obey applicable system, developer, project/AGENTS.md, skill, MCP and user instructions in priority order, tool schemas and permissions. Harness <system-reminder> blocks are instructions. In plan/read-only mode, no edits, write commands, config changes or commits; ask the user to switch modes for edits.
-
-Read relevant files/config first. Reuse project conventions and installed libraries. Fix root causes, stay scoped, preserve others' changes, and ask about direct conflicts. Clarify material ambiguity; obtain approval for a new application's plan before implementation.
-
-Never expose/log/commit secrets. Access outside the working directory only if explicitly instructed; ask before installing/deleting outside it, and isolate third-party package installs. Require explicit confirmation for every git mutation and destructive/irreversible action; never auto-stage/commit/amend or revert others' work. Explain state-changing shell commands and impact. Respect denied/cancelled actions; never bypass permissions.
-
-Use tools to do real work, text to communicate. Prefer dedicated file/search/edit tools to shell. Parallelize independent calls, sequence dependencies, and never guess arguments/results. Delegate only if user or applicable instructions request it.
-
-Run repository-prescribed and relevant tests/build/lint/typechecks, and inspect generated/visible output as needed. Report actual evidence, failures, uncertainty and blockers; never claim unrun checks passed or fabricate facts/URLs.
-
-Write concise, direct, factual replies in the user's language, with useful file:line references; no unrequested emojis. Consult https://opencode.ai/docs for OpenCode feature questions; feedback: https://github.com/anomalyco/opencode/issues.
-`;
-function compactSystem(system) {
-  const header = system[0];
-  if (!header)
-    return;
-  for (const [length, hash] of builtins) {
-    if (header.length < length || header.length !== length && header[length] !== `
-`)
-      continue;
-    if (digest(header.slice(0, length)) !== hash)
-      continue;
-    system[0] = compactPrompt + header.slice(length);
-    return { originalChars: length, replacementChars: compactPrompt.length };
-  }
-}
-
-// src/compaction.ts
-import { basename, isAbsolute } from "path";
 
 // src/compaction-policy.ts
 function compactionOptions(input) {
@@ -750,6 +77,39 @@ function policy(window, config) {
   const summaryReserve = config.reserveTokens ?? 16384;
   return { reserve, summaryReserve, trigger, target, keepRecentTokens: Math.min(config.keepRecentTokens, Math.max(1, tailBudget)), summaryCap: Math.max(1, Math.min(Math.floor(0.8 * summaryReserve), 16384, config.summaryOutputTokens ?? Infinity)) };
 }
+function authority(message) {
+  if (instruction(message))
+    return true;
+  if (message.role !== "user")
+    return false;
+  const part = Array.isArray(message.content) && message.content.length === 1 ? message.content[0] : undefined;
+  const text = record(part) && part.type === "text" ? part.text : message.content;
+  if (typeof text !== "string")
+    return false;
+  if (text.startsWith(`<system-update>
+`) && text.endsWith(`
+</system-update>`))
+    return true;
+  const file = /^Instructions from: ([^\n]+)\n/.exec(text)?.[1];
+  return file !== undefined && isAbsolute(file) && basename(file) === "AGENTS.md";
+}
+function toolMedia(message) {
+  if (message?.role !== "user" || !Array.isArray(message.content))
+    return false;
+  const [marker, ...media] = message.content;
+  return record(marker) && marker.type === "text" && marker.text === "Attached media from tool result:" && media.some((part) => record(part) && (part.type === "image_url" || part.type === "file"));
+}
+function conversationUser(message) {
+  return message.role === "user" && !authority(message) && !toolMedia(message);
+}
+function hasOpaqueContent(message) {
+  if (message.role !== "user" && message.role !== "assistant" && message.role !== "tool")
+    return true;
+  const content = message.content;
+  if (!Array.isArray(content))
+    return content != null && typeof content !== "string";
+  return content.some((part) => !record(part) || !(part.type === "text" && typeof part.text === "string" || part.type === "thinking" && typeof part.thinking === "string" || part.type === "image_url" || part.type === "image" || part.type === "input_image"));
+}
 function protocolGroups(messages) {
   const result = [];
   for (let index = 0;index < messages.length; ) {
@@ -776,6 +136,8 @@ function protocolGroups(messages) {
       }
       if (pending.size)
         throw new Error(`Cannot compact incomplete tool batch at message ${index}; missing results: ${[...pending].join(", ")}`);
+      if (end > index + 1 && toolMedia(messages[end]))
+        end++;
     }
     result.push({ start: index, end });
     index = end;
@@ -794,10 +156,251 @@ function recentCut(groups, messages, budget, count) {
   return cut;
 }
 
+// src/model-budget.ts
+import { Schema } from "effect";
+var id = Schema.NonEmptyString.check(Schema.isTrimmed());
+var modelBudget = Schema.Struct({
+  providerID: id,
+  modelID: id,
+  tokenizer: Schema.optionalKey(Schema.Literals(["cl100k_base", "o200k_base"])),
+  thresholdTokens: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1))),
+  thresholdPercent: Schema.optionalKey(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(100)))
+});
+var read = Schema.decodeUnknownSync(Schema.Array(modelBudget).check(Schema.makeFilter((budgets) => {
+  const seen = new Set;
+  for (const { providerID, modelID } of budgets) {
+    const key = JSON.stringify([providerID, modelID]);
+    if (seen.has(key))
+      return `Duplicate modelBudgets providerID/modelID pair: ${key}`;
+    seen.add(key);
+  }
+  return true;
+})), { onExcessProperty: "error" });
+function parseModelBudgets(input) {
+  return input === undefined ? [] : read(input);
+}
+function resolveModelBudget(budgets, identity) {
+  return budgets.find(({ providerID, modelID }) => providerID === identity.providerID && modelID === identity.modelID);
+}
+var loadEncoding = {
+  cl100k_base: () => __require("gpt-tokenizer/encoding/cl100k_base"),
+  o200k_base: () => __require("gpt-tokenizer/encoding/o200k_base")
+};
+var onlyFields = (value, keys) => Object.keys(value).every((key) => keys.includes(key));
+var text = (value) => typeof value === "string";
+function countableMessage(message) {
+  if (!["system", "developer", "user", "assistant", "tool"].includes(message.role))
+    return false;
+  if (!onlyFields(message, ["role", "content", "name", "tool_call_id", "reasoning", "reasoning_content", "tool_calls"]))
+    return false;
+  if (!["name", "tool_call_id", "reasoning", "reasoning_content"].every((key) => message[key] == null || text(message[key])))
+    return false;
+  const { content, tool_calls: calls } = message;
+  if (content != null && !text(content) && (!Array.isArray(content) || !content.every((part) => record(part) && part.type === "text" && text(part.text) && onlyFields(part, ["type", "text"]))))
+    return false;
+  return calls === undefined || Array.isArray(calls) && calls.every((call) => record(call) && call.type === "function" && text(call.id) && onlyFields(call, ["type", "id", "function"]) && record(call.function) && text(call.function.name) && text(call.function.arguments) && onlyFields(call.function, ["name", "arguments"]));
+}
+function functionTool(tool) {
+  if (!record(tool) || tool.type !== "function" || !onlyFields(tool, ["type", "function"]) || !record(tool.function))
+    return false;
+  const definition = tool.function;
+  return onlyFields(definition, ["name", "description", "parameters", "strict"]) && text(definition.name) && (definition.description === undefined || text(definition.description)) && (definition.parameters === undefined || record(definition.parameters)) && (definition.strict === undefined || typeof definition.strict === "boolean");
+}
+function responseFormat(value) {
+  if (!record(value))
+    return false;
+  if (value.type === "text" || value.type === "json_object")
+    return onlyFields(value, ["type"]);
+  const schema = value.json_schema;
+  return value.type === "json_schema" && onlyFields(value, ["type", "json_schema"]) && record(schema) && onlyFields(schema, ["name", "description", "schema", "strict"]) && text(schema.name) && record(schema.schema) && (schema.description === undefined || text(schema.description)) && (schema.strict === undefined || typeof schema.strict === "boolean");
+}
+function countableEnvelope(body) {
+  for (const [key, value] of Object.entries(body)) {
+    if (value === undefined)
+      continue;
+    switch (key) {
+      case "tools":
+        if (!Array.isArray(value) || !value.every(functionTool))
+          return false;
+        break;
+      case "response_format":
+        if (!responseFormat(value))
+          return false;
+        break;
+      case "tool_choice":
+        if (value === "auto" || value === "none" || value === "required")
+          break;
+        if (!record(value) || value.type !== "function" || !onlyFields(value, ["type", "function"]) || !record(value.function) || !onlyFields(value.function, ["name"]) || !text(value.function.name))
+          return false;
+        break;
+      case "stream_options":
+        if (!record(value) || !onlyFields(value, ["include_usage", "include_obfuscation"]) || !Object.values(value).every((flag) => typeof flag === "boolean"))
+          return false;
+        break;
+      case "chat_template_kwargs":
+        if (!record(value) || !onlyFields(value, ["enable_thinking", "preserve_thinking", "clear_thinking", "reasoning_effort"]) || !Object.entries(value).every(([name, flag]) => name === "reasoning_effort" ? text(flag) : typeof flag === "boolean"))
+          return false;
+        break;
+      case "stop":
+        if (value !== null && !text(value) && (!Array.isArray(value) || !value.every(text)))
+          return false;
+        break;
+      case "max_tokens":
+      case "max_completion_tokens":
+      case "max_output_tokens":
+      case "temperature":
+      case "top_p":
+      case "top_k":
+      case "frequency_penalty":
+      case "presence_penalty":
+      case "n":
+      case "seed":
+        if (value !== null && (typeof value !== "number" || !Number.isFinite(value)))
+          return false;
+        break;
+      case "stream":
+      case "parallel_tool_calls":
+      case "enable_thinking":
+      case "preserve_thinking":
+        if (typeof value !== "boolean")
+          return false;
+        break;
+      case "model":
+      case "user":
+      case "reasoning_effort":
+      case "verbosity":
+      case "prompt_cache_key":
+      case "cache_salt":
+      case "service_tier":
+        if (!text(value))
+          return false;
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+var inputLimit = 1024 * 1024;
+var mergeWorkLimit = 16 * inputLimit;
+function boundedJson(body) {
+  let units = inputLimit;
+  let nodes = 32768;
+  const visit = (value, depth) => {
+    if (--nodes < 0 || depth > 64)
+      return false;
+    if (text(value))
+      return (units -= value.length) >= 0;
+    if (value == null || typeof value === "boolean")
+      return true;
+    if (typeof value === "number")
+      return Number.isFinite(value);
+    if (Array.isArray(value)) {
+      if (value.length > nodes)
+        return false;
+      for (const child of value)
+        if (child === undefined || !visit(child, depth + 1))
+          return false;
+      return true;
+    }
+    if (!record(value) || Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+      return false;
+    return Object.entries(value).every(([key, child]) => (units -= key.length) >= 0 && visit(child, depth + 1));
+  };
+  return visit(body, 0);
+}
+function makeModelEstimator(budget) {
+  if (!budget?.tokenizer)
+    return;
+  const { countTokens, setMergeCacheSize } = loadEncoding[budget.tokenizer]();
+  setMergeCacheSize(0);
+  const ordinaryText = { disallowedSpecial: new Set };
+  return (body) => {
+    if (!boundedJson(body))
+      return;
+    const { messages, ...envelope } = body;
+    if (!countableEnvelope(envelope) || !messages.every(countableMessage))
+      return;
+    const segments = [JSON.stringify(envelope), ...messages.map((message) => JSON.stringify(message))];
+    let units = 0;
+    let mergeWork = 0;
+    for (const segment of segments) {
+      units += segment.length;
+      if (units > inputLimit)
+        return;
+      for (const [run] of segment.matchAll(/\s+|\S+/g)) {
+        mergeWork += run.length * run.length;
+        if (run.length > 1024 || mergeWork > mergeWorkLimit)
+          return;
+      }
+    }
+    return segments.reduce((tokens, segment) => tokens + countTokens(segment, ordinaryText), 3 + 4 * messages.length);
+  };
+}
+
+// src/options.ts
+var limit = Schema2.optionalKey(Schema2.Int.check(Schema2.isGreaterThan(0)));
+var flag = Schema2.optionalKey(Schema2.Boolean);
+var read2 = Schema2.decodeUnknownSync(Schema2.Struct({
+  providers: Schema2.NonEmptyArray(Schema2.NonEmptyString.check(Schema2.isTrimmed())),
+  maxOutputTokens: limit,
+  stateDirectory: Schema2.optionalKey(Schema2.String.check(Schema2.makeFilter(isAbsolute2))),
+  diagnostics: flag,
+  persistence: flag,
+  prefixGuard: flag,
+  usageAccounting: flag,
+  compaction: Schema2.optionalKey(Schema2.Unknown),
+  prefixHandoff: flag,
+  speculativeCompaction: flag,
+  supersedeReads: flag,
+  compactPrompt: flag,
+  compactTools: flag,
+  compactSkills: flag,
+  modelBudgets: Schema2.optionalKey(Schema2.Unknown),
+  shrinkToolOutputs: Schema2.optionalKey(Schema2.Union([
+    Schema2.Literal(false),
+    Schema2.Struct({ maxBytes: limit, maxLines: limit })
+  ]))
+}), { onExcessProperty: "error" });
+function parseOptions(input) {
+  const options = read2(input);
+  return {
+    ...options,
+    stateDirectory: options.stateDirectory ?? join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode-kv-guard"),
+    diagnostics: options.diagnostics ?? false,
+    persistence: options.persistence ?? true,
+    prefixGuard: options.prefixGuard ?? true,
+    usageAccounting: options.usageAccounting ?? true,
+    compaction: compactionOptions(options.compaction === undefined ? false : options.compaction),
+    modelBudgets: parseModelBudgets(options.modelBudgets)
+  };
+}
+
+// src/server-state.ts
+import { join as join4 } from "path";
+
+// src/checkpoints.ts
+import { Database } from "bun:sqlite";
+import { randomUUID as randomUUID3 } from "crypto";
+import { constants, watch } from "fs";
+import { chmod, lstat, mkdir, open } from "fs/promises";
+import { join as join2, resolve } from "path";
+
+// src/compaction.ts
+import { basename as basename3, isAbsolute as isAbsolute4 } from "path";
+
+// src/compaction-reads.ts
+import { basename as basename2, isAbsolute as isAbsolute3, normalize } from "path";
+import { fileURLToPath } from "url";
+
 // src/compaction-shake.ts
 var shakePlaceholder = (path, tokens) => `[Content removed from context (~${tokens} tokens); full output: ${JSON.stringify(path)}]`;
-function protectedResult(message, calls) {
-  const call = calls.get(message.tool_call_id);
+var readPlaceholder = (path) => `[Earlier read compacted; full output: ${JSON.stringify(path)}]`;
+function contentArtifactName(text) {
+  const hash = digest(text);
+  return `tool_${hash.slice(0, 12)}_kvguard_${hash.slice(12)}`;
+}
+function protectedResult(message, call) {
   if (!call || !record(call.function))
     return false;
   if (call.function.name === "skill")
@@ -811,7 +414,7 @@ function protectedResult(message, calls) {
     return false;
   }
   const path = record(args) ? args.path ?? args.filePath : undefined;
-  if (typeof path === "string" && (/^(skill|artifact):\/\//.test(path) || /(?:^|[/\\])tool_kvguard_(?:[a-f0-9]{48}|[a-f0-9]{64})(?::|$)/.test(path) || /(?:^|[/\\])tool-output[/\\]tool_[A-Za-z0-9_-]+(?::|$)/.test(path)))
+  if (typeof path === "string" && (/^(skill|artifact):\/\//.test(path) || /(?:^|[/\\])tool_[a-f0-9]{12}_kvguard_[a-f0-9]{52}(?::|$)/.test(path) || /(?:^|[/\\])tool_kvguard_(?:[a-f0-9]{48}|[a-f0-9]{64})(?::|$)/.test(path) || /(?:^|[/\\])tool-output[/\\]tool_[A-Za-z0-9_-]+(?::|$)/.test(path)))
     return true;
   const details = record(message.details) ? message.details : undefined;
   const meta = record(details?.meta) ? details.meta : undefined;
@@ -877,15 +480,17 @@ function shakeRegions(messages, config) {
     accumulated += config.costs?.[index] ?? config.count(messages[index]);
   }
   const calls = new Map;
-  for (const message of messages)
-    if (Array.isArray(message.tool_calls)) {
-      for (const call of message.tool_calls)
-        if (record(call))
-          calls.set(call.id, call);
-    }
   const regions = [];
   messages.forEach((message, index) => {
-    if (index === config.currentUser || config.archived.has(index) || instruction(message) || isGeneratedEnvironment(message) || hasSignedState(message))
+    if (message.role !== "tool") {
+      calls.clear();
+      if (Array.isArray(message.tool_calls)) {
+        for (const call of message.tool_calls)
+          if (record(call))
+            calls.set(call.id, call);
+      }
+    }
+    if (index === config.currentUser || config.archived.has(index) || authority(message) || hasOpaqueContent(message) || hasSignedState(message))
       return;
     if (config.reductions.some((reduction) => reduction.index === index && reduction.kind !== "media"))
       return;
@@ -893,7 +498,7 @@ function shakeRegions(messages, config) {
     if (!useless && (after[index] ?? 0) < config.protectTokens)
       return;
     if (message.role === "tool") {
-      if (message.prunedAt !== undefined || protectedResult(message, calls))
+      if (message.prunedAt !== undefined || protectedResult(message, calls.get(message.tool_call_id)))
         return;
       const fragments = typeof message.content === "string" ? [message.content] : Array.isArray(message.content) ? message.content.flatMap((part) => record(part) && part.type === "text" && typeof part.text === "string" && part.text.length ? [part.text] : []) : [];
       if (!fragments.length)
@@ -917,6 +522,8 @@ function shakeRegions(messages, config) {
   return regions.reduce((sum, region) => sum + Math.max(0, region.tokens - 16), 0) < config.minSavings ? [] : regions;
 }
 function reductionText(message, reduction) {
+  if (reduction.kind === "read")
+    return typeof message.content === "string" ? message.content : undefined;
   if (reduction.kind === "shake") {
     if (typeof message.content === "string")
       return message.content;
@@ -940,6 +547,9 @@ function applyReductions(messages, reductions) {
       continue;
     const message = { ...original };
     switch (reduction.kind) {
+      case "read":
+        message.content = readPlaceholder(reduction.path);
+        break;
       case "shake": {
         const replacement = shakePlaceholder(reduction.path, reduction.tokens);
         let replaced = false;
@@ -970,6 +580,153 @@ function applyReductions(messages, reductions) {
     result[reduction.index] = message;
   }
   return result;
+}
+
+// src/compaction-reads.ts
+function attachmentPath(value) {
+  if (isAbsolute3(value))
+    return normalize(value);
+  const url = URL.parse(value);
+  if (url?.protocol !== "file:")
+    return;
+  try {
+    return normalize(fileURLToPath(url));
+  } catch (error) {
+    if (!(error instanceof TypeError || error instanceof URIError))
+      throw error;
+  }
+}
+function page(input, text, order) {
+  const { path, offset, limit } = input;
+  if (typeof path !== "string" || !isAbsolute3(path) || normalize(path) !== path || /[\r\n\0]/.test(path) || /(?:^|[/\\])(?:skills|tool-output)(?:[/\\]|$)/i.test(path) || /(?:^|[/\\])shell[/\\](?:[^/\\]+[/\\])?sh_[a-f0-9]{12}[^/\\]*\.out$/i.test(path) || /^(?:agents\.md|skill\.md|tool_(?:[a-f0-9]{12}_kvguard_|kvguard_)[a-f0-9]+)$/i.test(basename2(path)) || Object.keys(input).some((key) => key !== "path" && key !== "offset" && key !== "limit"))
+    return;
+  if (offset !== undefined && (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0))
+    return;
+  if (limit !== undefined && (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 0))
+    return;
+  const [header, ...rows] = text.split(`
+`);
+  const prefix = `Read file ${path}, lines `;
+  if (!header?.startsWith(prefix))
+    return;
+  const range = /^([1-9]\d*)-([1-9]\d*)$/.exec(header.slice(prefix.length));
+  if (!range)
+    return;
+  const start = Number(range[1]);
+  const end = Number(range[2]);
+  if (start !== (offset || 1) || !Number.isSafeInteger(end) || !rows.length || end - start + 1 !== rows.length)
+    return;
+  if ((offset !== undefined || limit !== undefined) && rows.length > Math.min(limit || 2000, 2000))
+    return;
+  if (rows.some((row, index) => !row.startsWith(`${start + index}: `) || row.endsWith("... (line truncated to 2000 chars)")))
+    return;
+  return { path, args: JSON.stringify(input), text, start, end, rows, order };
+}
+function readEvidence(history) {
+  const attachments = new Set;
+  const attachmentNames = new Set;
+  for (const message of history) {
+    if (message.type !== "user")
+      continue;
+    for (const file of message.files ?? []) {
+      const location = file.source.type === "uri" ? attachmentPath(file.source.uri) : undefined;
+      const name = file.name === undefined ? undefined : attachmentPath(file.name);
+      if (location)
+        attachments.add(location);
+      if (name)
+        attachments.add(name);
+      if (!location && !name && file.name)
+        attachmentNames.add(basename2(file.name));
+    }
+  }
+  const seen = new Set;
+  const evidence = new Map;
+  for (const [order, message] of history.entries()) {
+    if (message.type !== "assistant")
+      continue;
+    for (const tool of message.content) {
+      if (tool.type !== "tool")
+        continue;
+      if (seen.has(tool.id)) {
+        evidence.delete(tool.id);
+        continue;
+      }
+      seen.add(tool.id);
+      const state = tool.state;
+      if (tool.name !== "read" || tool.executed !== false || tool.native !== undefined || state.status !== "completed" || state.metadata?.truncated !== false || Object.keys(state.metadata).length !== 1 || state.content.length !== 1)
+        continue;
+      const [part] = state.content;
+      if (part.type !== "text")
+        continue;
+      const read = page(state.input, part.text, order);
+      if (read && !attachments.has(read.path) && !attachmentNames.has(basename2(read.path)))
+        evidence.set(tool.id, read);
+    }
+  }
+  return evidence;
+}
+function coveredBy(read, later) {
+  if (read.text === later.text)
+    return true;
+  if (later.order <= read.order || later.start > read.start || later.end < read.end)
+    return false;
+  return read.rows.every((row, index) => row === later.rows[read.start - later.start + index]);
+}
+function readRegions(messages, { archived, reduced, witnessExcluded, count, evidence }) {
+  if (!evidence?.size)
+    return [];
+  const matches = [];
+  const calls = new Set;
+  const results = new Set;
+  const ambiguous = new Set;
+  const batch = new Map;
+  for (const [index, message] of messages.entries()) {
+    if (message.role === "tool") {
+      const id = message.tool_call_id;
+      if (typeof id !== "string")
+        continue;
+      if (results.has(id))
+        ambiguous.add(id);
+      results.add(id);
+      const read = batch.get(id);
+      if (read && !archived.has(index) && !reduced.has(index) && message.content === read.text && Object.keys(message).every((key) => key === "role" || key === "tool_call_id" || key === "content")) {
+        matches.push({ index, id, page: read });
+      }
+      continue;
+    }
+    batch.clear();
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls))
+      continue;
+    const safe = message.reasoning_opaque === undefined && !hasOpaqueContent(message) && !hasSignedState(message);
+    for (const call of message.tool_calls) {
+      if (!record(call) || typeof call.id !== "string")
+        continue;
+      if (calls.has(call.id))
+        ambiguous.add(call.id);
+      calls.add(call.id);
+      const read = evidence.get(call.id);
+      if (safe && read && call.type === "function" && record(call.function) && call.function.name === "read" && call.function.arguments === read.args)
+        batch.set(call.id, read);
+    }
+  }
+  const witnesses = new Map;
+  const regions = [];
+  for (const match of matches.reverse()) {
+    if (ambiguous.has(match.id))
+      continue;
+    const { index, page: read } = match;
+    const later = witnesses.get(read.path);
+    const covered = later?.some((witness) => coveredBy(read, witness));
+    if (covered && (!witnessExcluded || witnessExcluded.has(index))) {
+      regions.push({ index, kind: "read", text: read.text, tokens: count(read.text) });
+    } else if (!witnessExcluded?.has(index)) {
+      if (later)
+        later.push(read);
+      else
+        witnesses.set(read.path, [read]);
+    }
+  }
+  return regions.reverse();
 }
 
 // src/prompts/compaction/handoff-document.md
@@ -1325,7 +1082,7 @@ async function softSummary(input) {
       stream: false,
       ...body.max_completion_tokens !== undefined ? { max_completion_tokens: cap } : { max_tokens: cap }
     };
-    if (count(request) > hardBudget) {
+    if (input.promptCount(request) > hardBudget) {
       const halved = Math.floor(Math.min(window.budget, count(sent)) / 2);
       if (halved < 1)
         throw new Error(`Compaction summarizer cannot fit input budget ${hardBudget}; no summary state was committed`);
@@ -1451,6 +1208,18 @@ ${files}` : files;
 }
 
 // src/compaction.ts
+function withReadWitnesses(messages, segments, reductions, evidence) {
+  if (!reductions.some((item) => item.kind === "read"))
+    return reductions;
+  const verified = new Set(readRegions(messages, {
+    archived: new Set(segments.flatMap((segment) => segment.archived)),
+    reduced: new Set,
+    witnessExcluded: new Set(reductions.map(({ index }) => index)),
+    count: () => 1,
+    evidence
+  }).map(({ index }) => index));
+  return reductions.filter((item) => item.kind !== "read" || verified.has(item.index));
+}
 function isCompactionSnapshot(value) {
   if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes))
     return false;
@@ -1502,9 +1271,9 @@ function isCompactionSnapshot(value) {
         seen.add(key);
         return Object.keys(reduction).every((key) => key === "index" || key === "kind");
       }
-      if (reduction.kind !== "shake" && reduction.kind !== "block")
+      if (reduction.kind !== "shake" && reduction.kind !== "block" && reduction.kind !== "read")
         return false;
-      if (typeof reduction.path !== "string" || !isAbsolute(reduction.path) || !/^tool_kvguard_[a-f0-9]{64}$/.test(basename(reduction.path)) || typeof reduction.tokens !== "number" || !Number.isSafeInteger(reduction.tokens) || reduction.tokens < 1)
+      if (typeof reduction.path !== "string" || !isAbsolute4(reduction.path) || !/^tool_[a-f0-9]{12}_kvguard_[a-f0-9]{52}$/.test(basename3(reduction.path)) || typeof reduction.tokens !== "number" || !Number.isSafeInteger(reduction.tokens) || reduction.tokens < 1)
         return false;
       if (reduction.kind === "block" && (typeof reduction.part !== "number" || !Number.isSafeInteger(reduction.part) || reduction.part < -1 || typeof reduction.start !== "number" || !Number.isSafeInteger(reduction.start) || reduction.start < 0 || typeof reduction.end !== "number" || !Number.isSafeInteger(reduction.end) || reduction.end <= reduction.start))
         return false;
@@ -1519,7 +1288,7 @@ function isCompactionSnapshot(value) {
 function intervals(messages) {
   let interval = -1;
   return messages.map((message, index) => {
-    if (instruction(message))
+    if (authority(message))
       interval = index;
     return interval;
   });
@@ -1621,33 +1390,46 @@ function constrainedOutput(body) {
 var overflowPatterns = [
   /prompt is too long/i,
   /request_too_large/i,
-  /input is too long for requested model/i,
+  /input is too long for (?:the )?(?:requested|selected) model/i,
   /exceeds the context window/i,
+  /too large for the model'?s configured input limit/i,
+  /exceeded this model context window limit/i,
   /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
   /input token count.*exceeds the maximum/i,
+  /number of input tokens exceeds maximum length/i,
+  /requested input length \d+ exceeds maximum input length/i,
   /tokens in request more than max tokens allowed/i,
   /maximum prompt length is \d+/i,
   /reduce the length of the messages/i,
   /maximum context length is \d+ tokens/i,
   /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
-  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
+  /input(?: \(\d+ tokens\))? is longer than the model'?s context length/i,
   /exceeds the limit of \d+/i,
   /exceeds the available context size/i,
   /greater than the context length/i,
   /context window exceeds limit/i,
+  /`inputs` tokens \+ `max_new_tokens` must be <= \d+/i,
+  /context window exceeded/i,
   /exceeded model token limit/i,
   /context[_ ]length[_ ]exceeded/i,
   /request entity too large/i,
   /context length is only \d+ tokens/i,
   /input length.*exceeds.*context length/i,
-  /prompt too long; exceeded (?:max )?context length/i,
+  /prompt (?:too long|exceeds max length|\u8D85\u957F)/i,
   /too large for model with \d+ maximum context length/i,
   /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
   /model_context_window_exceeded/i,
+  /range of input length should be/i,
   /too many tokens/i,
   /token limit exceeded/i
 ];
-var overflowExclusions = [/^(throttling error|service unavailable):/i, /rate limit/i, /too many requests/i];
+var overflowExclusions = [
+  /^(throttling error|service unavailable):/i,
+  /rate limit/i,
+  /too many requests/i,
+  /max[_ ]tokens must be less than/i,
+  /too many tokens(?: per day)?, please wait/i
+];
 function isContextOverflow(message) {
   return !overflowExclusions.some((pattern) => pattern.test(message)) && overflowPatterns.some((pattern) => pattern.test(message));
 }
@@ -1717,16 +1499,16 @@ class RollingCompaction {
   }
   retained(body, context, candidate) {
     const state = candidate ?? this.lanes.get(this.key(body, context))?.state;
-    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message));
+    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex(conversationUser);
     let leading = 0;
-    while (instruction(body.messages[leading] ?? { role: "" }))
+    while (authority(body.messages[leading] ?? { role: "" }))
       leading++;
     const signature = digest(JSON.stringify({ policy: this.options, model: body.model, tools: body.tools, response_format: body.response_format, chat_template_kwargs: body.chat_template_kwargs, enable_thinking: body.enable_thinking, preserve_thinking: body.preserve_thinking, reasoning_effort: body.reasoning_effort, cache_salt: body.cache_salt, user: body.user, messages: body.messages.slice(0, leading) }));
-    if (!state || state.signature !== signature || body.messages.length < state.covered || digest(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint)
+    if (!state || context.currentUser && lastUser < 0 || state.signature !== signature || body.messages.length < state.covered || digest(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint)
       return { signature };
     const units = protocolGroups(body.messages);
     const policies = intervals(body.messages);
-    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start] ?? { role: "" }));
+    const lastGroup = units.findLast((group) => !authority(body.messages[group.start] ?? { role: "" }));
     const newestTool = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]?.tool_calls));
     const archived = new Set(state.segments.flatMap((segment) => segment.archived));
     if (archived.has(lastUser))
@@ -1741,13 +1523,14 @@ class RollingCompaction {
       for (const group of units) {
         const count = Array.from({ length: group.end - group.start }, (_, offset) => group.start + offset).filter((index) => indices.has(index)).length;
         const message = body.messages[group.start];
-        if (count && (count !== group.end - group.start || group === lastGroup || group === newestTool || !message || instruction(message) || isGeneratedEnvironment(message)))
+        if (count && (count !== group.end - group.start || group === lastGroup || group === newestTool || !message || authority(message) || body.messages.slice(group.start, group.end).some(hasOpaqueContent)))
           return { signature };
       }
     }
-    for (const reduction of state.reductions ?? []) {
+    const reductions = withReadWitnesses(body.messages, state.segments, state.reductions ?? [], context.readEvidence);
+    for (const reduction of reductions) {
       const message = body.messages[reduction.index];
-      if (!message || instruction(message) || isGeneratedEnvironment(message) || hasSignedState(message))
+      if (!message || authority(message) || hasOpaqueContent(message) || hasSignedState(message))
         return { signature };
       if (reduction.kind === "media") {
         if (!Array.isArray(message.content))
@@ -1758,8 +1541,10 @@ class RollingCompaction {
         if (reduction.kind === "block" && message.role !== "user" && message.role !== "assistant")
           return { signature };
         const text = reductionText(message, reduction);
-        if (!text || basename(reduction.path) !== "tool_kvguard_" + digest(text))
+        if (!text || basename3(reduction.path) !== contentArtifactName(text))
           return { signature };
+        if (reduction.kind === "read")
+          continue;
         const eligible = shakeRegions(body.messages, { protectTokens: 0, minSavings: 0, currentUser: lastUser, count: () => 400, archived: new Set, reductions: [] });
         if (!eligible.some((region) => region.index === reduction.index && region.kind === reduction.kind && (region.kind !== "block" || reduction.kind === "block" && region.part === reduction.part && region.start === reduction.start && region.end === reduction.end)))
           return { signature };
@@ -1770,7 +1555,11 @@ class RollingCompaction {
       if (!message || message.role !== "assistant" || hasSignedState(message) || state.segments.some((segment) => segment.archived.includes(entry.index)) || ["reasoning", "reasoning_content"].some((field) => Object.hasOwn(message, field) && Object.hasOwn(entry, field)))
         return { signature };
     }
-    return { signature, state };
+    if (!state.segments.length && !reductions.length && !state.replay?.length)
+      return { signature };
+    if (reductions.length === (state.reductions?.length ?? 0))
+      return { signature, state };
+    return { signature, state: { ...state, reductions: reductions.length ? reductions : undefined } };
   }
   reconstruct(body, context) {
     if (this.options === false)
@@ -1809,8 +1598,12 @@ class RollingCompaction {
       return;
     const key = this.key(body, context);
     const lane = this.lanes.get(key);
-    if (!lane || lane.speculation)
+    if (!lane)
       return;
+    if (lane.speculation) {
+      const existing = lane.speculation;
+      return existing.promise.then(() => !!existing.staged);
+    }
     const abort = new AbortController;
     const signal = context.signal ? AbortSignal.any([context.signal, abort.signal]) : abort.signal;
     const base = JSON.stringify(lane.state ?? null);
@@ -1834,6 +1627,7 @@ class RollingCompaction {
       if (!entry.staged && lane.speculation === entry)
         lane.speculation = undefined;
     })();
+    return entry.promise.then(() => !!entry.staged);
   }
   async compact(source, context, lane, active, adopted = false) {
     const config = this.options;
@@ -1846,21 +1640,25 @@ class RollingCompaction {
         throw new Error(`Compaction requires an actual positive integer ${name}; no model limits are guessed`);
     }
     const rawCount = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") / config.bytesPerToken);
-    const measured = (body) => context.estimate?.(body, rawCount) ?? rawCount(body);
+    const promptCount = (body) => context.countPrompt?.(body) ?? rawCount(body);
+    const measured = (body) => {
+      const calibrated = context.countPrompt?.(body);
+      const fallback = calibrated === undefined ? rawCount : (candidate) => candidate === body ? calibrated : promptCount(candidate);
+      return context.estimate?.(body, fallback) ?? fallback(body);
+    };
     const budget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - context.outputLimit) - config.marginTokens);
     if (budget < 1)
       throw new Error("Compaction has no input budget after the actual output reserve and margin");
     const resolved = policy(context.contextWindow, config);
     const { trigger, target } = resolved;
     const cap = Math.min(context.modelOutputLimit ?? Infinity, resolved.summaryCap);
-    const lastUser = context.currentUser ? source.messages.indexOf(context.currentUser) : source.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message));
+    const lastUser = context.currentUser ? source.messages.indexOf(context.currentUser) : source.messages.findLastIndex(conversationUser);
     if (context.currentUser && lastUser < 0)
       throw new Error("Cannot compact without the exact current user instruction object in the outgoing history");
     const units = protocolGroups(source.messages);
     const retained = this.retained(source, context, lane.state);
     const state = retained.state;
-    if (!state)
-      lane.state = undefined;
+    lane.state = state;
     let segments = structuredClone(state?.segments ?? []);
     let reductions = structuredClone(state?.reductions ?? []);
     let storageFailed = false;
@@ -1889,13 +1687,16 @@ class RollingCompaction {
     }
     const initialReductionCount = reductions.length;
     let workingSource = replayed(source, lane.state?.replay);
+    const activeReductions = () => withReadWitnesses(source.messages, segments, reductions, context.readEvidence);
+    const projectedMessages = (messages = workingSource.messages) => applyReductions(messages, activeReductions());
     const effective = () => {
-      const body = rewritten(reductions.length ? { ...workingSource, messages: applyReductions(workingSource.messages, reductions) } : workingSource, segments);
+      const messages = projectedMessages();
+      const body = rewritten(messages === workingSource.messages ? workingSource : { ...workingSource, messages }, segments);
       return context.restoreReasoning?.(body) ?? body;
     };
     const current = effective();
     const positions = new Map;
-    rewritten({ ...source, messages: applyReductions(source.messages, reductions) }, segments, positions);
+    rewritten({ ...source, messages: projectedMessages(source.messages) }, segments, positions);
     workingSource = { ...source, messages: source.messages.map((message, index) => {
       const position = positions.get(index);
       const restored = position === undefined ? undefined : current.messages[position];
@@ -1906,11 +1707,11 @@ class RollingCompaction {
     }) };
     const before = measured(source);
     const observed = measured(current);
-    const correction = Math.max(1, observed / Math.max(1, rawCount(current)));
-    const tailCorrection = context.estimate ? Math.max(1, observed / Math.max(1, current.messages.filter((message) => !instruction(message)).reduce((sum, message) => sum + rawCount(message), 0))) : 1;
+    const correction = Math.max(1, observed / Math.max(1, promptCount(current)));
+    const tailCorrection = context.estimate ? Math.max(1, observed / Math.max(1, current.messages.filter((message) => !authority(message)).reduce((sum, message) => sum + rawCount(message), 0))) : 1;
     let overflow = context.overflow !== undefined;
     let overflowScale = overflow ? Math.max(1, Math.max(context.overflow?.promptTokens ?? 0, budget + 1) / Math.max(1, observed)) : 1;
-    const estimate = (body) => Math.ceil((body === current ? observed : Math.max(measured(body), rawCount(body) * correction)) * overflowScale);
+    const estimate = (body) => Math.ceil((body === current ? observed : Math.max(measured(body), promptCount(body) * correction)) * overflowScale);
     let calls = 0;
     let prefixHandoff = false;
     let rescue = false;
@@ -1926,6 +1727,7 @@ class RollingCompaction {
       coveredMessages: new Set(segments.flatMap((segment) => segment.archived)).size,
       shakenResults: reductions.filter((reduction) => reduction.kind === "shake").length,
       shakenBlocks: reductions.filter((reduction) => reduction.kind === "block").length,
+      supersededReads: reductions.filter((reduction) => reduction.kind === "read").length,
       droppedMedia: reductions.filter((reduction) => reduction.kind === "media").length,
       prefixHandoff,
       rescue,
@@ -1937,8 +1739,9 @@ class RollingCompaction {
       return { body: current, report: report(current, false) };
     }
     if (estimate(current) <= trigger && estimate(current) <= budget && !context.force && !context.manual && !overflow) {
-      const lead = Math.min(32000, Math.max(8192, Math.floor(trigger * 0.125)));
-      return { body: current, report: { ...report(current, false), ...context.speculate && estimate(current) >= trigger - lead ? { speculate: true } : {} } };
+      const threshold = Math.min(trigger, budget);
+      const lead = Math.min(32000, Math.max(8192, Math.floor(threshold * 0.125)), Math.max(1, Math.floor(threshold / 2)));
+      return { body: current, report: { ...report(current, false), ...context.speculate && estimate(current) >= threshold - lead ? { speculate: true } : {} } };
     }
     const speculation = lane.speculation;
     if (speculation && overflow) {
@@ -1967,6 +1770,7 @@ class RollingCompaction {
     const limit = () => overflow || context.manual ? budget : Math.min(target, budget);
     const progressed = (body) => estimate(body) <= limit() && estimate(body) < estimate(current);
     const commit = () => {
+      reductions = activeReductions();
       const body = effective();
       if (estimate(body) > budget)
         throw new Error(`Compaction cannot fit input budget ${budget}; no summary state was committed`);
@@ -1986,24 +1790,24 @@ class RollingCompaction {
       const covered = Math.max(-1, ...archived, ...reductions.map((reduction) => reduction.index), ...replay.map((entry) => entry.index)) + 1;
       if (covered)
         lane.state = { segments: structuredClone(segments), reductions: reductions.length ? structuredClone(reductions) : undefined, replay: replay.length ? replay : undefined, covered, fingerprint: digest(JSON.stringify(source.messages.slice(0, covered))), signature: retained.signature };
-      return { body, report: { ...report(body, true), shook: reductions.filter((reduction) => reduction.kind === "shake" || reduction.kind === "block").length - (state?.reductions?.filter((reduction) => reduction.kind !== "media").length ?? 0) } };
+      return { body, report: { ...report(body, true), shook: reductions.filter((reduction) => reduction.kind === "shake" || reduction.kind === "block").length - (state?.reductions?.filter((reduction) => reduction.kind === "shake" || reduction.kind === "block").length ?? 0) } };
     };
     const policies = intervals(source.messages);
-    const fixed = { ...source, messages: source.messages.filter(instruction) };
+    const fixed = { ...source, messages: source.messages.filter((message) => authority(message) || hasOpaqueContent(message)) };
     if (estimate(fixed) > budget)
-      throw new Error(`Compaction cannot fit input budget ${budget}: fixed system/tools/format exceed the hard limit; no summary state was committed`);
+      throw new Error(`Compaction cannot fit input budget ${budget}: fixed instructions, tools, format or opaque content exceed the hard limit; no summary state was committed`);
     const preparePlans = () => {
       const archived = new Set(segments.flatMap((segment) => segment.archived));
       const liveUnits = units.filter((group) => !archived.has(group.start));
       const tail = Math.max(1, Math.floor(resolved.keepRecentTokens / tailCorrection / overflowScale));
-      const cut = recentCut(liveUnits, applyReductions(workingSource.messages, reductions), tail, rawCount);
-      const lastGroup = units.findLast((group) => !isGeneratedEnvironment(source.messages[group.start] ?? { role: "" }));
+      const cut = recentCut(liveUnits, projectedMessages(), tail, rawCount);
+      const lastGroup = units.findLast((group) => !authority(source.messages[group.start] ?? { role: "" }));
       const newestTool = units.findLast((group) => group.start > lastUser && Array.isArray(source.messages[group.start]?.tool_calls));
-      const splitTurnStart = source.messages[cut]?.role === "assistant" ? source.messages.findLastIndex((message, index) => index < cut && message.role === "user" && !isGeneratedEnvironment(message)) : -1;
+      const splitTurnStart = source.messages[cut]?.role === "assistant" ? source.messages.findLastIndex((message, index) => index < cut && conversationUser(message)) : -1;
       const plans = new Map;
       for (const group of units) {
         const message = source.messages[group.start];
-        if (group.start >= cut || group === lastGroup || group === newestTool || !message || instruction(message) || isGeneratedEnvironment(message) || group.start <= lastUser && group.end > lastUser || archived.has(group.start))
+        if (group.start >= cut || group === lastGroup || group === newestTool || !message || authority(message) || source.messages.slice(group.start, group.end).some(hasOpaqueContent) || group.start <= lastUser && group.end > lastUser || archived.has(group.start))
           continue;
         const interval = policies[group.start];
         let plan = plans.get(interval);
@@ -2027,7 +1831,7 @@ class RollingCompaction {
     if (context.prefixHandoff && !constrainedOutput(current) && !overflow && handoffPlans.length) {
       const prior = structuredClone(segments);
       const positions = new Map;
-      rewritten({ ...source, messages: applyReductions(source.messages, reductions) }, segments, positions);
+      rewritten({ ...source, messages: projectedMessages(source.messages) }, segments, positions);
       let failed = false;
       for (const plan of handoffPlans) {
         const selected = [...plan.previous ? [positions.get(plan.previous.archived[0] ?? -1)] : [], ...plan.additions.map((index) => positions.get(index))].filter((index) => index !== undefined).sort((a, b) => a - b);
@@ -2079,22 +1883,17 @@ class RollingCompaction {
       segments = prior;
       prefixHandoff = false;
     }
-    const shake = async (protectTokens, minSavings) => {
+    const saveReductions = async (regions) => {
       if (!context.artifacts)
         return;
-      const positions = new Map;
-      const projected = rewritten({ ...workingSource, messages: applyReductions(workingSource.messages, reductions) }, segments, positions);
-      const restored = context.restoreReasoning?.(projected) ?? projected;
-      const costs = source.messages.map((_, index) => {
-        const position = positions.get(index);
-        const message = position === undefined ? undefined : restored.messages[position];
-        return message ? rawCount(message) : 0;
-      });
-      const regions = shakeRegions(source.messages, { protectTokens, minSavings, currentUser: lastUser, count: rawCount, costs, archived: new Set(segments.flatMap((segment) => segment.archived)), reductions });
       for (const region of regions) {
         const path = context.artifacts.path(region.text);
+        if (region.kind === "read" && rawCount(readPlaceholder(path)) >= region.tokens)
+          continue;
         active();
         try {
+          if (!isAbsolute4(path) || basename3(path) !== contentArtifactName(region.text))
+            throw new Error("Artifact path does not match its content");
           await context.artifacts.save(path, region.text);
         } catch (error) {
           active();
@@ -2106,6 +1905,31 @@ class RollingCompaction {
         reductions.push({ ...reduction, path });
       }
     };
+    if (context.readEvidence && context.artifacts) {
+      await saveReductions(readRegions(source.messages, {
+        archived: new Set(segments.flatMap((segment) => segment.archived)),
+        reduced: new Set(reductions.map((reduction) => reduction.index)),
+        count: rawCount,
+        evidence: context.readEvidence
+      }));
+      if (progressed(effective()))
+        return commit();
+    }
+    const shake = async (protectTokens, minSavings) => {
+      if (!context.artifacts)
+        return;
+      const positions = new Map;
+      reductions = activeReductions();
+      const projected = rewritten({ ...workingSource, messages: projectedMessages() }, segments, positions);
+      const restored = context.restoreReasoning?.(projected) ?? projected;
+      const costs = source.messages.map((_, index) => {
+        const position = positions.get(index);
+        const message = position === undefined ? undefined : restored.messages[position];
+        return message ? rawCount(message) : 0;
+      });
+      const regions = shakeRegions(source.messages, { protectTokens, minSavings, currentUser: lastUser, count: rawCount, costs, archived: new Set(segments.flatMap((segment) => segment.archived)), reductions });
+      await saveReductions(regions);
+    };
     await shake(16000, 4000);
     if (progressed(effective()))
       return commit();
@@ -2115,7 +1939,7 @@ class RollingCompaction {
       const prefix = plan.splitTurnStart < 0 ? [] : plan.additions.filter((index) => index >= plan.splitTurnStart);
       let summary = plan.previous?.summary ?? "";
       if (history.length) {
-        const result = await softSummary({ body: { ...workingSource, messages: applyReductions(workingSource.messages, reductions) }, context, additions: history, previous: plan.previous?.summary, cap, margin: config.marginTokens, count: rawCount, active, onRequest: () => {
+        const result = await softSummary({ body: { ...workingSource, messages: projectedMessages() }, context, additions: history, previous: plan.previous?.summary, cap, margin: config.marginTokens, count: rawCount, promptCount, active, onRequest: () => {
           calls++;
         } });
         if ("response" in result)
@@ -2124,7 +1948,7 @@ class RollingCompaction {
       }
       if (prefix.length) {
         const prefixCap = Math.max(1, Math.min(Math.floor(0.5 * resolved.summaryReserve), 16384, context.modelOutputLimit ?? Infinity, config.summaryOutputTokens ?? Infinity));
-        const result = await softSummary({ body: { ...workingSource, messages: applyReductions(workingSource.messages, reductions) }, context, additions: prefix, turnPrefix: true, cap: prefixCap, margin: config.marginTokens, count: rawCount, active, onRequest: () => {
+        const result = await softSummary({ body: { ...workingSource, messages: projectedMessages() }, context, additions: prefix, turnPrefix: true, cap: prefixCap, margin: config.marginTokens, count: rawCount, promptCount, active, onRequest: () => {
           calls++;
         } });
         if ("response" in result)
@@ -2148,7 +1972,7 @@ ${result.summary}` : result.summary;
     if (progressed(effective()))
       return commit();
     source.messages.forEach((message, index) => {
-      if (instruction(message) || isGeneratedEnvironment(message) || hasSignedState(message) || !Array.isArray(message.content) || reductions.some((reduction) => reduction.index === index && reduction.kind === "media"))
+      if (authority(message) || hasOpaqueContent(message) || hasSignedState(message) || !Array.isArray(message.content) || reductions.some((reduction) => reduction.index === index && reduction.kind === "media"))
         return;
       if (message.content.some((part) => record(part) && ["image_url", "image", "input_image"].includes(String(part.type))))
         reductions.push({ index, kind: "media" });
@@ -2193,348 +2017,25 @@ ${result.summary}` : result.summary;
   }
 }
 
-// src/native-compaction.ts
-var systemLength = 630;
-var systemHash = "552db0de0af1873a8acd4a631e2548345d4c43192de1d9be69c8feab4b41f80c";
-var templateLength = 1107;
-var templateHash = "f508afb34ee881f5d317eda1fa22dff19426c257377796dad5b97436f4436e6a";
-var updateLength = 952;
-var updateHash = "f089eb74bde1fb476647bae165d276f4e214eb32b5515f0d86bda9a0f26b6c15";
-var start = `Here is the conversation so far:
+// src/heads.ts
+import { randomUUID } from "crypto";
 
-<conversation>
-`;
-var initial = `
-
-Create a new anchored summary from the conversation history in the <conversation> tags above so another coding agent can continue the work.`;
-var priorStart = `
-
-Here is the summary of the conversation before the <conversation> above:
-
-<prior-summary>
-`;
-function nativeCompactionInput(body) {
-  const system = body.messages[0];
-  const user = body.messages[1];
-  if (body.messages.length !== 2 || system?.role !== "system" || typeof system.content !== "string" || user?.role !== "user" || typeof user.content !== "string")
-    return;
-  if (digest(system.content.slice(0, systemLength)) !== systemHash || system.content.length > systemLength && system.content[systemLength] !== `
-`)
-    return;
-  const text = user.content;
-  if (!text.startsWith(start))
-    return;
-  const templateAt = text.lastIndexOf(`
-
-Output exactly the Markdown structure shown inside <template>`) + 2;
-  if (templateAt < 2 || digest(text.slice(templateAt, templateAt + templateLength)) !== templateHash)
-    return;
-  const context = [system.content.slice(systemLength).trim(), text.slice(templateAt + templateLength).trim()].filter(Boolean);
-  let conversation = text.slice(0, templateAt - 2);
-  let previous;
-  if (conversation.endsWith(initial))
-    conversation = conversation.slice(0, -initial.length);
-  else {
-    if (digest(conversation.slice(-updateLength)) !== updateHash)
-      return;
-    conversation = conversation.slice(0, -updateLength - 2);
-    if (!conversation.endsWith(`
-</prior-summary>`))
-      return;
-    const at = conversation.lastIndexOf(priorStart);
-    if (at < 0)
-      return;
-    previous = conversation.slice(at + priorStart.length, -`
-</prior-summary>`.length);
-    conversation = conversation.slice(0, at);
-  }
-  if (!conversation.endsWith(`
-</conversation>`))
-    return;
-  return { conversation: conversation.slice(start.length, -`
-</conversation>`.length), previous, context };
+// src/prefix.ts
+function canonical(value) {
+  if (Array.isArray(value))
+    return value.map(canonical);
+  if (value === null || typeof value !== "object")
+    return value;
+  return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => [key, canonical(item)]));
 }
 
-// src/checkpoints.ts
-import { Database as Database2 } from "bun:sqlite";
-import { randomUUID as randomUUID5 } from "crypto";
-import { constants, watch as watch2 } from "fs";
-import { chmod, lstat, mkdir, open } from "fs/promises";
-import { join as join2, resolve as resolve2 } from "path";
-
 // src/heads.ts
-import { randomUUID as randomUUID3 } from "crypto";
 var hash = (value) => digest(JSON.stringify(canonical(value)));
 var exactKeys = (value, keys) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 var equal = (a, b) => hash(a) === hash(b);
-var key = (session, lane, model) => hash([session, lane, model ?? null]);
-function json(value, depth = 0) {
-  if (depth > 100)
-    return false;
-  if (value === null || typeof value === "string" || typeof value === "boolean")
-    return true;
-  if (typeof value === "number")
-    return Number.isFinite(value);
-  if (Array.isArray(value))
-    return value.every((item) => json(item, depth + 1));
-  return record(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null) && Object.values(value).every((item) => json(item, depth + 1));
-}
-function tools(value) {
-  if (value === undefined)
-    return null;
-  if (!Array.isArray(value))
-    return false;
-  const names = new Set;
-  for (const tool of value) {
-    if (!record(tool) || !json(tool) || tool.type !== "function" || !record(tool.function) || typeof tool.function.name !== "string" || !tool.function.name || names.has(tool.function.name))
-      return false;
-    names.add(tool.function.name);
-  }
-  return canonical([...value].sort((a, b) => {
-    const left = a.function.name;
-    const right = b.function.name;
-    return left < right ? -1 : left > right ? 1 : 0;
-  }));
-}
-function chain(messages, prior, replacements) {
-  let previous = hash([]);
-  return messages.map((message, index) => {
-    const source = hash([previous, message]);
-    const replacement = replacements?.get(message);
-    const repaired = replacement && hash([previous, replacement]);
-    previous = repaired && source !== prior?.[index] && repaired === prior?.[index] ? repaired : source;
-    return previous;
-  });
-}
-function isSessionHeadsSnapshot(value, session) {
-  if (!record(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes))
-    return false;
-  const lanes = new Set;
-  const systems = (items) => Array.isArray(items) && items.every((item) => record(item) && typeof item.role === "string" && instruction(item) && json(item));
-  return value.lanes.every((lane) => {
-    if (!record(lane) || !(exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices"]) || exactKeys(lane, ["lane", "model", "system", "tools", "chain", "notices", "toolNotices"])) || typeof lane.lane !== "string" || !lane.lane || typeof lane.model !== "string" || !lane.model || !systems(lane.system) || !Array.isArray(lane.chain) || !lane.chain.every(isSha256) || new Set(lane.chain).size !== lane.chain.length || !Array.isArray(lane.notices))
-      return false;
-    const id = key(session, lane.lane, lane.model);
-    if (lanes.has(id))
-      return false;
-    lanes.add(id);
-    const normalized = tools(lane.tools === null ? undefined : lane.tools);
-    if (normalized === false || JSON.stringify(normalized) !== JSON.stringify(lane.tools))
-      return false;
-    if (lane.toolNotices !== undefined) {
-      if (!Array.isArray(lane.toolNotices) || !lane.toolNotices.length || !normalized)
-        return false;
-      const names = new Set(normalized.map((item) => item.function.name));
-      let position = -1;
-      if (!lane.toolNotices.every((notice) => {
-        if (!record(notice) || !exactKeys(notice, ["anchor", "unavailable", "changed"]) || !isSha256(notice.anchor) || !Array.isArray(notice.unavailable) || !notice.unavailable.every((name) => typeof name === "string" && names.has(name)))
-          return false;
-        const changed = tools(notice.changed);
-        if (!changed || JSON.stringify(changed) !== JSON.stringify(notice.changed) || !changed.every((item) => names.has(item.function.name)))
-          return false;
-        const index = lane.chain.indexOf(notice.anchor);
-        if (index < position || index < 0)
-          return false;
-        position = index;
-        return true;
-      }))
-        return false;
-    }
-    let anchor = -1;
-    return lane.notices.every((notice) => {
-      if (!record(notice) || !exactKeys(notice, ["anchor", "system"]) || !isSha256(notice.anchor) || !systems(notice.system) || !notice.system.length)
-        return false;
-      const index = lane.chain.indexOf(notice.anchor);
-      if (index < anchor || index < 0)
-        return false;
-      anchor = index;
-      return true;
-    });
-  });
-}
-function toolReset(previous, next) {
-  if (equal(previous, next))
-    return;
-  if (previous === null || next === null)
-    return "tools-availability-changed";
-  const before = new Set(previous.map((item) => item.function.name));
-  const after = new Set(next.map((item) => item.function.name));
-  const added = [...after].some((name) => !before.has(name));
-  const removed = [...before].some((name) => !after.has(name));
-  return added && removed ? "tools-replaced" : removed ? "tools-removed" : added ? "tools-added" : "tools-schema-changed";
-}
-function availability(frozen, current) {
-  const live = new Map(current.map((item) => [item.function.name, item]));
-  return {
-    unavailable: frozen.filter((item) => !live.has(item.function.name)).map((item) => item.function.name),
-    changed: frozen.flatMap((item) => {
-      const now = live.get(item.function.name);
-      return now && !equal(now, item) ? [now] : [];
-    })
-  };
-}
-function toolNoticeMessage(notice) {
-  const lines = ["Tool availability for the current agent changed. This replaces every earlier tool availability notice: each listed tool not named below is available with its listed definition."];
-  if (notice.unavailable.length)
-    lines.push(`These listed tools are unavailable now; calls to them fail: ${notice.unavailable.join(", ")}.`);
-  if (notice.changed.length)
-    lines.push("These listed tools now use the following definitions instead:", ...notice.changed.map((item) => JSON.stringify(item)));
-  return { role: "system", content: lines.join(`
-`) };
-}
-
-class SessionHeads {
-  lanes = new Map;
-  apply(body, context) {
-    const id = key(context.session, context.lane, body.model);
-    const normalizedTools = tools(body.tools);
-    if (normalizedTools === false) {
-      if (!context.reconstruct)
-        this.lanes.delete(id);
-      return { body, report: { status: "unsupported", reason: "unsupported-tools", notices: 0 } };
-    }
-    let count = 0;
-    while (count < body.messages.length && instruction(body.messages[count]))
-      count++;
-    const system = body.messages.slice(0, count);
-    const conversation = body.messages.slice(count);
-    const previous = this.lanes.get(id)?.state;
-    const sourceAnchors = chain(conversation);
-    const anchors = chain(conversation, previous?.chain, context.replacements);
-    let state;
-    const report = { status: previous ? "stable" : "initialized", notices: 0 };
-    const fresh = () => ({ lane: context.lane, model: body.model, system: structuredClone(system), tools: structuredClone(normalizedTools), chain: anchors, notices: [] });
-    if (!previous) {
-      state = fresh();
-      if (context.parentSession) {
-        const parent = this.lanes.get(key(context.parentSession, context.parentLane ?? context.lane, body.model))?.state;
-        if (!parent)
-          report.parent = "missing";
-        else if (!equal([...parent.system, ...parent.notices.flatMap((notice) => notice.system)], system) || !equal(parent.tools, normalizedTools) || parent.notices.length && (!anchors.length || conversation.some(instruction)))
-          report.parent = "incompatible";
-        else {
-          state.system = structuredClone(parent.system);
-          state.tools = structuredClone(parent.tools);
-          if (parent.notices.length)
-            state.notices = [{ anchor: anchors.at(-1), system: structuredClone(system.slice(parent.system.length)) }];
-          report.parent = "shared";
-        }
-      }
-    } else {
-      let shared = 0;
-      while (shared < previous.chain.length && previous.chain[shared] === anchors[shared])
-        shared++;
-      const liveTools = context.stableTools === true && normalizedTools === null ? [] : normalizedTools;
-      const keepCatalog = context.stableTools === true && previous.tools !== null && liveTools !== null && liveTools.every((item) => previous.tools.some((frozen) => frozen.function.name === item.function.name));
-      let reason = keepCatalog ? undefined : toolReset(previous.tools, normalizedTools);
-      let history;
-      if (!reason && shared < previous.chain.length && !context.reconstruct)
-        history = shared === anchors.length ? "history-reverted" : "history-edited";
-      if (!reason && context.reconstruct && anchors.length < previous.chain.length)
-        history = "history-reverted";
-      const keep = !history ? previous.chain.length : context.reconstruct ? anchors.length : shared;
-      const retained = previous.notices.filter((notice) => previous.chain.indexOf(notice.anchor) < keep);
-      const retainedTools = (previous.toolNotices ?? []).filter((notice) => previous.chain.indexOf(notice.anchor) < keep);
-      const live = keepCatalog ? availability(previous.tools, liveTools) : undefined;
-      const announced = retainedTools.at(-1) ?? { unavailable: [], changed: [] };
-      const announce = live !== undefined && !equal({ unavailable: announced.unavailable, changed: announced.changed }, live);
-      if (!reason && announce && !anchors.length)
-        reason = toolReset(previous.tools, normalizedTools) ?? "tools-availability-changed";
-      const effective = [...previous.system, ...retained.flatMap((notice) => notice.system)];
-      const compatible = system.length >= effective.length && effective.every((message, index) => equal(message, system[index]));
-      if (!reason && !compatible)
-        reason = "system-contract-changed";
-      if (!reason && (retained.length || system.length > effective.length) && conversation.some(instruction))
-        reason = "system-contract-changed";
-      if (!reason && system.length > effective.length && !anchors.length)
-        reason = "unanchored-system-addition";
-      if (reason) {
-        state = fresh();
-        report.status = "reset";
-        report.reason = reason;
-      } else {
-        state = structuredClone(previous);
-        state.notices = structuredClone(retained);
-        state.toolNotices = structuredClone(retainedTools);
-        if (history) {
-          report.status = "rewound";
-          report.reason = history;
-        }
-        if (context.reconstruct) {
-          state.notices = state.notices.map((notice) => ({
-            ...notice,
-            anchor: anchors[previous.chain.indexOf(notice.anchor)]
-          }));
-          state.toolNotices = state.toolNotices.map((notice) => ({
-            ...notice,
-            anchor: anchors[previous.chain.indexOf(notice.anchor)]
-          }));
-        }
-        state.chain = anchors;
-        if (system.length > effective.length) {
-          state.notices.push({ anchor: anchors.at(-1), system: structuredClone(system.slice(effective.length)) });
-          report.status = "appended";
-        }
-        if (announce) {
-          state.toolNotices.push({ anchor: anchors.at(-1), ...live });
-          report.status = "appended";
-        }
-        if (!state.toolNotices.length)
-          delete state.toolNotices;
-      }
-    }
-    state.notices = state.notices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)] }));
-    if (state.toolNotices)
-      state.toolNotices = state.toolNotices.map((notice) => ({ ...notice, anchor: sourceAnchors[anchors.indexOf(notice.anchor)] }));
-    state.chain = sourceAnchors;
-    if (!context.reconstruct)
-      this.lanes.set(id, { session: context.session, state });
-    report.notices = state.notices.reduce((total, notice) => total + notice.system.length, 0);
-    if (state.toolNotices)
-      report.toolNotices = state.toolNotices.length;
-    const messages = [...structuredClone(state.system)];
-    for (let index = 0;index < conversation.length; index++) {
-      messages.push(conversation[index]);
-      for (const notice of state.notices)
-        if (notice.anchor === sourceAnchors[index])
-          messages.push(...structuredClone(notice.system));
-      for (const notice of state.toolNotices ?? [])
-        if (notice.anchor === sourceAnchors[index])
-          messages.push(toolNoticeMessage(notice));
-    }
-    const result = { ...body, messages };
-    if (state.tools !== null)
-      result.tools = structuredClone(state.tools);
-    return { body: result, report };
-  }
-  snapshot(session) {
-    return { version: 1, session, lanes: [...this.lanes.values()].filter((entry) => entry.session === session).map((entry) => structuredClone(entry.state)) };
-  }
-  restore(session, value) {
-    if (!isSessionHeadsSnapshot(value, session))
-      return false;
-    this.delete(session);
-    for (const state of value.lanes)
-      this.lanes.set(key(session, state.lane, state.model), { session, state: structuredClone(state) });
-    return true;
-  }
-  delete(session) {
-    for (const [id, lane] of this.lanes)
-      if (lane.session === session)
-        this.lanes.delete(id);
-  }
-  clear() {
-    this.lanes.clear();
-  }
-}
+var key = (session, lane) => hash([session, lane]);
 function messageHashes(message) {
   return { hash: hash(message), role: message.role, fields: Object.fromEntries(Object.entries(message).filter(([, value]) => value !== undefined).map(([field, value]) => [field, hash(value)])) };
-}
-function structure(body) {
-  return {
-    fields: Object.fromEntries(Object.entries(body).filter(([field, value]) => field !== "messages" && value !== undefined).map(([field, value]) => [field, hash(value)])),
-    messages: body.messages.map(messageHashes)
-  };
 }
 function structuralChain(messages) {
   let previous = hash([]);
@@ -2544,7 +2045,7 @@ function bound(request, fields, anchors) {
   return request.fields === fields && anchors.length >= request.length && request.chain === (request.length ? anchors[request.length - 1] : hash([]));
 }
 function plainAssistant(value) {
-  if (!record(value) || !json(value) || value.role !== "assistant" || Object.keys(value).some((field) => !["role", "content", "tool_calls", "name", "reasoning_content", "reasoning"].includes(field)))
+  if (!record(value) || value.role !== "assistant" || Object.keys(value).some((field) => !["role", "content", "tool_calls", "name", "reasoning_content", "reasoning"].includes(field)))
     return false;
   if (value.content !== undefined && value.content !== null && typeof value.content !== "string")
     return false;
@@ -2566,10 +2067,10 @@ function plainAssistant(value) {
 }
 function isRequestHashes(value) {
   const fields = (items) => record(items) && Object.keys(items).every((field) => field.length > 0) && Object.values(items).every(isSha256);
-  return record(value) && exactKeys(value, ["fields", "messages"]) && fields(value.fields) && Object.hasOwn(value.fields, "model") && !Object.hasOwn(value.fields, "messages") && Array.isArray(value.messages) && value.messages.every((message) => record(message) && exactKeys(message, ["hash", "role", "fields"]) && isSha256(message.hash) && typeof message.role === "string" && !!message.role && fields(message.fields) && message.fields.role === hash(message.role));
+  return record(value) && exactKeys(value, ["fields", "messages", "wire"]) && isSha256(value.wire) && fields(value.fields) && Object.hasOwn(value.fields, "model") && !Object.hasOwn(value.fields, "messages") && Array.isArray(value.messages) && value.messages.every((message) => record(message) && exactKeys(message, ["hash", "role", "fields"]) && isSha256(message.hash) && typeof message.role === "string" && !!message.role && fields(message.fields) && message.fields.role === hash(message.role));
 }
 function isPrefixGuardSnapshot(value, session) {
-  if (!record(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 1 || value.session !== session || !Array.isArray(value.lanes))
+  if (!record(value) || !exactKeys(value, ["version", "session", "lanes"]) || value.version !== 2 || value.session !== digest(session) || !Array.isArray(value.lanes))
     return false;
   const lanes = new Set;
   return value.lanes.every((lane) => {
@@ -2581,9 +2082,10 @@ function isPrefixGuardSnapshot(value, session) {
     const anchors = structuralChain(previous.messages);
     const records = new Set;
     return lane.records.every((entry) => {
-      if (!record(entry) || !exactKeys(entry, ["request", "assistant"]) || !record(entry.request) || !exactKeys(entry.request, ["fields", "length", "chain"]) || !isSha256(entry.request.fields) || !isSha256(entry.request.chain) || !Number.isSafeInteger(entry.request.length) || entry.request.length < 0 || !plainAssistant(entry.assistant))
+      if (!record(entry) || !exactKeys(entry, ["request", "assistant"]) || !record(entry.request) || !exactKeys(entry.request, ["fields", "length", "chain"]) || !isSha256(entry.request.fields) || !isSha256(entry.request.chain) || typeof entry.request.length !== "number" || !Number.isSafeInteger(entry.request.length) || entry.request.length < 0 || !plainAssistant(entry.assistant))
         return false;
-      const request = entry.request;
+      const { fields: policy, length, chain } = entry.request;
+      const request = { fields: policy, length, chain };
       if (!bound(request, fields, anchors))
         return false;
       const assistant = previous.messages[request.length];
@@ -2604,9 +2106,10 @@ function differences(previous, next) {
       continue;
     result.push({ kind: !Object.hasOwn(previous.fields, field) ? "request-field-added" : !Object.hasOwn(next.fields, field) ? "request-field-removed" : "request-field-changed", field, classification: field === "model" ? "model" : field === "tools" || field === "tool_choice" ? "tools" : "other" });
   }
-  for (let index = 0;index < Math.min(previous.messages.length, next.messages.length); index++) {
-    const before = previous.messages[index];
+  for (const [index, before] of previous.messages.entries()) {
     const after = next.messages[index];
+    if (!after)
+      break;
     if (before.hash === after.hash)
       continue;
     for (const field of [...new Set([...Object.keys(before.fields), ...Object.keys(after.fields)])].sort()) {
@@ -2628,18 +2131,18 @@ class PrefixGuard {
   apply(body, context) {
     const id = key(context.session, context.lane);
     const prior = this.lanes.get(id)?.state;
-    const report = { receipt: randomUUID3(), firstRequest: !prior, sharedMessages: 0, previousMessages: prior?.previous.messages.length ?? 0, currentMessages: body.messages.length, divergences: [], replayed: [] };
+    const replayed = [];
     let result = body;
-    const current = structure(body);
-    const fields = hash(current.fields);
+    const fieldHashes = Object.fromEntries(Object.entries(body).filter(([field, value]) => field !== "messages" && value !== undefined).map(([field, value]) => [field, hash(value)]));
+    const fields = hash(fieldHashes);
     const anchors = [];
+    const messages = [];
     const available = new Map;
     for (const entry of prior?.records ?? [])
       available.set(entry.request.length, [...available.get(entry.request.length) ?? [], entry]);
-    for (let index = 0;index < body.messages.length; index++) {
-      const message = result.messages[index];
+    for (const [index, message] of body.messages.entries()) {
       const candidates = [];
-      if (context.replay !== false && message.role === "assistant" && message !== context.currentUser) {
+      if (context.replay !== false && message.role === "assistant") {
         for (const entry of available.get(index) ?? []) {
           if (!bound(entry.request, fields, anchors))
             continue;
@@ -2652,16 +2155,30 @@ class PrefixGuard {
             candidates.push(candidate);
         }
       }
-      if (candidates.length === 1) {
-        const candidate = candidates[0];
+      const [candidate, ambiguous] = candidates;
+      if (candidate && !ambiguous) {
         if (result === body)
           result = { ...body, messages: [...body.messages] };
         result.messages[index] = candidate;
-        report.replayed.push({ index, fields: ["reasoning_content", "reasoning"].filter((field) => !Object.hasOwn(message, field) && Object.hasOwn(candidate, field)) });
-        current.messages[index] = messageHashes(candidate);
+        replayed.push({ index, fields: ["reasoning_content", "reasoning"].filter((field) => !Object.hasOwn(message, field) && Object.hasOwn(candidate, field)) });
       }
-      anchors.push(hash([anchors.at(-1) ?? hash([]), current.messages[index].hash]));
+      const hashed = messageHashes(candidate && !ambiguous ? candidate : message);
+      messages.push(hashed);
+      anchors.push(hash([anchors.at(-1) ?? hash([]), hashed.hash]));
     }
+    const serialized = JSON.stringify(result);
+    const current = { fields: fieldHashes, messages, wire: digest(serialized) };
+    const report = {
+      receipt: context.receipt ?? randomUUID(),
+      wireFingerprint: current.wire,
+      wireBytes: Buffer.byteLength(serialized),
+      firstRequest: !prior,
+      sharedMessages: 0,
+      previousMessages: prior?.previous.messages.length ?? 0,
+      currentMessages: messages.length,
+      divergences: [],
+      replayed
+    };
     let records = prior?.records ?? [];
     if (prior) {
       report.divergences = differences(prior.previous, current);
@@ -2677,21 +2194,25 @@ class PrefixGuard {
       this.lanes.set(id, { session: context.session, state: { lane: context.lane, receipt: report.receipt, previous: current, records } });
     return { body: result, report };
   }
+  accepts(body, context) {
+    const prior = this.lanes.get(key(context.session, context.lane))?.state;
+    return prior !== undefined && context.receipt === prior.receipt && prior.previous.wire === digest(JSON.stringify(body));
+  }
   record(body, assistant, context) {
     if (context.outcome !== "success" || !["stop", "tool_calls"].includes(context.finishReason) || !plainAssistant(assistant) || context.finishReason === "tool_calls" && (!Array.isArray(assistant.tool_calls) || !assistant.tool_calls.length))
       return false;
     const id = key(context.session, context.lane);
-    const request = structure(body);
     const prior = this.lanes.get(id)?.state;
-    if (!prior || context.receipt !== prior.receipt || !equal(prior.previous, request))
+    if (!prior || !this.accepts(body, context))
       return false;
+    const request = prior.previous;
     const entry = { request: { fields: hash(request.fields), length: request.messages.length, chain: structuralChain(request.messages).at(-1) ?? hash([]) }, assistant: structuredClone(assistant) };
     if (!prior.records.some((item) => equal(item, entry)))
       prior.records.push(entry);
     return true;
   }
   snapshot(session) {
-    return { version: 1, session, lanes: [...this.lanes.values()].filter((entry) => entry.session === session).map((entry) => structuredClone(entry.state)) };
+    return { version: 2, session: digest(session), lanes: [...this.lanes.values()].filter((entry) => entry.session === session).map((entry) => structuredClone(entry.state)) };
   }
   restore(session, value) {
     if (!isPrefixGuardSnapshot(value, session))
@@ -2712,8 +2233,7 @@ class PrefixGuard {
 }
 
 // src/usage.ts
-import { isDeepStrictEqual } from "util";
-import { randomUUID as randomUUID4 } from "crypto";
+import { randomUUID as randomUUID2 } from "crypto";
 var count = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 function isUsageSnapshot(value) {
   if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes))
@@ -2792,18 +2312,11 @@ class UsageTracker {
       }] : [];
     }) };
   }
-  prepare(lane) {
+  prepare(lane, receipt = randomUUID2()) {
     const state = this.lanes.get(lane) ?? { latest: 0 };
-    state.receipt = randomUUID4();
+    state.receipt = receipt;
     this.lanes.set(lane, state);
     return state.receipt;
-  }
-  publish(snapshot, receipt) {
-    for (const { lane, anchor } of snapshot.lanes) {
-      const state = this.lanes.get(lane);
-      if (state?.receipt === receipt && anchor)
-        state.anchor = structuredClone(anchor);
-    }
   }
   restore(snapshot, replace = []) {
     for (const lane of replace) {
@@ -2830,7 +2343,7 @@ class UsageTracker {
     }
   }
   begin(body, lane, receipt) {
-    const request = { startedAt: performance.now() };
+    const request = {};
     let state = this.lanes.get(lane);
     if (receipt !== state?.receipt)
       return request;
@@ -2891,16 +2404,6 @@ function usage(value) {
   }
   return result;
 }
-function output(value) {
-  if (!record(value))
-    return false;
-  if ([value.content, value.reasoning_content, value.reasoning, value.reasoning_text].some((part) => typeof part === "string" && part.length > 0))
-    return true;
-  if (Array.isArray(value.content) && value.content.some((part) => record(part) && part.type === "text" && typeof part.text === "string" && part.text.length > 0))
-    return true;
-  const calls = Array.isArray(value.tool_calls) ? value.tool_calls : record(value.function_call) ? [{ function: value.function_call }] : [];
-  return calls.some((call) => record(call) && (typeof call.id === "string" && call.id.length > 0 || record(call.function) && [call.function.name, call.function.arguments].some((part) => typeof part === "string" && part.length > 0)));
-}
 
 class Events {
   event;
@@ -2911,7 +2414,6 @@ class Events {
   push(chunk, eof = false) {
     if (chunk.length)
       this.pending = Buffer.concat([this.pending, chunk]);
-    const frames = [];
     let start = 0;
     let line = 0;
     for (let index = 0;index < this.pending.length; ) {
@@ -2924,36 +2426,33 @@ class Events {
         break;
       const end = index + (byte === 13 && this.pending[index + 1] === 10 ? 2 : 1);
       if (index === line) {
-        frames.push(this.event(this.pending.subarray(start, end)));
+        this.event(this.pending.subarray(start, end));
         start = end;
       }
       line = end;
       index = end;
     }
     this.pending = this.pending.slice(start);
-    return frames;
   }
 }
-function observeResponse(response, options) {
-  const { body: prompt, lane, tracker, signal, transform } = options;
-  const request = options.request ?? tracker.begin(prompt, lane);
-  const headerMs = Math.max(0, performance.now() - request.startedAt);
+function observeResponse(response, onComplete) {
   const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
   const format = contentType === "text/event-stream" ? "sse" : contentType === "application/json" || contentType?.endsWith("+json") ? "json" : "other";
+  if (!response.ok || !response.body || format === "other")
+    return response;
+  const reader = response.body.getReader();
   const counts = {};
   const choices = new Set;
   const finishedChoices = new Set;
-  let firstOutputMs;
   let terminal = false;
   let invalid = false;
-  let reported = false;
   let stopped = false;
   let replayable = true;
   let finishReason;
   const assistant = { role: "assistant", content: "" };
   const calls = new Map;
   const collect = (value) => {
-    if (!options.onAssistant || !record(value) || !Array.isArray(value.choices))
+    if (!record(value) || !Array.isArray(value.choices))
       return;
     for (const choice of value.choices) {
       if (!record(choice) || choice.index !== undefined && choice.index !== 0 || value.choices.length > 1) {
@@ -3030,7 +2529,6 @@ function observeResponse(response, options) {
     }
   };
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-  const encoder = new TextEncoder;
   const inspect = (value) => {
     if (!record(value)) {
       invalid = true;
@@ -3056,22 +2554,7 @@ function observeResponse(response, options) {
         else
           finishedChoices.add(index);
       }
-      if (firstOutputMs === undefined && (output(choice.delta) || output(choice.message)))
-        firstOutputMs = Math.max(0, performance.now() - request.startedAt);
     }
-  };
-  const normalize = (value) => {
-    if (!transform) {
-      collect(value);
-      return;
-    }
-    const before = JSON.stringify(value);
-    const transformed = transform(value);
-    collect(transformed);
-    const after = JSON.stringify(transformed);
-    if (after === undefined)
-      throw new TypeError("Response transform must return a JSON value");
-    return before === after || isDeepStrictEqual(JSON.parse(before), JSON.parse(after)) ? undefined : after;
   };
   const events = new Events((frame) => {
     let text;
@@ -3079,73 +2562,42 @@ function observeResponse(response, options) {
       text = decoder.decode(frame);
     } catch {
       invalid = true;
-      return frame;
+      return;
     }
-    const lines = text.split(/(\r\n|\r|\n)/);
-    const data = [];
+    const lines = text.split(/\r\n|\r|\n/);
     const values = [];
-    for (let index = 0;index < lines.length; index += 2) {
-      const line = index === 0 ? lines[index].replace(/^\uFEFF/, "") : lines[index];
+    for (const [index, rawLine] of lines.entries()) {
+      const line = index === 0 ? rawLine.replace(/^\uFEFF/, "") : rawLine;
       const colon = line.indexOf(":");
       const field = colon < 0 ? line : line.slice(0, colon);
       const value = colon < 0 ? "" : line.slice(colon + 1).replace(/^ /, "");
       if (field === "event" && value === "error")
         invalid = true;
-      if (field !== "data")
-        continue;
-      data.push(index);
-      values.push(value);
+      if (field === "data")
+        values.push(value);
     }
-    if (!data.length)
-      return frame;
+    if (!values.length)
+      return;
     const raw = values.join(`
 `);
     if (raw.trim() === "[DONE]") {
       terminal = true;
-      return frame;
+      return;
     }
     let value;
     try {
       value = JSON.parse(raw);
     } catch {
       invalid = true;
-      return frame;
+      return;
     }
     inspect(value);
-    const changed = normalize(value);
-    if (changed === undefined)
-      return frame;
-    for (let index = 0;index < data.length; index++) {
-      const position = data[index];
-      const original = lines[position];
-      const prefix = original.startsWith("\uFEFF") ? "\uFEFF" : "";
-      const space = original.replace(/^\uFEFF/, "").startsWith("data: ") ? " " : "";
-      lines[position] = `${prefix}data:${space}${index === 0 ? changed : ""}`;
-    }
-    return encoder.encode(lines.join(""));
+    collect(value);
   });
   const json = [];
-  const finish = (outcome) => {
-    if (outcome !== "complete")
-      signal?.removeEventListener("abort", abort);
-    if (reported)
-      return;
-    reported = true;
-    const anchorRecorded = outcome === "complete" && counts.promptTokens !== undefined && (counts.cachedTokens === undefined || counts.cachedTokens <= counts.promptTokens) && tracker.record(request, prompt, lane, counts.promptTokens);
-    const retained = anchorRecorded ? options.onAnchor?.() : undefined;
-    const report = {
-      laneFingerprint: digest(lane),
-      ...options.label === undefined ? {} : { label: options.label },
-      status: response.status,
-      format,
-      outcome,
-      headerMs,
-      ...firstOutputMs === undefined ? {} : { firstOutputMs },
-      endMs: Math.max(0, performance.now() - request.startedAt),
-      ...counts,
-      anchorRecorded
-    };
-    if (outcome === "complete" && replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
+  const finish = () => {
+    let completedAssistant;
+    if (replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
       const ordered = [...calls].sort(([a], [b]) => a - b);
       if (ordered.every(([index, call], offset) => {
         if (index !== offset || !call.id || !call.function.name)
@@ -3162,131 +2614,84 @@ function observeResponse(response, options) {
       })) {
         if (ordered.length)
           assistant.tool_calls = ordered.map(([, call]) => call);
-        options.onAssistant?.(assistant);
+        completedAssistant = assistant;
       }
     }
-    if (options.onReport)
-      queueMicrotask(() => {
-        try {
-          Promise.resolve(options.onReport(report)).catch(() => {});
-        } catch {}
-      });
-    return retained;
+    return onComplete({
+      ...counts,
+      ...completedAssistant ? { assistant: completedAssistant } : {},
+      ...typeof finishReason === "string" ? { finishReason } : {}
+    });
   };
-  let controller;
-  const reader = response.body?.getReader();
-  const abort = () => {
-    if (stopped)
-      return;
-    stopped = true;
-    Promise.resolve(reader?.cancel(signal.reason)).then(() => controller?.error(signal.reason), (error) => controller?.error(error));
-    finish("aborted");
-  };
-  if (!reader) {
-    finish(signal?.aborted ? "aborted" : response.ok ? "incomplete" : "error");
-    return response;
-  }
   const stream = new ReadableStream({
-    start(value) {
-      controller = value;
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted)
-        abort();
-    },
     async pull(value) {
+      if (stopped)
+        return;
       try {
-        while (!stopped) {
-          const item = await reader.read();
-          if (stopped)
-            return;
-          if (!item.done) {
-            if (format === "sse") {
-              const frames = events.push(item.value);
-              if (transform) {
-                for (const frame of frames)
-                  value.enqueue(frame);
-                if (frames.length)
-                  return;
-                continue;
-              }
-            } else if (format === "json") {
-              json.push(item.value.slice());
-              if (transform)
-                continue;
-            }
-            value.enqueue(item.value);
-            return;
-          }
-          if (format === "sse") {
-            const frames = events.push(new Uint8Array(0), true);
-            if (transform)
-              for (const frame of frames)
-                value.enqueue(frame);
-            const remaining = events.pending;
-            if (/(?:^|[\r\n])(?:\uFEFF)?data(?::|[\r\n]|$)/.test(new TextDecoder().decode(remaining)))
-              invalid = true;
-            if (transform && remaining.length)
-              value.enqueue(remaining);
-          } else if (format === "json") {
-            const bytes = Buffer.concat(json);
-            let changed;
-            let parsed;
-            try {
-              parsed = JSON.parse(decoder.decode(bytes).replace(/^\uFEFF/, ""));
-            } catch {
-              invalid = true;
-            }
-            if (!invalid) {
-              inspect(parsed);
-              terminal = true;
-              changed = normalize(parsed);
-            }
-            if (transform)
-              value.enqueue(changed === undefined ? bytes : encoder.encode(changed));
-          }
-          const complete = terminal && !invalid && choices.size > 0 && [...choices].every((index) => finishedChoices.has(index));
-          await finish(!response.ok || invalid ? "error" : complete ? "complete" : "incomplete");
-          signal?.removeEventListener("abort", abort);
-          if (stopped)
-            return;
-          stopped = true;
-          value.close();
+        const item = await reader.read();
+        if (stopped)
+          return;
+        if (!item.done) {
+          if (format === "sse")
+            events.push(item.value);
+          else if (format === "json")
+            json.push(item.value.slice());
+          value.enqueue(item.value);
+          return;
         }
+        if (format === "sse") {
+          events.push(new Uint8Array(0), true);
+          const remaining = events.pending;
+          if (/(?:^|[\r\n])(?:\uFEFF)?data(?::|[\r\n]|$)/.test(new TextDecoder().decode(remaining)))
+            invalid = true;
+        } else if (format === "json") {
+          let parsed;
+          try {
+            parsed = JSON.parse(decoder.decode(Buffer.concat(json)).replace(/^\uFEFF/, ""));
+          } catch {
+            invalid = true;
+          }
+          if (!invalid) {
+            inspect(parsed);
+            terminal = true;
+            collect(parsed);
+          }
+        }
+        if (terminal && !invalid && choices.size > 0 && [...choices].every((index) => finishedChoices.has(index))) {
+          await finish();
+        }
+        if (stopped)
+          return;
+        stopped = true;
+        value.close();
       } catch (error) {
         if (stopped)
           return;
         stopped = true;
         value.error(error);
         reader.cancel(error).catch(() => {});
-        finish(signal?.aborted ? "aborted" : "error");
       }
     },
-    async cancel(reason) {
+    cancel(reason) {
       if (stopped)
         return;
       stopped = true;
-      try {
-        await reader.cancel(reason);
-      } finally {
-        finish(signal?.aborted ? "aborted" : "cancelled");
-      }
+      return reader.cancel(reason);
     }
   }, { highWaterMark: 0 });
-  const headers = new Headers(response.headers);
-  if (transform)
-    headers.delete("content-length");
-  return new Response(stream, { status: response.status, statusText: response.statusText, headers });
+  return new Response(stream, { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 
 // src/checkpoints.ts
-var version = 2;
+var version = 3;
 function isCheckpointSnapshot(value, session) {
   if (!record(value))
     return false;
-  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard", "usage"].includes(key)) && isModeRemindersSnapshot(value.modes, session) && isEnvironmentsSnapshot(value.environments) && isCompactionSnapshot(value.compaction) && (value.heads === undefined || isSessionHeadsSnapshot(value.heads, session)) && (value.prefixGuard === undefined || isPrefixGuardSnapshot(value.prefixGuard, session)) && (value.usage === undefined || isUsageSnapshot(value.usage));
+  return Object.keys(value).every((key) => ["boundary", "prefix", "usage", "compaction"].includes(key)) && (value.boundary === undefined || typeof value.boundary === "number" && Number.isSafeInteger(value.boundary) && value.boundary >= 0) && isPrefixGuardSnapshot(value.prefix, session) && isUsageSnapshot(value.usage) && (value.compaction === undefined || isCompactionSnapshot(value.compaction));
 }
 
 class CheckpointConflictError extends Error {
+  name = "CheckpointConflictError";
   constructor() {
     super("KV guard checkpoint revision conflict; reload the session before preparing another request");
   }
@@ -3297,13 +2702,13 @@ class CheckpointStore {
   constructor(root, project, scope) {
     if (!root || !project || !scope)
       throw new Error("Checkpoint root, project and policy scope must be nonempty");
-    this.directory = join2(resolve2(root), digest(project), digest(scope));
+    this.directory = join2(resolve(root), digest(project), digest(scope));
   }
   async database(session) {
     if (!session)
       throw new Error("Checkpoint session must be nonempty");
-    const root = resolve2(this.directory, "../..");
-    for (const directory of [root, resolve2(this.directory, ".."), this.directory]) {
+    const root = resolve(this.directory, "../..");
+    for (const directory of [root, resolve(this.directory, ".."), this.directory]) {
       await mkdir(directory, { recursive: true, mode: 448 });
       const stat = await lstat(directory);
       if (!stat.isDirectory() || stat.isSymbolicLink() || process.getuid && stat.uid !== process.getuid())
@@ -3320,7 +2725,7 @@ class CheckpointStore {
     } finally {
       await file.close();
     }
-    const db = new Database2(path, { strict: true });
+    const db = new Database(path, { strict: true });
     try {
       db.exec("PRAGMA busy_timeout = 0; PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON");
       db.exec("CREATE TABLE IF NOT EXISTS checkpoint (id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, version INTEGER NOT NULL, payload TEXT, deleted INTEGER NOT NULL CHECK (deleted IN (0, 1)))");
@@ -3336,25 +2741,29 @@ class CheckpointStore {
       throw new Error("KV guard checkpoint database has an invalid revision or deletion marker");
     return row;
   }
+  decode(row, session) {
+    if (!row)
+      return { revision: null, snapshot: null };
+    if (row.deleted)
+      return { revision: row.revision, snapshot: null, reason: "deleted" };
+    if (row.version !== version)
+      return { revision: row.revision, snapshot: null, reason: "version" };
+    let snapshot;
+    try {
+      snapshot = typeof row.payload === "string" ? JSON.parse(row.payload) : null;
+    } catch (error) {
+      if (!(error instanceof SyntaxError))
+        throw error;
+      return { revision: row.revision, snapshot: null, reason: "malformed" };
+    }
+    if (!isCheckpointSnapshot(snapshot, session))
+      return { revision: row.revision, snapshot: null, reason: "malformed" };
+    return { revision: row.revision, snapshot };
+  }
   async load(session) {
     const db = await this.database(session);
     try {
-      const row = this.row(db);
-      if (!row)
-        return { revision: null, snapshot: null };
-      if (row.deleted)
-        return { revision: row.revision, snapshot: null, reason: "deleted" };
-      if (row.version !== version)
-        return { revision: row.revision, snapshot: null, reason: "version" };
-      let snapshot;
-      try {
-        snapshot = typeof row.payload === "string" ? JSON.parse(row.payload) : null;
-      } catch {
-        return { revision: row.revision, snapshot: null, reason: "malformed" };
-      }
-      if (!isCheckpointSnapshot(snapshot, session))
-        return { revision: row.revision, snapshot: null, reason: "malformed" };
-      return { revision: row.revision, snapshot };
+      return this.decode(this.row(db), session);
     } finally {
       db.close();
     }
@@ -3371,7 +2780,7 @@ class CheckpointStore {
           throw new Error("KV guard refuses to save a deleted session checkpoint");
         if ((row?.revision ?? null) !== expectedRevision)
           throw new CheckpointConflictError;
-        const revision = randomUUID5();
+        const revision = randomUUID3();
         db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, ?, 0) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = excluded.payload, deleted = 0").run(revision, version, payload);
         return revision;
       }).immediate();
@@ -3379,27 +2788,48 @@ class CheckpointStore {
       db.close();
     }
   }
-  async delete(session, onContention) {
+  async reset(session, boundary, onContention) {
+    const file = `${digest(session)}.sqlite`;
+    try {
+      await lstat(join2(this.directory, file));
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT")
+        return false;
+      throw error;
+    }
+    const payload = boundary.deleted ? null : JSON.stringify({
+      boundary: boundary.sequence,
+      prefix: { version: 2, session: digest(session), lanes: [] },
+      usage: { lanes: [] }
+    });
     let notified = false;
     for (;; ) {
       const changed = Promise.withResolvers();
-      const journal = `${digest(session)}.sqlite-journal`;
+      const journal = `${file}-journal`;
       let watcher;
       const timer = setTimeout(changed.resolve, 250);
       try {
         try {
-          watcher = watch2(this.directory, (_event, filename) => {
+          watcher = watch(this.directory, (_event, filename) => {
             if (filename === journal)
               changed.resolve();
           });
           watcher.on("error", changed.resolve);
-        } catch {}
+        } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || !["ENOENT", "ENOSYS", "ENOTSUP"].some((code) => code === error.code))
+            throw error;
+        }
         const db = await this.database(session);
         try {
           db.transaction(() => {
-            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, NULL, 1) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = NULL, deleted = 1").run(randomUUID5(), version);
+            const row = this.row(db);
+            if (row?.deleted)
+              return;
+            if (!boundary.deleted && (this.decode(row, session).snapshot?.boundary ?? -1) >= boundary.sequence)
+              return;
+            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = excluded.payload, deleted = excluded.deleted").run(randomUUID3(), version, payload, Number(boundary.deleted));
           }).immediate();
-          return;
+          return true;
         } finally {
           db.close();
         }
@@ -3419,430 +2849,14 @@ class CheckpointStore {
   }
 }
 
-// src/glm.ts
-var effort = (value) => value === "low" || value === "high" || value === "max";
-function parseGLMOptions(input) {
-  if (input === undefined || input === false)
-    return false;
-  if (!record(input))
-    throw new Error("KV guard: glm must be false or an options object");
-  for (const key of Object.keys(input)) {
-    if (!["models", "reasoningEffort", "clearThinking", "cumulativeReasoning"].includes(key))
-      throw new Error(`KV guard: unknown glm option ${key}`);
-  }
-  if (!Array.isArray(input.models) || !input.models.length || input.models.some((id) => typeof id !== "string" || !id.trim() || id !== id.trim())) {
-    throw new Error("KV guard: glm.models must be a nonempty array of exact model IDs");
-  }
-  if (input.reasoningEffort !== undefined && !effort(input.reasoningEffort))
-    throw new Error("KV guard: glm.reasoningEffort must be low, high or max");
-  for (const key of ["clearThinking", "cumulativeReasoning"]) {
-    if (input[key] !== undefined && typeof input[key] !== "boolean")
-      throw new Error(`KV guard: glm.${key} must be boolean`);
-  }
-  return {
-    models: [...input.models],
-    reasoningEffort: effort(input.reasoningEffort) ? input.reasoningEffort : "max",
-    clearThinking: input.clearThinking === true,
-    cumulativeReasoning: input.cumulativeReasoning === true
-  };
-}
-function normalizeGLMRequest(body, options) {
-  const targeted = options !== false && options.models.includes(body.model);
-  const report = { targeted, cumulativeReasoning: targeted && options.cumulativeReasoning, changes: [], conflicts: [] };
-  if (!targeted)
-    return { body, report };
-  let result = body;
-  const containers = ["chat_template_kwargs", "chatTemplateKwargs"];
-  const present = containers.filter((key) => Object.hasOwn(body, key));
-  const opaque = present.some((key) => !record(body[key]));
-  const dual = present.length > 1;
-  if (dual || opaque)
-    report.conflicts.push(...present);
-  for (const [camel, wire, fallback] of [
-    ["reasoningEffort", "reasoning_effort", options.reasoningEffort],
-    ["clearThinking", "clear_thinking", options.clearThinking]
-  ]) {
-    const fields = [];
-    for (const key of [wire, camel])
-      if (Object.hasOwn(body, key))
-        fields.push({ path: key, value: body[key] });
-    for (const container of present) {
-      const kwargs = body[container];
-      if (!record(kwargs))
-        continue;
-      for (const key of [wire, camel])
-        if (Object.hasOwn(kwargs, key))
-          fields.push({ path: `${container}.${key}`, value: kwargs[key] });
-    }
-    const invalid = fields.filter((field) => wire === "reasoning_effort" ? !effort(field.value) : typeof field.value !== "boolean");
-    const conflict = fields.some((field) => !Object.is(field.value, fields[0]?.value));
-    const source = conflict || dual ? "conflict" : opaque || invalid.length ? "opaque" : fields.length ? "request" : "profile";
-    if (conflict)
-      report.conflicts.push(...fields.map((field) => field.path));
-    if (source === "opaque")
-      report.conflicts.push(...invalid.map((field) => field.path));
-    const effective = source === "profile" ? fallback : source === "request" ? fields[0].value : undefined;
-    if (wire === "reasoning_effort") {
-      report.effortSource = source;
-      if (effort(effective))
-        report.reasoningEffort = effective;
-    } else {
-      report.clearThinkingSource = source;
-      if (typeof effective === "boolean")
-        report.clearThinking = effective;
-    }
-    if (source === "conflict" || source === "opaque")
-      continue;
-    if (result === body)
-      result = { ...body };
-    if (!fields.length) {
-      if (wire === "reasoning_effort") {
-        result[wire] = fallback;
-        report.changes.push(wire);
-      } else {
-        const container = present[0] ?? "chat_template_kwargs";
-        result[container] = { ...record(result[container]) ? result[container] : {}, [wire]: fallback };
-        report.changes.push(`${container}.${wire}`);
-      }
-      continue;
-    }
-    if (Object.hasOwn(result, camel)) {
-      if (!Object.hasOwn(result, wire))
-        result[wire] = result[camel];
-      delete result[camel];
-      report.changes.push(`${camel}->${wire}`);
-    }
-    for (const container of present) {
-      const kwargs = result[container];
-      if (!record(kwargs) || !Object.hasOwn(kwargs, camel))
-        continue;
-      const normalized = { ...kwargs };
-      if (!Object.hasOwn(normalized, wire))
-        normalized[wire] = normalized[camel];
-      delete normalized[camel];
-      result[container] = normalized;
-      report.changes.push(`${container}.${camel}->${wire}`);
-    }
-  }
-  if (!dual && !opaque && Object.hasOwn(result, "chatTemplateKwargs")) {
-    if (result === body)
-      result = { ...body };
-    result.chat_template_kwargs = result.chatTemplateKwargs;
-    delete result.chatTemplateKwargs;
-    report.changes.push("chatTemplateKwargs->chat_template_kwargs");
-  }
-  return { body: report.changes.length ? result : body, report };
-}
-var reasoningAliases = ["reasoning_content", "reasoning", "reasoning_text"];
-var nonempty = (value) => typeof value === "string" && value.length > 0;
-function createGLMChunkAdapter(model, options) {
-  if (options === false || !options.models.includes(model))
-    return (value) => value;
-  const snapshots = new Map;
-  return (value) => {
-    if (!record(value) || !Array.isArray(value.choices))
-      return value;
-    const inputChoices = value.choices;
-    const indices = new Set;
-    const choices = inputChoices.map((choice) => {
-      if (!record(choice))
-        return choice;
-      const key = record(choice.delta) ? "delta" : record(choice.message) ? "message" : undefined;
-      if (!key)
-        return choice;
-      const message = choice[key];
-      if (message.role !== undefined && message.role !== "assistant" || message.content !== undefined && message.content !== null && typeof message.content !== "string" || Object.keys(message).some((name) => !["role", "content", "tool_calls", "function_call", "refusal", ...reasoningAliases].includes(name)) || reasoningAliases.some((name) => message[name] !== undefined && message[name] !== null && typeof message[name] !== "string"))
-        return choice;
-      const alias = reasoningAliases.find((name) => nonempty(message[name]));
-      if (!alias)
-        return choice;
-      const text = message[alias];
-      let normalized = message;
-      let delta = text;
-      if (options.cumulativeReasoning && key === "delta") {
-        const index = typeof choice.index === "number" && Number.isSafeInteger(choice.index) && choice.index >= 0 ? choice.index : inputChoices.length === 1 && choice.index === undefined ? 0 : undefined;
-        if (index === undefined)
-          throw new Error("KV guard: GLM cumulative reasoning requires an unambiguous choice index");
-        if (indices.has(index))
-          throw new Error("KV guard: GLM cumulative reasoning requires unique choice indices");
-        indices.add(index);
-        const previous = snapshots.get(index) ?? "";
-        if (!text.startsWith(previous))
-          throw new Error("KV guard: GLM cumulative reasoning must be append-only");
-        snapshots.set(index, text);
-        delta = text.slice(previous.length);
-      }
-      if (alias === "reasoning" && message.reasoning_content === "") {
-        normalized = { ...normalized };
-        delete normalized.reasoning_content;
-      }
-      if (alias === "reasoning_text") {
-        normalized = { ...normalized, reasoning_content: delta };
-        delete normalized.reasoning_text;
-      } else if (delta !== text)
-        normalized = { ...normalized, [alias]: delta };
-      const redundant = reasoningAliases.filter((other) => other !== alias && other !== "reasoning_content" && (normalized[other] === text || normalized[other] === ""));
-      if (redundant.length) {
-        if (normalized === message)
-          normalized = { ...normalized };
-        for (const other of redundant)
-          delete normalized[other];
-      }
-      return normalized === message ? choice : { ...choice, [key]: normalized };
-    });
-    return choices.every((choice, index) => choice === inputChoices[index]) ? value : { ...value, choices };
-  };
-}
-
-// src/skills.ts
-var header = `Skills provide specialized instructions and workflows for specific tasks.
-Use the skill tool to load a skill when a task matches its description.`;
-var start2 = `${header}
-<available_skills>
-`;
-var end = `
-</available_skills>`;
-function compactSkillCatalog(body, provenance) {
-  if (!Array.isArray(body.tools) || !body.tools.some((tool) => record(tool) && tool.type === "function" && record(tool.function) && tool.function.name === "skill"))
-    return { body };
-  const primary = body.messages[0];
-  if (!primary || primary.role !== "system" || typeof primary.content !== "string")
-    return { body };
-  if (body.messages.slice(1).some(instruction))
-    return { body };
-  let generated = primary.content;
-  const suffix = provenance.userSystem;
-  if (suffix) {
-    if (!Number.isSafeInteger(suffix.length) || suffix.length < 0 || suffix.length > generated.length)
-      return { body };
-    const text = suffix.length ? generated.slice(-suffix.length) : "";
-    if (digest(text) !== suffix.hash)
-      return { body };
-    if (suffix.length) {
-      const delimiter = generated.length - suffix.length - 1;
-      if (delimiter < 0 || generated[delimiter] !== `
-`)
-        return { body };
-      generated = generated.slice(0, delimiter);
-    }
-  }
-  if (!generated.endsWith(end))
-    return { body };
-  const offset = generated.lastIndexOf(start2);
-  if (offset < 0 || offset > 0 && generated[offset - 1] !== `
-`)
-    return { body };
-  if (generated.indexOf(header) !== offset || generated.indexOf("<available_skills>") !== offset + header.length + 1 || generated.indexOf("</available_skills>") !== generated.length - "</available_skills>".length)
-    return { body };
-  const catalog = generated.slice(offset + start2.length, -end.length);
-  const entries = [];
-  const entry = /  <skill>\n    <name>([^<>\r\n]+)<\/name>\n    <description>([\s\S]*?)<\/description>\n    <location>([^<>\r\n]*)<\/location>\n  <\/skill>(?:\n|$)/y;
-  let cursor = 0;
-  while (cursor < catalog.length) {
-    entry.lastIndex = cursor;
-    const match = entry.exec(catalog);
-    if (!match)
-      return { body };
-    const [, name, description, location] = match;
-    if (/<\/?(?:available_skills|skill|name|description|location)(?:[\s>])/.test(description))
-      return { body };
-    if (location.replace(/&(?:amp|lt|gt|quot|#39);/g, "").includes("&"))
-      return { body };
-    if (entries.some((skill) => skill.name === name) || entries.length > 0 && entries.at(-1).name.localeCompare(name) > 0)
-      return { body };
-    entries.push({ name, description });
-    cursor = entry.lastIndex;
-  }
-  if (!entries.length)
-    return { body };
-  const original = generated.slice(offset);
-  const replacement = `${start2}${entries.map((skill) => `${skill.name}: ${skill.description}`).join(`
-`)}${end}`;
-  const content = primary.content.slice(0, offset) + replacement + primary.content.slice(generated.length);
-  return {
-    body: { ...body, messages: [{ ...primary, content }, ...body.messages.slice(1)] },
-    report: { skills: entries.length, originalChars: original.length, replacementChars: replacement.length }
-  };
-}
-
-// src/tools.ts
-var fixed = {
-  read: {
-    length: 1158,
-    hash: "98ee843341c2dab2227add0019e48d4b2f0f00f9b042b853d1ee52bb34e6363d",
-    compact: `Reads a file or directory. \`filePath\` should be absolute. \`offset\` is the 1-indexed start line; \`limit\` is the maximum line count (default 2000). Call again with a larger offset for later sections.
-File lines are returned as \`<line>: <content>\` (e.g. \`1: foo\`); lines over 2000 characters are truncated. Directories list one entry per line, with a trailing \`/\` for subdirectories. Images and PDFs are returned as attachments. A missing path returns an error.
-Use Grep for specific content in large files and Glob when unsure of a path. Read independent files in parallel; prefer larger windows over tiny repeated slices.`
-  },
-  edit: {
-    length: 1369,
-    hash: "4426ccf60241fe41d01bbafc1e7450ea6538003f9fca863ab0210492a74647f8",
-    compact: `Replaces exact text in a file: \`filePath\` (absolute), \`oldString\`, \`newString\` (must differ), optional \`replaceAll\` (default false).
-- Read the file earlier in the conversation first, or the edit fails.
-- Copy text from Read output exactly as it appears after the \`<line>: \` prefix, preserving indentation; never include the prefix.
-- Fails with "oldString not found in content" if absent, or with a multiple-matches error if not unique: add surrounding lines, or set \`replaceAll\` to change every occurrence (e.g. renames).
-- Prefer editing existing files; no emojis unless requested.`
-  },
-  write: {
-    length: 623,
-    hash: "8b7197b6e3a8ec1d129eeb6b82608e4cab759bfcc60ba890ecf36322a6e45180",
-    compact: "Writes `content` to `filePath` (absolute), overwriting any existing file. An existing file must be read with Read first, or the write fails. Prefer editing existing files; create new files, including documentation/README files, only when required or requested. No emojis unless requested."
-  },
-  glob: {
-    length: 517,
-    hash: "50b2d2c41d4b8d0286ab4542c6ec882421ac4ae5c0567ad213c3668ed973ed9a",
-    compact: "Finds files by glob `pattern` (e.g. `**/*.js`, `src/**/*.ts`) and returns matching paths. Omit `path` to search the current directory. Batch independent searches in parallel; use Task for open-ended multi-round searching."
-  },
-  grep: {
-    length: 657,
-    hash: "97fa2a9929353d20d3418041aae53ffea3aaf63e9a6e2fdc8cff6db61c3f4c5e",
-    compact: "Searches file contents with regular expression `pattern` and returns file paths and line numbers of matching lines. `path` defaults to the current directory; `include` filters files (e.g. `*.js`, `*.{ts,tsx}`). To count matches, run `rg` through Bash, not `grep`. Use Task for open-ended multi-round searching."
-  },
-  webfetch: {
-    length: 750,
-    hash: "0da3ec7c3f6bc47706553c1c522dacb2042d66a4c2bf09368e43ce4a72f3b7dc",
-    compact: "Fetches a fully-formed `url` (HTTP is upgraded to HTTPS) and returns it as `format` `markdown` (default), `text` or `html`; `timeout` is in seconds (max 120). Read-only; very large content may be summarized. Prefer a more capable or targeted fetch tool when one is available."
-  },
-  todowrite: {
-    length: 2012,
-    hash: "f214ea20cd870a9837cb30dd993aefbe5abe6d9e3319b47672c529961ba0c3ad",
-    compact: `Replaces the session task list with \`todos\`; each item has \`content\`, \`status\` (\`pending\`, \`in_progress\`, \`completed\`, \`cancelled\`) and \`priority\` (\`high\`, \`medium\`, \`low\`).
-Use it for work with 3+ distinct steps, several user-listed tasks or new instructions; skip single trivial tasks and purely informational requests.
-Keep exactly one item \`in_progress\` while work remains and update status as you go. Mark \`completed\` only after the work and required verification are done; if blocked, keep it \`in_progress\` and add a blocker item. Keep items specific; preserve user-provided commands verbatim.`
-  },
-  skill: {
-    length: 399,
-    hash: "226f63ce9fd51e51431205c90ef98e53a20ba5af690fdad241eba416db49c339",
-    compact: "Loads a skill listed in the system prompt by its exact `name`, adding its instructions and resource references to the conversation. Use it when the task matches a skill's description."
-  },
-  question: {
-    length: 657,
-    hash: "c0a5776acd585b62292c16839a5486b8b69e176b2d7da0cf206c82fcbd929584",
-    compact: 'Asks the user `questions` during execution to gather preferences, clarify ambiguity or choose between options. Custom typed answers are enabled by default, so do not add "Other" options. Answers return as arrays of labels; set `multiple: true` to allow several. Put a recommended option first and end its label with "(Recommended)".'
-  },
-  apply_patch: {
-    length: 1092,
-    hash: "2e88f3a8fb30723c4fd6a084ef20716dec6b6ea66aa943dde675e81c5cb1cc4e",
-    compact: `Edits files with a patch in \`patchText\`:
-*** Begin Patch
-*** Add File: <path>     (every following line starts with +)
-*** Delete File: <path>  (nothing follows)
-*** Update File: <path>  (optionally followed by *** Move to: <new path>)
-@@ <context line>
--old line
-+new line
-*** End Patch
-Every operation needs an Add, Delete or Update header, and new lines start with \`+\` even when adding a file.`
-  },
-  lsp: {
-    length: 1303,
-    hash: "8f25f3ea038c4fc7b5c37072eb2ccfe9c7abc8fc812bde6688bccb4d04ab454a",
-    compact: "Queries the configured LSP server. `operation`: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls or outgoingCalls. All operations take `filePath`, `line` and `character` (both 1-based, as in editors). workspaceSymbol also takes `query` (empty string = all symbols); its filePath only selects the server. Fails if no server handles the file type."
-  },
-  plan_exit: {
-    length: 579,
-    hash: "00dba1a429590e46c1975bade1963eac331b5edd3610b680edd15ef124ff2c43",
-    compact: "Asks the user whether to leave planning and switch to the build agent. Call only after the plan file is complete, open questions are resolved and the user is not still planning."
-  }
-};
-var bashTemplate = { length: 4636, hash: "74600c017fe0683dc02202ba11ab718369cebb7ee2ae77d25337a387a3cf3a0d" };
-var bashLayout = /^([\s\S]*?\nBe aware: OS: )([^\n,]*)(, Shell: )([^\n]*)(\n[\s\S]*?\nUse `)([^`\n]*)(` for temporary work[\s\S]*?commands will time out after )(\d+)(ms\.\n[\s\S]*?If the output exceeds )(\d+)( lines or )(\d+)( bytes[\s\S]*)$/;
-var websearchTemplate = { length: 1031, hash: "31abe3e2b84a60582979c963414ced0aafded8182f08b0c8a19aa04f0de4748a" };
-var websearchLayout = /^([\s\S]*The current year is )(\d+)(\. You MUST[\s\S]*)$/;
-var task = { length: 2305, hash: "220dcf4ad2582dbdaf2b0bbc8b7f5fa78172b1337539ac1c8912f45f2b9e5d46" };
-var taskBackground = { length: 311, hash: "8c625cde589a304cc7373250688781ab16ddb532256c81324142d2d49bbab99d" };
-var agentListing = `
-Available agent types and the tools they have access to:
-`;
-var taskCompact = `Launches a subagent for complex multistep work. Set \`subagent_type\` to an agent listed below, \`description\` to 3-5 words, and \`prompt\` to a complete, self-contained task stating whether to write code or only research, how to verify, and exactly what to return. Pass a previous \`task_id\` to resume that subagent session; otherwise it starts with fresh context.
-Use Read/Glob/Grep directly for known paths, specific definitions or a few files. Launch independent agents in parallel and do not duplicate delegated work. The result is not shown to the user, so summarize it. Generally trust agent output; use agents proactively when their description says so.`;
-var taskBackgroundCompact = "`background: true` starts the agent asynchronously and returns immediately; use it only for independent work, as completion is notified automatically. Foreground (default) is for results needed before continuing.";
-function compact(name, description) {
-  const known = fixed[name];
-  if (known)
-    return description.length === known.length && digest(description) === known.hash ? known.compact : undefined;
-  if (name === "bash") {
-    const match = bashLayout.exec(description);
-    if (!match)
-      return;
-    const [, head, os, afterOs, shell, afterShell, tmp, afterTmp, timeout, afterTimeout, maxLines, afterLines, maxBytes, tail] = match;
-    const template = `${head}\x00os\x00${afterOs}\x00shell\x00${afterShell}\x00tmp\x00${afterTmp}\x00timeout\x00${afterTimeout}\x00maxLines\x00${afterLines}\x00maxBytes\x00${tail}`;
-    if (template.length !== bashTemplate.length || digest(template) !== bashTemplate.hash)
-      return;
-    return `Runs a command in a persistent ${shell} session (OS: ${os}). Use it for terminal work such as git, package managers, builds and tests; use the dedicated Read/Glob/Grep/Edit/Write tools for file operations.
-- \`command\` is required. \`workdir\` sets the directory (default: current); use it instead of \`cd <dir> && ...\`. \`timeout\` is in milliseconds (default ${timeout}).
-- Quote paths containing spaces with double quotes. Chain dependent commands with \`&&\` in one call; use \`;\` only when earlier failures do not matter; never separate commands with newlines outside quotes. Run independent commands as parallel calls.
-- \`${tmp}\` already exists and is pre-approved for temporary work outside the workspace.
-- Output over ${maxLines} lines or ${maxBytes} bytes is truncated and saved to a file; inspect it with Read offset/limit or Grep instead of head/tail.
-- Git: commit, amend, push or open PRs only when asked. Inspect status/diff/log first, stage only intended files and never commit secrets. Never change git config, skip hooks, use interactive \`-i\`, force-push, create empty commits or amend a failed commit unless asked. Use \`gh\` for GitHub and return PR URLs.`;
-  }
-  if (name === "websearch") {
-    const match = websearchLayout.exec(description);
-    if (!match)
-      return;
-    const [, head, year, tail] = match;
-    const template = `${head}\x00year\x00${tail}`;
-    if (template.length !== websearchTemplate.length || digest(template) !== websearchTemplate.hash)
-      return;
-    return `Searches the web through the session's search provider and returns content from the most relevant sites; use it for current information beyond your knowledge cutoff. \`query\` is required; optional \`numResults\` (default 8), \`livecrawl\` (\`fallback\` or \`preferred\`), \`type\` (\`auto\`, \`fast\` or \`deep\`) and \`contextMaxCharacters\` (default 10000). The current year is ${year}; use it when searching for recent information or current events.`;
-  }
-  if (name === "task") {
-    if (digest(description.slice(0, task.length)) !== task.hash)
-      return;
-    let rest = description.slice(task.length);
-    const background = digest(rest.slice(0, taskBackground.length)) === taskBackground.hash;
-    if (background)
-      rest = rest.slice(taskBackground.length);
-    if (!rest.startsWith(agentListing))
-      return;
-    return taskCompact + (background ? `
-${taskBackgroundCompact}` : "") + rest;
-  }
-}
-function compactToolDescriptions(tools) {
-  let report;
-  const result = tools.map((tool) => {
-    if (!record(tool) || tool.type !== "function" || !record(tool.function))
-      return tool;
-    const fn = tool.function;
-    const { name, description } = fn;
-    if (typeof name !== "string" || typeof description !== "string")
-      return tool;
-    const replacement = compact(name, description);
-    if (replacement === undefined)
-      return tool;
-    report ??= { tools: 0, originalChars: 0, replacementChars: 0 };
-    report.tools++;
-    report.originalChars += description.length;
-    report.replacementChars += replacement.length;
-    return { ...tool, function: { ...fn, description: replacement } };
-  });
-  return report ? { tools: result, report } : { tools };
-}
-
 // src/output.ts
 import { randomBytes } from "crypto";
 import { constants as constants2 } from "fs";
 import { chmod as chmod2, link, lstat as lstat2, mkdir as mkdir2, open as open2, rename, unlink } from "fs/promises";
-import { homedir } from "os";
-import { basename as basename2, dirname, isAbsolute as isAbsolute2, join as join3, resolve as resolve3 } from "path";
+import { homedir as homedir2 } from "os";
+import { basename as basename4, dirname, isAbsolute as isAbsolute5, join as join3, resolve as resolve2 } from "path";
 import { stripVTControlCharacters } from "util";
-var tools2 = { bash: true, grep: true, glob: true, webfetch: true };
-function options(input) {
-  if (input === false)
-    return false;
-  if (input !== undefined && !record(input))
-    throw new Error("shrinkToolOutputs must be false or an options object");
-  const result = { maxBytes: 16 * 1024, maxLines: 400 };
-  for (const [key, value] of Object.entries(input ?? {})) {
-    if (key !== "maxBytes" && key !== "maxLines")
-      throw new Error(`Unknown shrinkToolOutputs option: ${key}`);
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)
-      throw new Error(`shrinkToolOutputs.${key} must be a positive integer`);
-    result[key] = value;
-  }
-  return result;
-}
+var tools = new Set(["shell", "grep", "glob", "webfetch", "execute"]);
 function edge(text, maxBytes, tail = false) {
   const bytes = Buffer.from(text);
   if (bytes.length <= maxBytes)
@@ -3879,19 +2893,14 @@ ${marker}`;
 }
 var noFollow = constants2.O_NOFOLLOW ?? 0;
 var noBlock = constants2.O_NONBLOCK ?? 0;
-var linkUnsupported = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV", "EINVAL", "EACCES"]);
-async function regular(path) {
-  const info = await lstat2(path);
-  if (info.isSymbolicLink() || !info.isFile())
-    throw new Error("Tool output artifact must be a regular file, not a symlink");
-}
+var linkUnsupported = new Set(["EPERM", "EACCES", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EXDEV"]);
 
 class ToolArtifacts {
   directory;
-  constructor(dataDirectory = process.env.XDG_DATA_HOME || join3(homedir(), ".local", "share")) {
-    if (!isAbsolute2(dataDirectory))
+  constructor(dataDirectory = process.env.XDG_DATA_HOME || join3(homedir2(), ".local", "share")) {
+    if (!isAbsolute5(dataDirectory))
       throw new Error("Tool output data directory must be an absolute path");
-    this.directory = join3(resolve3(dataDirectory), "opencode", "tool-output");
+    this.directory = join3(resolve2(dataDirectory), "opencode", "tool-output");
   }
   async directories(create) {
     for (const directory of [dirname(this.directory), this.directory]) {
@@ -3904,14 +2913,23 @@ class ToolArtifacts {
     }
   }
   async native(path) {
-    if (typeof path !== "string" || !isAbsolute2(path) || dirname(path) !== this.directory || !/^tool_[A-Za-z0-9_-]+$/.test(basename2(path)))
+    if (typeof path !== "string" || !isAbsolute5(path) || path !== resolve2(path))
       return false;
-    await this.directories(false);
-    try {
-      await regular(path);
-    } catch {
+    const toolOutput = dirname(path) === this.directory && /^tool_[a-f0-9]{12}[A-Za-z0-9_-]+$/.test(basename4(path));
+    const shell = dirname(dirname(path)) === join3(dirname(this.directory), "shell") && /^sh_[a-f0-9]{12}[A-Za-z0-9]+\.out$/.test(basename4(path));
+    if (!toolOutput && !shell)
       return false;
+    if (toolOutput)
+      await this.directories(false);
+    if (shell) {
+      for (const directory of [dirname(this.directory), dirname(dirname(path)), dirname(path)]) {
+        const info = await lstat2(directory);
+        if (!info.isDirectory() || process.getuid && info.uid !== process.getuid())
+          return false;
+      }
     }
+    if (!(await lstat2(path)).isFile())
+      return false;
     const file = await open2(path, constants2.O_RDONLY | noFollow | noBlock);
     try {
       const info = await file.stat();
@@ -3922,6 +2940,10 @@ class ToolArtifacts {
     } finally {
       await file.close();
     }
+  }
+  path() {
+    const key = randomBytes(30).toString("hex");
+    return join3(this.directory, `tool_${key.slice(0, 12)}_kvguard_${key.slice(12)}`);
   }
   async save(path, raw) {
     await this.directories(true);
@@ -3936,14 +2958,14 @@ class ToolArtifacts {
     }
   }
   contentPath(text) {
-    return join3(this.directory, `tool_kvguard_${digest(text)}`);
+    return join3(this.directory, contentArtifactName(text));
   }
   async saveContent(path, text) {
     if (path !== this.contentPath(text))
       throw new Error("Content artifact path does not match its text");
     if (await this.matches(path, text))
       return;
-    const temporary = join3(this.directory, `tool_kvguard_tmp_${randomBytes(24).toString("hex")}`);
+    const temporary = this.path();
     await this.save(temporary, text);
     try {
       await link(temporary, path);
@@ -3954,10 +2976,8 @@ class ToolArtifacts {
       if (code !== "EEXIST" && !linkUnsupported.has(code))
         throw error;
       await rename(temporary, path);
-      await this.matches(path, text).then((ok) => {
-        if (!ok)
-          throw new Error("Tool output artifact was replaced during publication");
-      });
+      if (!await this.matches(path, text))
+        throw new Error("Tool output artifact was replaced during publication");
     } finally {
       await unlink(temporary).catch(() => {});
     }
@@ -3966,7 +2986,8 @@ class ToolArtifacts {
     let file;
     try {
       await this.directories(false);
-      await regular(path);
+      if (!(await lstat2(path)).isFile())
+        throw new Error("Content artifact must be a regular file");
       file = await open2(path, constants2.O_RDWR | noFollow | noBlock);
     } catch (error) {
       if (record(error) && error.code === "ENOENT")
@@ -3976,7 +2997,7 @@ class ToolArtifacts {
     try {
       const info = await file.stat();
       if (!info.isFile() || process.getuid && info.uid !== process.getuid())
-        throw new Error("Tool output artifact must be a regular file owned by the current user");
+        throw new Error("Content artifact must be owned by the current user");
       await file.chmod(384);
       if (await file.readFile("utf8") !== text)
         return false;
@@ -3992,935 +3013,1394 @@ class ToolArtifacts {
 class ToolOutputShrinker {
   limits;
   artifacts;
-  constructor(input, dataDirectory) {
-    this.limits = options(input);
+  constructor(input = {}, dataDirectory) {
+    this.limits = { maxBytes: input.maxBytes ?? 16 * 1024, maxLines: input.maxLines ?? 400 };
     this.artifacts = new ToolArtifacts(dataDirectory);
   }
+  supports(tool) {
+    return tools.has(tool);
+  }
   async apply(tool, result) {
-    if (!this.limits || !Object.hasOwn(tools2, tool) || !record(result.metadata) || result.metadata.kvGuardOutput === 1)
+    if (!this.supports(tool) || result.content === undefined)
       return result;
-    const text = stripVTControlCharacters(result.output);
-    const clipped = Buffer.byteLength(text) > this.limits.maxBytes || text.split(`
-`).length > this.limits.maxLines;
-    if (text === result.output && !clipped)
+    if (result.metadata !== undefined && !record(result.metadata))
       return result;
-    const metadata = result.metadata;
-    const native = metadata.truncated === true;
+    const metadata = result.metadata ?? {};
+    if (metadata.kvGuardOutput === 1 || tool === "shell" && metadata.status === "running")
+      return result;
+    const content = typeof result.content === "string" ? [{ type: "text", text: result.content }] : result.content;
+    const first = content.findIndex((item) => item.type === "text");
+    const primary = content[first];
+    if (primary?.type !== "text")
+      return result;
+    const original = primary.text;
+    const text = stripVTControlCharacters(original);
+    const trailing = content.slice(first + 1).flatMap((item) => item.type === "text" ? [item.text] : []);
+    const limits = {
+      maxBytes: this.limits.maxBytes - trailing.reduce((sum, item) => sum + Buffer.byteLength(item) + 1, 0),
+      maxLines: this.limits.maxLines - trailing.reduce((sum, item) => sum + item.split(`
+`).length, 0)
+    };
+    const clipped = Buffer.byteLength(text) > limits.maxBytes || text.split(`
+`).length > limits.maxLines;
+    if (text === original && !clipped)
+      return result;
+    const structured = result.output;
+    const suppliedPath = tool === "shell" && record(structured) ? structured.outputPath : metadata.outputPath;
+    const native = metadata.truncated === true && (tool === "shell" || ("outputPath" in metadata));
     try {
-      if (native && !await this.artifacts.native(metadata.outputPath))
+      if (native && (typeof suppliedPath !== "string" || !await this.artifacts.native(suppliedPath)))
         return result;
-      const path = native ? metadata.outputPath : join3(this.artifacts.directory, `tool_kvguard_${randomBytes(24).toString("hex")}`);
-      const annotation = native && tool === "bash" ? text.match(/\n\n<shell_metadata>\n(?:(?!<\/?shell_metadata>)[\s\S])*\n<\/shell_metadata>$/)?.[0] ?? "" : "";
-      const excerpt = annotation ? text.slice(0, -annotation.length) : text;
-      const output = preview(excerpt, path, {
-        maxBytes: this.limits.maxBytes - Buffer.byteLength(annotation),
-        maxLines: this.limits.maxLines - (annotation.match(/\n/g)?.length ?? 0)
-      });
-      if (output === undefined)
+      const path = native && typeof suppliedPath === "string" ? suppliedPath : this.artifacts.path();
+      const excerpt = preview(text, path, limits);
+      if (excerpt === undefined)
         return result;
       if (!native)
-        await this.artifacts.save(path, result.output);
-      return { ...result, output: output + annotation, metadata: { ...metadata, truncated: native || clipped, outputPath: path, kvGuardOutput: 1 } };
+        await this.artifacts.save(path, original);
+      return {
+        ...result,
+        content: typeof result.content === "string" ? excerpt : content.map((item, index) => index === first ? { type: "text", text: excerpt } : item),
+        metadata: { ...metadata, truncated: clipped || metadata.truncated === true, outputPath: path, kvGuardOutput: 1 }
+      };
     } catch {
       return result;
     }
   }
 }
 
-// src/index.ts
-var agentHeader = "x-opencode-kv-guard-agent";
-var limitsHeader = "x-opencode-kv-guard-limits";
-var userHeader = "x-opencode-kv-guard-user";
-var systemSuffixHeader = "x-opencode-kv-guard-system-suffix";
-var manualCommand = "kv-compact";
-var manualCommandPrompt = "The conversation context was just compacted on request. Reply with one short sentence confirming it and stating the current task, if any. Do not call tools or continue the task until the next instruction.";
-var internalAgents = ["title", "summary", "compaction"];
-var nativeConversationStart = `Here is the conversation so far:
+// src/server-state.ts
+var historyEvents = [
+  "session.forked",
+  "session.revert.staged",
+  "session.revert.cleared",
+  "session.revert.committed",
+  "session.compaction.ended",
+  "session.deleted"
+];
+var maxSpeculativeSessions = 32;
+var loggedFields = new Set([
+  "model",
+  "tools",
+  "tool_choice",
+  "role",
+  "content",
+  "name",
+  "tool_calls",
+  "tool_call_id",
+  "reasoning",
+  "reasoning_content",
+  "temperature",
+  "top_p",
+  "top_k",
+  "stop",
+  "stream",
+  "stream_options",
+  "max_tokens",
+  "max_completion_tokens",
+  "response_format",
+  "prompt_cache_key",
+  "reasoning_effort"
+]);
 
-<conversation>
-`;
-var nativeConversationEnd = `
-</conversation>
-
-`;
-var plugin = async ({ client, project, directory, worktree }, options = {}) => {
-  const allowed = ["providers", "maxConcurrent", "maxOutputTokens", "compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "compaction", "diagnostics", "usageAccounting", "crossProcess", "persistence", "stateDirectory", "glm", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "shrinkToolOutputs", "continueTruncated", "speculativeCompaction", "stableAgentTools"];
-  for (const key of Object.keys(options)) {
-    if (!allowed.includes(key))
-      throw new Error(`KV guard: unknown option ${key}`);
+class ServerState {
+  options;
+  store;
+  memory = new Map;
+  tails = new Map;
+  providers;
+  artifacts;
+  pendingBoundaries = new Map;
+  compactions = new Map;
+  speculation = new Map;
+  plans = new WeakMap;
+  active = true;
+  constructor(project, options) {
+    this.options = options;
+    this.providers = new Set(options.providers);
+    this.store = options.persistence ? new CheckpointStore(join4(options.stateDirectory, "checkpoints"), project, "opencode-v2-wire") : undefined;
+    this.artifacts = options.compaction ? new ToolArtifacts : undefined;
   }
-  if (!Array.isArray(options.providers) || !options.providers.length || options.providers.some((id) => typeof id !== "string" || !id)) {
-    throw new Error("KV guard: providers must be a nonempty array of explicit OpenCode provider IDs");
+  log(event, details) {
+    if (this.options.diagnostics)
+      console.error(JSON.stringify({ service: "kv-guard", event, ...details }));
   }
-  const providers = new Set(options.providers);
-  const activeProviders = new Set;
-  const maxConcurrent = options.maxConcurrent ?? 1;
-  if (typeof maxConcurrent !== "number" || !Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) {
-    throw new Error("KV guard: maxConcurrent must be a positive integer");
-  }
-  const maxOutputTokens = options.maxOutputTokens;
-  if (maxOutputTokens !== undefined && (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
-    throw new Error("KV guard: maxOutputTokens must be a positive integer");
-  }
-  for (const key of ["compactPrompt", "stabilizeEnvironment", "retainModeReminders", "canonicalToolSchemas", "promptCacheKey", "diagnostics", "usageAccounting", "crossProcess", "persistence", "compactSkills", "compactTools", "sessionHeads", "prefixGuard", "prefixHandoff", "continueTruncated", "speculativeCompaction", "stableAgentTools"]) {
-    if (options[key] !== undefined && typeof options[key] !== "boolean")
-      throw new Error(`KV guard: ${key} must be boolean`);
-  }
-  if (options.stateDirectory !== undefined && (typeof options.stateDirectory !== "string" || !isAbsolute3(options.stateDirectory))) {
-    throw new Error("KV guard: stateDirectory must be an absolute path");
-  }
-  const stateDirectory = options.stateDirectory ?? join4(process.env.XDG_STATE_HOME || join4(homedir2(), ".local", "state"), "opencode-kv-guard");
-  const glm = parseGLMOptions(options.glm);
-  const outputShrinker = options.shrinkToolOutputs === false ? undefined : new ToolOutputShrinker(options.shrinkToolOutputs);
-  const outputSessions = new Set;
-  const outputCalls = new Map;
-  const environments = new Environments;
-  const reminders = new ModeReminders;
-  const audit = new PrefixAudit;
-  const heads = new SessionHeads;
-  const prefixGuard = new PrefixGuard;
-  const compaction = new RollingCompaction(options.compaction);
-  const toolArtifacts = new ToolArtifacts;
-  const userTurns = new UserTurns;
-  const usage = new UsageTracker;
-  const sessionLanes = new Map;
-  const parentHeadLanes = new Map;
-  const stateTails = new Map;
-  const pendingDeletions = new Map;
-  const deletionFailures = [];
-  const deleted = new Set;
-  const lastExchanges = new Map;
-  const nativeCompactions = new Set;
-  const nativePrompts = new Map;
-  let customCompactionPrompt = false;
-  const manualMarker = `\x1Ekv-guard-compact:${randomUUID6()}:`;
-  const manualPattern = new RegExp(`${manualMarker}([a-f0-9-]{36})\x1F`);
-  const manualPending = new Map;
-  const manualCompactions = new Map;
-  const toolChoiceNoneRejected = new Set;
-  const manualHandoff = options.compaction !== false && options.prefixHandoff !== false;
-  let manualCommandOwned = false;
-  const disposed = new AbortController;
-  let store;
-  const log = async (message, extra) => {
-    if (options.diagnostics === true)
-      await client.app.log({ body: { service: "kv-guard", level: "info", message, extra } });
-  };
-  const compactionNotice = (session) => {
-    let title;
-    let started = false;
-    const show = (message, variant) => {
-      title ??= Promise.resolve().then(() => client.session.get({ path: { id: session } })).then((result) => result.data?.title);
-      title.then((resolved) => client.tui.showToast({ body: { title: resolved, message, variant } })).catch((error) => Promise.resolve().then(() => client.app.log({ body: { service: "kv-guard", level: "warn", message: "Compaction notification failed", extra: { error: error instanceof Error ? error.message : String(error) } } })).catch(() => {}));
-    };
-    return {
-      summary(run) {
-        if (!started) {
-          started = true;
-          show("Compacting session", "info");
-        }
-        return run();
-      },
-      finished(report) {
-        if (typeof report?.summaryRequests === "number" && report.summaryRequests > 0 || report?.speculative === true)
-          show("Session compacted", "success");
-        else if (typeof report?.shook === "number" && report.shook > 0)
-          show(`Removed ${report.shook} large context region${report.shook === 1 ? "" : "s"}; full output saved`, "success");
-        if (report?.rescue === true)
-          show("Context was still too large: recent tool results and attachments were removed to fit", "warning");
-        if (report?.shakeStorageFailed === true)
-          show("Could not save some tool outputs to disk; those results were kept in context", "warning");
-        if (report?.manualNoop === true)
-          show("Nothing to compact", "info");
-      }
-    };
-  };
-  const truncatedHandled = new Map;
-  const truncatedLimit = 3;
-  const truncatedReminder = `<system-reminder>
-The previous response stopped at the output token limit before finishing. Continue the task from where it stopped. Keep reasoning brief and split large outputs or edits into smaller steps.
-</system-reminder>`;
-  const truncatedPending = new Set;
-  const continueTruncated = async (session) => {
-    if (options.continueTruncated === false || deleted.has(session) || truncatedPending.has(session))
-      return;
-    truncatedPending.add(session);
-    try {
-      const messages = (await client.session.messages({ path: { id: session } })).data ?? [];
-      const last = messages.at(-1)?.info;
-      const prior = truncatedHandled.get(session);
-      if (last?.role !== "assistant" || last.finish !== "length" || !last.time.completed || last.error || last.summary || !activeProviders.has(last.providerID) || internalAgents.includes(last.mode)) {
-        truncatedHandled.delete(session);
-        return;
-      }
-      if (prior?.assistant === last.id)
-        return;
-      if ((await client.session.get({ path: { id: session } })).data?.parentID)
-        return;
-      const parent = messages.find((message) => message.info.id === last.parentID);
-      const continued = !!parent?.parts.length && parent.parts.every((part) => part.type === "text" && part.synthetic && part.text === truncatedReminder);
-      const count = (continued ? prior?.count ?? 0 : 0) + 1;
-      truncatedHandled.set(session, { assistant: last.id, count });
-      if (count > truncatedLimit) {
-        await client.tui.showToast({ body: { message: `Response hit the output limit ${truncatedLimit} times in a row; not continuing automatically`, variant: "warning" } }).catch(() => {});
-        return;
-      }
-      const user = parent?.info.role === "user" ? parent.info : undefined;
-      await client.session.promptAsync({
-        path: { id: session },
-        body: {
-          agent: user?.agent ?? last.mode,
-          model: { providerID: last.providerID, modelID: last.modelID },
-          ...user?.system !== undefined ? { system: user.system } : {},
-          ...user?.model.variant !== undefined ? { variant: user.model.variant } : {},
-          ...user?.format !== undefined ? { format: user.format } : {},
-          parts: [{ type: "text", synthetic: true, text: truncatedReminder }]
-        }
-      });
-      await log("Continued a response truncated at the output limit", { attempt: count });
-    } catch (error) {
-      await client.app.log({ body: { service: "kv-guard", level: "warn", message: "Truncated response continuation failed", extra: { error: error instanceof Error ? error.message : String(error) } } }).catch(() => {});
-    } finally {
-      truncatedPending.delete(session);
-    }
-  };
-  const manualExchange = async (session, targetID, headScope, model) => {
-    const exchange = lastExchanges.get(session);
-    if (!exchange || exchange.target !== targetID || exchange.headScope !== headScope || exchange.body.model !== model)
-      return;
-    const stored = await client.session.messages({ path: { id: session } });
-    const messages = stored.data ?? [];
-    const marker = messages.findLastIndex((message) => message.info.role === "user" && message.parts.some((part) => part.type === "compaction"));
-    if (marker < 0)
-      return;
-    const user = messages.slice(0, marker).findLastIndex((message) => message.info.role === "user");
-    if (user < 0 || messages[user].info.id !== exchange.userID)
-      return;
-    const between = messages.slice(user + 1, marker).map((message) => message.info);
-    if (!between.length)
-      return;
-    for (const info of between) {
-      if (info.role !== "assistant" || info.error || !info.finish || info.summary)
-        return;
-    }
-    const last = between.at(-1);
-    if (last.role !== "assistant" || ["tool-calls", "unknown"].includes(last.finish ?? ""))
-      return;
-    return exchange;
-  };
-  const checkpoint = async (session, action, completedResponse = false) => {
-    const prior = stateTails.get(session) ?? Promise.resolve();
-    const pending = prior.then(async () => {
-      if (!completedResponse)
-        disposed.signal.throwIfAborted();
-      if (deleted.has(session))
-        throw new Error("KV guard: session was deleted");
-      const loaded = store ? await store.load(session) : undefined;
-      if (loaded?.reason === "deleted")
-        throw new Error("KV guard: session checkpoint was deleted");
-      const empty = { modes: { messages: [] }, environments: { lanes: [] }, compaction: { lanes: [] } };
-      if (loaded) {
-        const snapshot = loaded.snapshot ?? empty;
-        if (!await compaction.restore(session, snapshot.compaction) || !reminders.restore(session, snapshot.modes) || !environments.restore(session, snapshot.environments) || !heads.restore(session, snapshot.heads ?? { version: 1, session, lanes: [] }) || !prefixGuard.restore(session, snapshot.prefixGuard ?? { version: 1, session, lanes: [] })) {
-          throw new Error("KV guard: checkpoint cannot be restored during concurrent state changes");
-        }
-        const lanes = sessionLanes.get(session) ?? new Set;
-        usage.restore(snapshot.usage ?? { lanes: [] }, lanes);
-        for (const { lane } of snapshot.usage?.lanes ?? [])
-          lanes.add(lane);
-        sessionLanes.set(session, lanes);
-        if (loaded.reason)
-          await log("Checkpoint cache miss", { reason: loaded.reason });
-      }
-      const result = await action();
-      try {
-        if (!completedResponse)
-          disposed.signal.throwIfAborted();
-        if (deleted.has(session))
-          throw new Error("KV guard: session was deleted during preparation");
-        if (store && loaded) {
-          const snapshot = { modes: reminders.snapshot(session), environments: environments.snapshot(session), compaction: compaction.snapshot(session), heads: heads.snapshot(session), prefixGuard: prefixGuard.snapshot(session), usage: usage.snapshot(sessionLanes.get(session) ?? []) };
-          if (JSON.stringify(snapshot) !== JSON.stringify(loaded.snapshot ?? empty))
-            await store.save(session, snapshot, loaded.revision);
-        }
-        return result;
-      } catch (error) {
-        if (result instanceof Response)
-          await result.body?.cancel().catch(() => {});
-        throw error;
-      }
-    });
+  serial(session, operation) {
+    const pending = (this.tails.get(session) ?? Promise.resolve()).then(operation);
     const tail = pending.then(() => {}, () => {});
-    stateTails.set(session, tail);
+    this.tails.set(session, tail);
     tail.then(() => {
-      if (stateTails.get(session) === tail)
-        stateTails.delete(session);
+      if (this.tails.get(session) === tail)
+        this.tails.delete(session);
     });
     return pending;
-  };
-  return {
-    async config(config) {
-      customCompactionPrompt = config.agent?.compaction?.prompt !== undefined;
-      manualCommandOwned = options.compaction !== false && !config.command?.[manualCommand];
-      if (manualCommandOwned)
-        config.command = { ...config.command, [manualCommand]: { template: manualCommandPrompt, description: "Compact the session context now, keeping the KV-cached prefix (kv-guard)", subtask: false } };
-      const targets = [...providers].map((id) => {
-        const provider = config.provider?.[id];
-        if (!provider || provider.npm !== "@ai-sdk/openai-compatible") {
-          throw new Error(`KV guard: ${id} must be explicitly configured with @ai-sdk/openai-compatible`);
+  }
+  clearSpeculation(session) {
+    this.speculation.get(session)?.rolling.clear();
+    this.speculation.delete(session);
+  }
+  startSpeculation(plan) {
+    if (!this.active || this.pendingBoundaries.has(plan.session)) {
+      plan.rolling.clear();
+      return;
+    }
+    this.clearSpeculation(plan.session);
+    if (this.speculation.size >= maxSpeculativeSessions) {
+      const oldest = this.speculation.keys().next().value;
+      if (oldest !== undefined)
+        this.clearSpeculation(oldest);
+    }
+    const entry = { ...plan.source, rolling: plan.rolling, ready: false };
+    this.speculation.set(plan.session, entry);
+    Promise.resolve(plan.compute()).then((ready) => {
+      if (this.speculation.get(plan.session) !== entry)
+        return;
+      if (!ready) {
+        this.clearSpeculation(plan.session);
+        return;
+      }
+      entry.ready = true;
+      this.log("wire.compaction-staged", { session: digest(plan.session) });
+    });
+  }
+  update(request, change, committed) {
+    const { sessionID: session, kind, providerID } = request;
+    const { diagnostics, usageAccounting, prefixGuard } = this.options;
+    if (!session || kind !== "primary" || !this.providers.has(providerID) || !(diagnostics || usageAccounting || prefixGuard || this.options.compaction))
+      return;
+    return this.serial(session, async () => {
+      const memory = this.memory.get(session);
+      if (!this.active || request.signal.aborted || memory === null)
+        return;
+      const loaded = await this.store?.load(session);
+      if (loaded?.reason === "deleted")
+        return;
+      if (loaded?.reason)
+        this.log("checkpoint.cache-miss", { session: digest(session), reason: loaded.reason });
+      const persisted = loaded?.snapshot;
+      const snapshot = (memory?.boundary ?? -1) > (persisted?.boundary ?? -1) ? memory : persisted ?? memory;
+      const prefix = new PrefixGuard;
+      const usage = new UsageTracker;
+      if (snapshot) {
+        prefix.restore(session, snapshot.prefix);
+        usage.restore(snapshot.usage);
+      }
+      const lanes = new Set(snapshot?.usage.lanes.map(({ lane }) => lane));
+      const state = { prefix, usage, lanes, compaction: this.options.compaction ? snapshot?.compaction : undefined };
+      const result = await change(session, state);
+      if (result instanceof Response)
+        return result;
+      if (result === undefined || !this.active || request.signal.aborted)
+        return;
+      if (request.compaction && this.pendingBoundaries.has(session))
+        return;
+      const next = {
+        boundary: snapshot?.boundary,
+        prefix: prefix.snapshot(session),
+        usage: usage.snapshot(lanes),
+        ...state.compaction?.lanes.length ? { compaction: state.compaction } : {}
+      };
+      if (this.store && loaded) {
+        await this.store.save(session, next, loaded.revision);
+        this.memory.delete(session);
+      } else
+        this.memory.set(session, next);
+      if (this.active && !request.signal.aborted) {
+        committed?.(result);
+        return result;
+      }
+    });
+  }
+  onRequest = async (request) => {
+    const lane = digest(request.lane);
+    const modelBudget = request.modelID === undefined ? undefined : resolveModelBudget(this.options.modelBudgets ?? [], { providerID: request.providerID, modelID: request.modelID });
+    const countPrompt = makeModelEstimator(modelBudget);
+    const prepared = await this.update(request, async (session, state) => {
+      const { prefix, usage, lanes } = state;
+      const context = { session, lane, receipt: request.id, replay: this.options.prefixGuard };
+      let effective = request.body;
+      let plan;
+      const capability = request.compaction;
+      if (this.options.compaction && capability && this.artifacts) {
+        if (this.pendingBoundaries.has(session))
+          throw new Error("KV guard: session history changed before compaction");
+        const controller = new AbortController;
+        const signal = AbortSignal.any([request.signal, controller.signal]);
+        this.compactions.set(session, controller);
+        let options = this.options.compaction;
+        if (modelBudget?.thresholdTokens !== undefined || modelBudget?.thresholdPercent !== undefined) {
+          const { thresholdTokens: _tokens, thresholdPercent: _percent, ...base } = options;
+          options = {
+            ...base,
+            ...modelBudget.thresholdTokens === undefined ? {} : { thresholdTokens: modelBudget.thresholdTokens },
+            ...modelBudget.thresholdPercent === undefined ? {} : { thresholdPercent: modelBudget.thresholdPercent }
+          };
         }
-        const configuredURL = provider.options?.baseURL;
-        if (typeof configuredURL !== "string" || !configuredURL)
-          throw new Error(`KV guard: ${id} needs options.baseURL`);
-        const baseURL = configuredURL.replace(/\$\{([^}]+)\}/g, (_match, key) => {
-          const value = process.env[key];
-          if (value === undefined)
-            throw new Error(`KV guard: unresolved baseURL environment variable ${key}`);
-          return value;
-        });
-        if (baseURL.includes("${"))
-          throw new Error(`KV guard: ${id} has unresolved baseURL variables`);
-        const endpoint = new URL(baseURL.replace(/\/$/, "") + "/chat/completions");
-        if (!["http:", "https:"].includes(endpoint.protocol))
-          throw new Error(`KV guard: ${id} needs an HTTP baseURL`);
-        const custom = provider.options?.fetch;
-        if (custom !== undefined && typeof custom !== "function")
-          throw new Error(`KV guard: ${id} has a non-function fetch`);
-        const headerTimeout = provider.options?.headerTimeout === false ? undefined : provider.options?.headerTimeout ?? 300000;
-        const requestTimeout = provider.options?.timeout === false || provider.options?.timeout == null ? undefined : provider.options.timeout;
-        const summaryTimeouts = { header: typeof headerTimeout === "number" ? headerTimeout : undefined, request: typeof requestTimeout === "number" ? requestTimeout : undefined };
-        const local = endpointGate(baseURL, maxConcurrent);
-        const shared = options.crossProcess === false ? undefined : processEndpointGate(baseURL, maxConcurrent, join4(stateDirectory, "admission"));
-        const gate = shared ? {
-          async acquire(signal) {
-            const releaseLocal = await local.acquire(signal);
-            try {
-              const releaseShared = await shared.acquire(signal);
-              return async () => {
-                try {
-                  await releaseShared();
-                } finally {
-                  releaseLocal();
-                }
-              };
-            } catch (error) {
-              releaseLocal();
-              throw error;
-            }
-          }
-        } : local;
-        return { id, provider, baseURL, endpoint, gate, summaryTimeouts, fetch: custom ?? globalThis.fetch };
-      });
-      if (options.persistence !== false)
-        store = new CheckpointStore(join4(stateDirectory, "checkpoints"), JSON.stringify([project?.id, directory, worktree]), JSON.stringify(canonical({
-          version: 1,
-          providers: [...providers].sort(),
-          compaction: compaction.options,
-          compactPrompt: options.compactPrompt !== false,
-          compactSkills: options.compactSkills !== false,
-          compactTools: options.compactTools !== false,
-          stabilizeEnvironment: options.stabilizeEnvironment !== false,
-          retainModeReminders: options.retainModeReminders !== false,
-          canonicalToolSchemas: options.canonicalToolSchemas !== false,
-          glm,
-          sessionHeads: options.sessionHeads !== false,
-          prefixGuard: options.prefixGuard !== false,
-          prefixHandoff: options.prefixHandoff !== false,
-          shrinkToolOutputs: outputShrinker?.limits ?? false,
-          ...options.stableAgentTools === true ? { stableAgentTools: true } : {}
-        })));
-      for (const target of targets) {
-        target.provider.options ??= {};
-        target.provider.options.baseURL = target.baseURL;
-        target.provider.options.fetch = async (input, init) => {
-          const url = new URL(input instanceof Request ? input.url : input.toString());
-          const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-          if (method.toUpperCase() !== "POST" || url.origin !== target.endpoint.origin || url.pathname !== target.endpoint.pathname) {
-            return target.fetch(input, init);
-          }
-          const request = new Request(input instanceof Request ? input.clone() : input, init);
-          const signal = AbortSignal.any([request.signal, disposed.signal]);
-          let body = await request.json();
-          const headers = new Headers(request.headers);
-          const session = headers.get("x-opencode-session-id") ?? headers.get("x-session-id");
-          const agent = headers.get(agentHeader);
-          const encodedLimits = headers.get(limitsHeader);
-          const expectedUser = headers.get(userHeader);
-          const encodedSystemSuffix = headers.get(systemSuffixHeader);
-          headers.delete(agentHeader);
-          headers.delete(limitsHeader);
-          headers.delete(userHeader);
-          headers.delete(systemSuffixHeader);
-          headers.delete("content-length");
-          const currentUser = userTurns.consume(body.messages, session && expectedUser ? userTurns.marker(session, expectedUser) : undefined);
-          url.hash = "";
-          const parentSession = headers.get("x-opencode-parent-session-id") ?? headers.get("x-parent-session-id") ?? undefined;
-          const stableTools = options.stableAgentTools === true && !!agent && !internalAgents.includes(agent) && !parentSession;
-          const laneAgent = stableTools ? { stableAgentTools: true } : agent;
-          const lane = digest(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => name !== "x-opencode-request").sort(([a], [b]) => a.localeCompare(b)), body.model, session, laneAgent]));
-          const headScope = digest(JSON.stringify([target.id, url.href, [...headers].filter(([name]) => !["x-opencode-request", "x-opencode-session-id", "x-session-id", "x-opencode-parent-session-id", "x-parent-session-id", "x-session-affinity", "x-litellm-session-id"].includes(name)).sort(([a], [b]) => a.localeCompare(b)), body.model]));
-          const headLane = digest(JSON.stringify([headScope, laneAgent]));
-          if (session) {
-            const lanes = sessionLanes.get(session) ?? new Set;
-            lanes.add(lane);
-            sessionLanes.set(session, lanes);
-          }
-          if (session && !headers.has("x-litellm-session-id")) {
-            headers.set("x-litellm-session-id", headers.get("x-parent-session-id") ?? session);
-          }
-          const normalized = normalizeGLMRequest(body, glm);
-          body = normalized.body;
-          if (normalized.report.targeted)
-            await log("GLM request policy", { ...normalized.report });
-          for (const [camel, wire] of [
-            ["promptCacheKey", "prompt_cache_key"],
-            ["cacheSalt", "cache_salt"],
-            ["chatTemplateKwargs", "chat_template_kwargs"],
-            ["enableThinking", "enable_thinking"],
-            ["preserveThinking", "preserve_thinking"],
-            ["maxTokens", "max_tokens"],
-            ["maxCompletionTokens", "max_completion_tokens"]
-          ]) {
-            if (camel === "chatTemplateKwargs" && normalized.report.targeted)
-              continue;
-            if (!Object.hasOwn(body, camel))
-              continue;
-            if (camel === "maxTokens" && typeof body.maxTokens === "number" && typeof body.max_tokens === "number") {
-              body.max_tokens = Math.min(body.max_tokens, body.maxTokens);
-            } else if (!Object.hasOwn(body, wire))
-              body[wire] = body[camel];
-            delete body[camel];
-          }
-          if (options.promptCacheKey === true && session)
-            body.prompt_cache_key ??= session;
-          if (options.usageAccounting !== false && target.provider.options?.includeUsage !== false && body.stream === true && (body.stream_options === undefined || record(body.stream_options))) {
-            body.stream_options = { include_usage: true, ...body.stream_options };
-          }
-          if (maxOutputTokens !== undefined) {
-            if (typeof body.max_completion_tokens === "number") {
-              body.max_completion_tokens = Math.min(body.max_completion_tokens, maxOutputTokens);
-              delete body.max_tokens;
-            } else
-              body.max_tokens = Math.min(typeof body.max_tokens === "number" ? body.max_tokens : maxOutputTokens, maxOutputTokens);
-          }
-          if (options.compactTools !== false && Array.isArray(body.tools)) {
-            const compacted = compactToolDescriptions(body.tools);
-            body.tools = compacted.tools;
-            if (compacted.report)
-              await log("Tool description compression", { ...compacted.report });
-          }
-          if (options.canonicalToolSchemas !== false && body.tools)
-            body.tools = canonical(body.tools);
-          if (options.compactSkills !== false && encodedSystemSuffix) {
-            const suffix = JSON.parse(encodedSystemSuffix);
-            if (!record(suffix) || typeof suffix.length !== "number" || !Number.isSafeInteger(suffix.length) || suffix.length < 0 || !isSha256(suffix.hash))
-              throw new Error("KV guard: invalid user system suffix metadata");
-            const compacted = compactSkillCatalog(body, { userSystem: suffix.length ? { length: suffix.length, hash: suffix.hash } : undefined });
-            body = compacted.body;
-            if (compacted.report)
-              await log("Skill catalog compression", { ...compacted.report });
-          }
-          let replayReceipt;
-          let usageReceipt;
-          const sendSummary = async (outgoing, attempt = (body) => send(body, "summary")) => {
-            if (outgoing.tool_choice !== "none")
-              return attempt(outgoing);
-            if (toolChoiceNoneRejected.has(target.id))
-              return attempt({ ...outgoing, tool_choice: "auto" });
-            const response = await attempt(outgoing);
-            if (response.ok)
-              return response;
-            const error = await providerError(response);
-            if (!error)
-              return response;
-            if (error.overflow)
-              return error.response();
-            toolChoiceNoneRejected.add(target.id);
-            await log("Summary tool_choice none was rejected; using auto", { status: response.status });
-            return attempt({ ...outgoing, tool_choice: "auto" });
-          };
-          let afterMain;
-          const send = async (outgoing, label, requestSignal = signal) => {
-            if (session && agent && label === "main" && !internalAgents.includes(agent))
-              lastExchanges.delete(session);
-            const requestLane = label === "summary" ? `${lane}:summary` : lane;
-            const receipt = usageReceipt;
-            const ticket = usage.begin(outgoing, requestLane, label === "main" ? receipt : undefined);
-            let admissionWaitMs = 0;
-            const gate = {
-              async acquire(waitSignal) {
-                const started = performance.now();
-                const release = await target.gate.acquire(waitSignal);
-                admissionWaitMs = performance.now() - started;
-                return release;
-              }
-            };
-            const response = await admittedFetch(target.fetch, gate, input, { ...init, headers, body: JSON.stringify(outgoing), signal: requestSignal });
-            return observeResponse(response, {
-              body: outgoing,
-              lane: requestLane,
-              tracker: usage,
-              request: ticket,
-              signal: requestSignal,
-              label,
-              transform: glm && glm.models.includes(outgoing.model) ? createGLMChunkAdapter(outgoing.model, glm) : undefined,
-              onAnchor: store && session && receipt && label === "main" && options.usageAccounting !== false ? () => {
-                const completed = usage.snapshot([lane]);
-                return checkpoint(session, () => usage.publish(completed, receipt), true).catch(() => log("Usage checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}));
-              } : undefined,
-              onAssistant: session && agent && label === "main" && (options.prefixGuard !== false || manualHandoff && !internalAgents.includes(agent)) ? (assistant) => {
-                if (manualHandoff && !internalAgents.includes(agent) && expectedUser)
-                  lastExchanges.set(session, { target: target.id, headScope, lane, userID: expectedUser, body: outgoing, assistant });
-                if (options.prefixGuard === false)
-                  return;
-                checkpoint(session, () => prefixGuard.record(outgoing, assistant, { session, lane, outcome: "success", finishReason: assistant.tool_calls ? "tool_calls" : "stop", receipt: replayReceipt }), true).catch(() => log("Response replay checkpoint was not retained", { laneFingerprint: lane }).catch(() => {}));
-              } : undefined,
-              onReport: (report) => {
-                if (label === "main" && report.outcome === "complete")
-                  afterMain?.();
-                return log("Request usage and lifecycle", { ...report, admissionWaitMs, upstreamHeaderMs: Math.max(0, report.headerMs - admissionWaitMs) });
-              }
-            });
-          };
-          const nativeDefault = session && agent === "compaction" && options.compaction !== false && !customCompactionPrompt && nativePrompts.get(session)?.prompt === undefined ? nativeCompactionInput(body) : undefined;
-          if (nativeDefault && encodedLimits && compaction.options) {
-            const limits = JSON.parse(encodedLimits);
-            if (record(limits) && typeof limits.context === "number" && typeof limits.output === "number") {
-              const cap = Math.min(policy(limits.context, compaction.options).summaryCap, limits.output, typeof body.max_completion_tokens === "number" ? body.max_completion_tokens : typeof body.max_tokens === "number" ? body.max_tokens : Infinity);
-              body = { ...body, ...body.max_completion_tokens !== undefined ? { max_completion_tokens: cap } : { max_tokens: cap } };
-            }
-          }
-          const manualCompaction = async (sessionID) => {
-            const prompt = body.messages.at(-1);
-            const text = prompt?.role === "user" && typeof prompt.content === "string" ? prompt.content : undefined;
-            const end = text?.startsWith(nativeConversationStart) ? text.indexOf(nativeConversationEnd) : -1;
-            if (!text || end < 0) {
-              await log("Manual compaction kept the native request", { reason: "unrecognized compaction prompt" });
-              return;
-            }
-            const system = body.messages.filter((message) => message.role === "system");
-            if (system.some((message) => typeof message.content !== "string"))
-              return;
-            const systemInstructions = system.map((message) => message.content).join(`
-
-`);
-            const instructions = text.slice(end + nativeConversationEnd.length);
-            let exchange;
-            try {
-              exchange = await manualExchange(sessionID, target.id, headScope, body.model);
-            } catch (error) {
-              await log("Manual compaction kept the native request", { reason: "history unavailable", error: error instanceof Error ? error.message : String(error) });
-              return;
-            }
-            if (!exchange) {
-              await log("Manual compaction kept the native request", { reason: "no matching cached exchange" });
-              return;
-            }
-            const prior = exchange.body;
-            if (constrainedOutput(prior)) {
-              await log("Manual compaction kept the native request", { reason: "constrained output" });
-              return;
-            }
-            const limits = JSON.parse(encodedLimits);
-            const output = typeof body.max_completion_tokens === "number" ? body.max_completion_tokens : typeof body.max_tokens === "number" ? body.max_tokens : undefined;
-            if (!record(limits) || typeof limits.context !== "number" || output === undefined)
-              return;
-            const handoff = {
-              ...summaryRequestBase(prior),
-              ...prior.tools !== undefined ? { tools: prior.tools, tool_choice: "none" } : {},
-              messages: [...prior.messages, exchange.assistant, {
-                role: "user",
-                content: nativeDefault ? handoffPrompt(false, [...nativeDefault.context, ...nativeDefault.previous ? [`<previous-summary>
-${escapeSummaryBoundaries(nativeDefault.previous)}
-</previous-summary>`] : []].join(`
-
-`)) : `<conversation> consists of every message above in this request. This is a summary handoff: do not continue the task, answer questions in it, or call tools.
-
-For this handoff, follow these compaction-agent system instructions instead of the task instructions in the conversation above:
-<compaction-system-instructions>
-${systemInstructions}
-</compaction-system-instructions>
-
-${instructions}`
-              }],
-              stream: false,
-              ...prior.max_completion_tokens !== undefined ? { max_completion_tokens: output } : { max_tokens: output }
-            };
-            const config = compaction.options;
-            if (!config)
-              return;
-            const { bytesPerToken } = config;
-            const fallback = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / bytesPerToken);
-            const measure = (candidate) => options.usageAccounting === false ? fallback(candidate) : usage.estimate(candidate, exchange.lane, fallback);
-            const budget = Math.min(typeof limits.input === "number" && limits.input > 0 ? limits.input : Infinity, limits.context - output) - config.marginTokens;
-            const size = measure(handoff);
-            if (size > budget) {
-              await log("Manual compaction kept the native request", { reason: "handoff exceeds budget", estimated: size, budget });
-              return;
-            }
-            const notice = compactionNotice(sessionID);
-            const response = await notice.summary(() => sendSummary(handoff));
-            if (!response.ok) {
-              const error = await providerError(response);
-              if (error?.overflow) {
-                await log("Manual compaction kept the native request", { reason: "handoff context overflow" });
-                return;
-              }
-              return error ? error.response() : response;
-            }
-            let summary;
-            try {
-              summary = await readSummary(response, signal);
-            } catch (error) {
-              await log("Manual compaction kept the native request", { reason: "summary rejected", error: error instanceof Error ? error.message : String(error) });
-              return;
-            }
-            notice.finished({ summaryRequests: 1 });
-            lastExchanges.delete(sessionID);
-            await log("Manual compaction via prefix handoff", { estimated: size, budget, cachedMessages: prior.messages.length + 1 });
-            const id = typeof summary.completion.id === "string" ? summary.completion.id : `kv-guard-${digest(summary.content).slice(0, 16)}`;
-            const created = Math.floor(Date.now() / 1000);
-            const usageField = summary.completion.usage !== undefined ? { usage: summary.completion.usage } : {};
-            if (body.stream !== true)
-              return Response.json({ id, object: "chat.completion", created, model: body.model, choices: [{ index: 0, message: { role: "assistant", content: summary.content }, finish_reason: "stop" }], ...usageField });
-            const frames = [
-              { choices: [{ index: 0, delta: { role: "assistant", content: summary.content }, finish_reason: null }] },
-              { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-              ...summary.completion.usage !== undefined ? [{ choices: [], ...usageField }] : []
-            ];
-            const events = frames.map((frame) => `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: body.model, ...frame })}
-
-`).join("");
-            return new Response(events + `data: [DONE]
-
-`, { headers: { "content-type": "text/event-stream" } });
-          };
-          if (session && agent === "compaction" && manualHandoff && encodedLimits) {
-            const handled = await manualCompaction(session);
-            if (handled)
-              return handled;
-          }
-          if (nativeDefault)
-            body = { ...body, messages: [
-              { role: "system", content: summarizationSystem },
-              { role: "user", content: summaryPrompt(nativeDefault.conversation, nativeDefault.previous, false, nativeDefault.context) }
-            ] };
-          const manual = !!session && !!agent && !internalAgents.includes(agent) && !!currentUser && !!expectedUser && manualCompactions.get(session) === expectedUser;
-          const prepare = async (overflow) => {
-            const headContext = { session: session ?? "", lane: headLane, currentUser, parentSession, parentLane: parentSession ? parentHeadLanes.get(parentSession)?.get(headScope) : undefined, stableTools };
-            const replacements = new Map;
-            if (session && agent && options.prefixGuard !== false) {
-              const sources = new Set(body.messages);
-              let probe = { ...body, messages: [...body.messages] };
-              if (options.stabilizeEnvironment !== false)
-                environments.apply(probe.messages, session, lane, { reconstruct: true });
-              if (options.sessionHeads !== false)
-                probe = heads.apply(probe, { ...headContext, reconstruct: true }).body;
-              if (encodedLimits && options.compaction !== false)
-                probe = compaction.reconstruct(probe, { session, lane, currentUser });
-              const restored = prefixGuard.apply(probe, { session, lane, currentUser, observe: false });
-              for (const { index } of restored.report.replayed) {
-                const source = probe.messages[index];
-                if (sources.has(source))
-                  replacements.set(source, restored.body.messages[index]);
-              }
-            }
-            if (session && agent && options.stabilizeEnvironment !== false)
-              environments.apply(body.messages, session, lane, { replacements });
-            if (session && agent && options.sessionHeads !== false) {
-              const prepared = heads.apply(body, { ...headContext, replacements });
-              body = prepared.body;
-              await log("Session head contract", { ...prepared.report });
-              if (!internalAgents.includes(agent)) {
-                const lanes = parentHeadLanes.get(session) ?? new Map;
-                lanes.set(headScope, headLane);
-                parentHeadLanes.set(session, lanes);
-              }
-            }
-            if (session && agent && options.prefixGuard !== false && (!encodedLimits || options.compaction === false)) {
-              const guarded = prefixGuard.apply(body, { session, lane, currentUser, observe: false });
-              body = guarded.body;
-            }
-            if (session && agent && encodedLimits) {
-              const allowSummary = !internalAgents.includes(agent);
-              if (allowSummary && options.compaction !== false && !currentUser) {
-                throw new Error("KV guard: current user provenance was removed by another transform; cannot compact safely");
-              }
-              const limits = JSON.parse(encodedLimits);
-              if (!record(limits) || typeof limits.context !== "number") {
-                throw new Error("KV guard: invalid model context metadata");
-              }
-              const output = body.max_completion_tokens ?? body.max_tokens;
-              if (typeof output !== "number")
-                throw new Error("KV guard: an actual completion token limit is required");
-              const notice = compactionNotice(session);
-              const compactionContext = {
-                session,
-                lane,
-                contextWindow: limits.context,
-                inputLimit: "input" in limits && typeof limits.input === "number" && limits.input > 0 ? limits.input : undefined,
-                modelOutputLimit: typeof limits.output === "number" && limits.output > 0 ? limits.output : undefined,
-                outputLimit: output,
-                signal,
-                allowSummary,
-                currentUser,
-                prefixHandoff: options.prefixHandoff !== false,
-                restoreReasoning: options.prefixGuard === false ? undefined : (effective) => prefixGuard.apply(effective, { session, lane, currentUser, observe: false }).body,
-                estimate: options.usageAccounting === false ? undefined : (candidate, fallback) => usage.estimate(candidate, lane, fallback),
-                overflow,
-                manual,
-                speculate: options.speculativeCompaction === true && allowSummary && !manual,
-                completeSummary: (summary) => notice.summary(() => sendSummary(summary)),
-                artifacts: { path: (text) => toolArtifacts.contentPath(text), save: (path, text) => toolArtifacts.saveContent(path, text) }
-              };
-              const history = body;
-              const prepared = await compaction.prepare(body, compactionContext);
-              if ("response" in prepared)
-                return prepared.response;
-              notice.finished(prepared.report);
-              if (prepared.report?.speculate) {
-                afterMain = () => {
-                  afterMain = undefined;
-                  compaction.speculate(history, {
-                    ...compactionContext,
-                    signal: disposed.signal,
-                    overflow: undefined,
-                    completeSummary: (summary, summarySignal) => sendSummary(summary, async (body) => {
-                      const header = target.summaryTimeouts.header === undefined ? undefined : new AbortController;
-                      const timer = header && setTimeout(() => header.abort(new DOMException("Summary header timeout", "TimeoutError")), target.summaryTimeouts.header);
-                      const signals = [summarySignal ?? disposed.signal, ...header ? [header.signal] : [], ...target.summaryTimeouts.request === undefined ? [] : [AbortSignal.timeout(target.summaryTimeouts.request)]];
-                      try {
-                        return await send(body, "summary", AbortSignal.any(signals));
-                      } finally {
-                        clearTimeout(timer);
-                      }
-                    })
-                  });
-                  log("Speculative compaction started", { estimated: prepared.report?.estimatedAfter ?? null });
-                };
-              }
-              body = prepared.body;
-              if (prepared.report)
-                await log("Preflight budget (usage-anchored when available; otherwise estimated)", prepared.report);
-            }
-            if (session && agent && options.prefixGuard !== false) {
-              const guarded = prefixGuard.apply(body, { session, lane, currentUser, replay: false });
-              body = guarded.body;
-              replayReceipt = guarded.report.receipt;
-              await log("Prefix guard comparison", { ...guarded.report });
-            }
-            if (store && session && agent && options.usageAccounting !== false)
-              usageReceipt = usage.prepare(lane);
-          };
-          const incoming = { ...body, messages: [...body.messages] };
-          const observePrefix = async () => {
-            if (!session || !agent || options.diagnostics !== true)
-              return;
-            const report = audit.observe(body, session, lane);
-            await log("Request prefix comparison (not a token-cache hit measurement)", report);
-          };
-          const canRecover = !!session && !!agent && !!encodedLimits && options.compaction !== false && !internalAgents.includes(agent);
-          const recover = async (error) => {
-            const overflow = { promptTokens: overflowPromptTokens(error.text) };
-            body = { ...incoming, messages: [...incoming.messages] };
-            try {
-              const retried = await checkpoint(session, () => prepare(overflow));
-              if (retried)
-                return retried;
-            } catch (cause) {
-              if (signal.aborted)
-                throw cause;
-              await log("Context overflow recovery failed", { error: cause instanceof Error ? cause.message : String(cause) });
-              return error.response();
-            }
-            await log("Context overflow recovery", { reportedPromptTokens: overflow.promptTokens ?? null });
-            await observePrefix();
-            return send(body, "main");
-          };
-          const failed = session && agent ? await checkpoint(session, () => prepare()) : await prepare();
-          if (failed)
-            return failed;
-          await observePrefix();
-          const response = await send(body, "main");
-          if (response.ok || !canRecover)
-            return response;
-          const error = await providerError(response);
-          if (!error?.overflow)
-            return error ? error.response() : response;
-          return recover(error);
-        };
-        activeProviders.add(target.id);
-      }
-    },
-    async "command.execute.before"(input, output) {
-      if (input.command !== manualCommand || !manualCommandOwned)
-        return;
-      const part = output.parts.find((part) => part.type === "text");
-      if (part?.type !== "text")
-        return;
-      const nonce = randomUUID6();
-      part.text = manualMarker + nonce + "\x1F" + part.text;
-      manualPending.set(nonce, input.sessionID);
-    },
-    async "chat.message"(input, output) {
-      for (const part of output.parts) {
-        if (part.type !== "text")
-          continue;
-        const match = manualPattern.exec(part.text);
-        if (!match)
-          continue;
-        part.text = part.text.replace(manualPattern, "");
-        if (manualPending.get(match[1]) === input.sessionID)
-          manualCompactions.set(input.sessionID, output.message.id);
-        manualPending.delete(match[1]);
-      }
-    },
-    async "chat.params"(input, output) {
-      if (!activeProviders.has(input.model.providerID) || maxOutputTokens === undefined)
-        return;
-      output.maxOutputTokens = Math.min(output.maxOutputTokens ?? maxOutputTokens, maxOutputTokens);
-    },
-    async "chat.headers"(input, output) {
-      if (input.agent === "compaction")
-        nativeCompactions.delete(input.sessionID);
-      if (!internalAgents.includes(input.agent)) {
-        if (activeProviders.has(input.model.providerID))
-          outputSessions.add(input.sessionID);
+        const { messages: _messages, ...requestPolicy } = request.body;
+        const binding = digest(JSON.stringify([lane, requestPolicy, capability.limits, modelBudget, state.compaction]));
+        const staged = this.speculation.get(session);
+        const reusable = staged?.ready && staged.binding === binding && !capability.overflow && request.body.messages.length >= staged.length && digest(JSON.stringify(request.body.messages.slice(0, staged.length))) === staged.fingerprint;
+        if (reusable)
+          this.speculation.delete(session);
         else
-          outputSessions.delete(input.sessionID);
-      }
-      if (!activeProviders.has(input.model.providerID))
-        return;
-      output.headers[agentHeader] = input.agent;
-      output.headers[limitsHeader] = JSON.stringify(input.model.limit);
-      const system = input.message.system ?? "";
-      output.headers[systemSuffixHeader] = JSON.stringify({ length: system.length, hash: digest(system) });
-      if (options.compaction !== false)
-        output.headers[userHeader] = input.message.id;
-    },
-    async "tool.execute.before"(input) {
-      if (!outputShrinker || !outputSessions.has(input.sessionID))
-        return;
-      const calls = outputCalls.get(input.sessionID) ?? new Set;
-      calls.add(input.callID);
-      outputCalls.set(input.sessionID, calls);
-    },
-    async "tool.execute.after"(input, output) {
-      const calls = outputCalls.get(input.sessionID);
-      const selected = calls?.delete(input.callID);
-      if (!calls?.size)
-        outputCalls.delete(input.sessionID);
-      if (!outputShrinker || !selected)
-        return;
-      Object.assign(output, await outputShrinker.apply(input.tool, output));
-    },
-    async "experimental.chat.system.transform"(input, output) {
-      if (!activeProviders.has(input.model.providerID))
-        return;
-      if (options.compactPrompt !== false)
-        compactSystem(output.system);
-      stripEnvironmentDate(output.system);
-    },
-    async "experimental.session.compacting"(input, output) {
-      nativeCompactions.add(input.sessionID);
-      nativePrompts.set(input.sessionID, output);
-    },
-    async "experimental.chat.messages.transform"(_input, output) {
-      userTurns.clean(output.messages);
-      const current = output.messages.findLast((message) => message.info.role === "user");
-      const nativeCompaction = current ? nativeCompactions.delete(current.info.sessionID) : false;
-      if (current?.info.role === "user" && activeProviders.has(current.info.model.providerID)) {
-        await checkpoint(current.info.sessionID, () => {
-          if (options.retainModeReminders !== false)
-            reminders.apply(output.messages, activeProviders);
-        });
-      }
-      if (options.compaction !== false && !nativeCompaction)
-        userTurns.mark(output.messages, activeProviders);
-    },
-    async event({ event }) {
-      if (event.type === "session.idle") {
-        nativeCompactions.delete(event.properties.sessionID);
-        nativePrompts.delete(event.properties.sessionID);
-        for (const [nonce, owner] of manualPending)
-          if (owner === event.properties.sessionID)
-            manualPending.delete(nonce);
-        manualCompactions.delete(event.properties.sessionID);
-        return continueTruncated(event.properties.sessionID);
-      }
-      if (event.type !== "session.deleted")
-        return;
-      const session = event.properties.info.id;
-      const pending = pendingDeletions.get(session);
-      if (pending)
-        return pending;
-      deleted.add(session);
-      truncatedHandled.delete(session);
-      outputSessions.delete(session);
-      outputCalls.delete(session);
-      lastExchanges.delete(session);
-      nativeCompactions.delete(session);
-      nativePrompts.delete(session);
-      for (const [nonce, owner] of manualPending)
-        if (owner === session)
-          manualPending.delete(nonce);
-      manualCompactions.delete(session);
-      compaction.delete(session);
-      const deletion = (async () => {
-        await stateTails.get(session);
-        await store?.delete(session, () => {
-          log("Waiting for checkpoint writer", { operation: "delete", state: "waiting" }).catch(() => {});
-        });
-        environments.delete(session);
-        reminders.delete(session);
-        audit.delete(session);
-        heads.delete(session);
-        prefixGuard.delete(session);
-        compaction.delete(session);
-        for (const lane of sessionLanes.get(session) ?? []) {
-          usage.delete(lane);
-          usage.delete(`${lane}:summary`);
+          this.clearSpeculation(session);
+        const rolling = reusable ? staged.rolling : new RollingCompaction(options);
+        try {
+          if (state.compaction)
+            await rolling.restore(session, state.compaction);
+          const { limits, currentUser, completeSummary, overflow } = capability;
+          const artifacts = this.artifacts;
+          const compactionContext = {
+            ...context,
+            contextWindow: limits.context,
+            inputLimit: limits.input,
+            modelOutputLimit: limits.output,
+            outputLimit: limits.wireOutput,
+            currentUser,
+            allowSummary: true,
+            signal,
+            overflow,
+            completeSummary,
+            prefixHandoff: this.options.prefixHandoff !== false,
+            speculate: this.options.speculativeCompaction === true && capability.backgroundSummary !== undefined,
+            countPrompt,
+            readEvidence: this.options.supersedeReads ? capability.readEvidence : undefined,
+            restoreReasoning: this.options.prefixGuard ? (candidate) => prefix.apply(candidate, { ...context, observe: false }).body : undefined,
+            estimate: this.options.usageAccounting ? (candidate, fallback) => usage.estimate(candidate, lane, fallback) : undefined,
+            artifacts: { path: (text) => artifacts.contentPath(text), save: (path, text) => artifacts.saveContent(path, text) }
+          };
+          const result = await rolling.prepare(effective, compactionContext);
+          if (signal.aborted && "response" in result)
+            await result.response.body?.cancel(signal.reason);
+          signal.throwIfAborted();
+          if ("response" in result)
+            return result.response;
+          effective = result.body;
+          state.compaction = rolling.snapshot(session);
+          const background = capability.backgroundSummary;
+          if (result.report?.speculate && !result.report.compacted && background) {
+            plan = {
+              session,
+              rolling,
+              source: { binding, length: request.body.messages.length, fingerprint: digest(JSON.stringify(request.body.messages)) },
+              compute: () => {
+                let sent = false;
+                let exceeded = false;
+                return rolling.speculate(request.body, {
+                  ...compactionContext,
+                  signal: undefined,
+                  completeSummary: (body2, signal2) => {
+                    if (!signal2)
+                      throw new Error("KV guard: missing speculative compaction signal");
+                    if (sent) {
+                      exceeded = true;
+                      throw new Error("KV guard: speculative summary may send only one request");
+                    }
+                    sent = true;
+                    return background(body2, signal2);
+                  }
+                })?.then((ready) => ready && !exceeded);
+              }
+            };
+          }
+          if (result.report)
+            this.log("wire.compaction", { lane, ...result.report });
+        } finally {
+          this.compactions.delete(session);
+          if (!plan)
+            rolling.clear();
         }
-        sessionLanes.delete(session);
-        parentHeadLanes.delete(session);
-      })().catch(async (error) => {
-        deletionFailures.push(error);
-        await client.app.log({ body: { service: "kv-guard", level: "error", message: "Checkpoint deletion failed; durable cleanup is incomplete", extra: { operation: "delete", state: "failed" } } }).catch(() => {});
-      }).finally(() => {
-        pendingDeletions.delete(session);
+      } else
+        this.clearSpeculation(session);
+      const { body, report } = prefix.apply(effective, context);
+      let estimatedPromptTokens;
+      if (this.options.usageAccounting) {
+        if (this.options.diagnostics) {
+          const rawCount = (value) => Math.ceil(Buffer.byteLength(JSON.stringify(value)) / 4);
+          const calibrated = countPrompt?.(body);
+          estimatedPromptTokens = usage.estimate(body, lane, calibrated === undefined ? rawCount : (value) => value === body ? calibrated : countPrompt?.(value) ?? rawCount(value));
+        }
+        usage.begin(body, lane, usage.prepare(lane, request.id));
+        lanes.add(lane);
+      } else {
+        lanes.delete(lane);
+      }
+      return { body, report, estimatedPromptTokens, plan };
+    }, (result) => {
+      if (!(result instanceof Response) && result.plan)
+        this.plans.set(request.signal, result.plan);
+    });
+    if (this.options.compaction && request.compaction && (!prepared || request.sessionID && this.pendingBoundaries.has(request.sessionID))) {
+      if (prepared instanceof Response)
+        await prepared.body?.cancel();
+      throw new Error("KV guard: compaction checkpoint is no longer current");
+    }
+    if (prepared instanceof Response)
+      return prepared;
+    if (!prepared)
+      return;
+    if (this.options.diagnostics) {
+      const { divergences, ...report } = prepared.report;
+      this.log("wire.prefix", {
+        ...report,
+        endpoint: request.endpoint,
+        lane,
+        estimatedPromptTokens: prepared.estimatedPromptTokens,
+        divergences: divergences.map(({ field, ...item }) => ({
+          ...item,
+          field: field === undefined || loggedFields.has(field) ? field : digest(field)
+        }))
       });
-      pendingDeletions.set(session, deletion);
-      return deletion;
-    },
+    }
+    return prepared.body;
+  };
+  onComplete = async (request, completion) => {
+    if (!request.sessionID || request.kind !== "primary" || !this.providers.has(request.providerID))
+      return;
+    const lane = digest(request.lane);
+    const plan = this.plans.get(request.signal);
+    this.plans.delete(request.signal);
+    let recorded;
+    try {
+      recorded = await this.update(request, (session, { prefix, usage }) => {
+        const context = { session, lane, receipt: request.id };
+        if (!prefix.accepts(request.body, context))
+          return;
+        const { assistant, finishReason, cachedTokens: cachedTokens2, promptTokens: promptTokens2 } = completion;
+        const reasoning = !!(this.options.prefixGuard && assistant && finishReason && prefix.record(request.body, assistant, { ...context, outcome: "success", finishReason }));
+        const anchor = this.options.usageAccounting && promptTokens2 !== undefined && (cachedTokens2 === undefined || cachedTokens2 <= promptTokens2) && usage.record(usage.begin(request.body, lane, request.id), request.body, lane, promptTokens2);
+        const speculate = plan !== undefined && (finishReason === "stop" || finishReason === "tool_calls");
+        return reasoning || anchor || speculate ? { reasoning, anchor, speculate } : undefined;
+      }, (result) => {
+        if (result.speculate && plan)
+          this.startSpeculation(plan);
+      });
+    } catch (error) {
+      if (!(error instanceof CheckpointConflictError) && !busy(error))
+        throw error;
+      this.log("checkpoint.completion-conflict", { receipt: request.id });
+    }
+    if (!recorded?.speculate)
+      plan?.rolling.clear();
+    const { promptTokens, cachedTokens, completionTokens, totalTokens } = completion;
+    this.log("wire.usage", {
+      receipt: request.id,
+      endpoint: request.endpoint,
+      lane,
+      promptTokens,
+      cachedTokens,
+      completionTokens,
+      totalTokens,
+      anchorRecorded: recorded?.anchor ?? false,
+      reasoningRecorded: recorded?.reasoning ?? false
+    });
+  };
+  onEvent(event) {
+    const { sessionID: session } = event.data;
+    const sequence = event.durable.seq;
+    const deleted = event.type === "session.deleted";
+    if (this.options.compaction) {
+      this.pendingBoundaries.set(session, (this.pendingBoundaries.get(session) ?? 0) + 1);
+      this.clearSpeculation(session);
+      this.compactions.get(session)?.abort(new Error("KV guard: session history changed during compaction"));
+    }
+    return this.serial(session, async () => {
+      const snapshot = this.memory.get(session);
+      if (snapshot === null || !deleted && (snapshot?.boundary ?? -1) >= sequence)
+        return;
+      if (deleted)
+        this.memory.set(session, null);
+      const durable = await this.store?.reset(session, { sequence, deleted }, () => {
+        this.log("checkpoint.history-wait", { session: digest(session), cause: event.type, sequence });
+      });
+      if (!durable && !deleted) {
+        this.memory.set(session, {
+          boundary: sequence,
+          prefix: { version: 2, session: digest(session), lanes: [] },
+          usage: { lanes: [] }
+        });
+      }
+      this.log("history.invalidated", { session: digest(session), cause: event.type, sequence });
+    }).finally(() => {
+      const outstanding = this.pendingBoundaries.get(session) ?? 0;
+      if (outstanding <= 1)
+        this.pendingBoundaries.delete(session);
+      else
+        this.pendingBoundaries.set(session, outstanding - 1);
+    });
+  }
+  subscriptionFailed(error) {
+    this.active = false;
+    for (const session of this.speculation.keys())
+      this.clearSpeculation(session);
+    for (const controller of this.compactions.values())
+      controller.abort(error);
+    this.log("history.subscription-failed", { reason: error instanceof Error ? error.name : "closed" });
+  }
+  async dispose() {
+    this.active = false;
+    for (const session of this.speculation.keys())
+      this.clearSpeculation(session);
+    for (const controller of this.compactions.values())
+      controller.abort();
+    await Promise.all(this.tails.values());
+    this.memory.clear();
+  }
+}
+function registerServerState(ctx, options) {
+  const state = new ServerState(ctx.location.project.id, options);
+  const controller = new AbortController;
+  const history = ctx.event.subscribe({ types: historyEvents, signal: controller.signal });
+  const observer = (async () => {
+    try {
+      for await (const event of history)
+        state.onEvent(event).catch((error) => state.subscriptionFailed(error));
+      if (!controller.signal.aborted)
+        state.subscriptionFailed();
+    } catch (error) {
+      if (!controller.signal.aborted)
+        state.subscriptionFailed(error);
+    }
+  })();
+  return {
+    onRequest: state.onRequest,
+    onComplete: state.onComplete,
     async dispose() {
-      disposed.abort(new Error("KV guard disposed"));
-      await Promise.all(stateTails.values());
-      while (pendingDeletions.size)
-        await Promise.all(pendingDeletions.values());
-      environments.clear();
-      reminders.clear();
-      audit.clear();
-      heads.clear();
-      prefixGuard.clear();
-      compaction.clear();
-      usage.clear();
-      sessionLanes.clear();
-      parentHeadLanes.clear();
-      outputSessions.clear();
-      outputCalls.clear();
-      lastExchanges.clear();
-      nativeCompactions.clear();
-      nativePrompts.clear();
-      manualPending.clear();
-      manualCompactions.clear();
-      truncatedHandled.clear();
-      toolChoiceNoneRejected.clear();
-      if (deletionFailures.length)
-        throw new AggregateError(deletionFailures, "KV guard could not complete durable session deletion");
+      controller.abort();
+      await observer;
+      await state.dispose();
     }
   };
+}
+
+// src/server-tools.ts
+async function registerTools(ctx, options) {
+  if (options.shrinkToolOutputs === false)
+    return;
+  const shrinker = new ToolOutputShrinker(options.shrinkToolOutputs);
+  const providers = new Set(options.providers);
+  const requests = new Map;
+  await ctx.session.hook("model.request", ({ kind, sessionID, agent, model }) => {
+    if (kind !== "primary")
+      return;
+    requests.delete(sessionID);
+    if (providers.has(model.providerID)) {
+      requests.set(sessionID, { agent, provider: model.providerID, verified: new Map });
+    }
+  });
+  await ctx.session.hook("experimental.idle", ({ sessionID }) => {
+    requests.delete(sessionID);
+  });
+  await ctx.tool.hook("execute.after", async (event) => {
+    const request = requests.get(event.sessionID);
+    if (!request || request.agent !== event.agent)
+      return;
+    if (event.status === "error" || !shrinker.supports(event.tool))
+      return;
+    let verified = request.verified.get(event.messageID);
+    if (verified === undefined) {
+      verified = ctx.session.context({ sessionID: event.sessionID }).then((messages) => messages.some((message) => message.type === "assistant" && message.id === event.messageID && message.agent === event.agent && message.model.providerID === request.provider), () => false);
+      request.verified.set(event.messageID, verified);
+    }
+    if (!await verified || requests.get(event.sessionID) !== request)
+      return;
+    event.result = await shrinker.apply(event.tool, event.result);
+  });
+  const stop = new AbortController;
+  const events = ctx.event.subscribe({ types: ["session.step.started", "session.deleted"], signal: stop.signal });
+  const listener = (async () => {
+    for await (const event of events) {
+      switch (event.type) {
+        case "session.deleted":
+          requests.delete(event.data.sessionID);
+          break;
+        case "session.step.started": {
+          const { sessionID, assistantMessageID, agent, model } = event.data;
+          const request = requests.get(sessionID);
+          if (request?.agent === agent && request.provider === model.providerID) {
+            request.verified.set(assistantMessageID, Promise.resolve(true));
+          }
+          break;
+        }
+        default: {
+          const unhandled = event;
+          return unhandled;
+        }
+      }
+    }
+  })().catch(() => requests.clear());
+  return async () => {
+    stop.abort();
+    await listener;
+    requests.clear();
+  };
+}
+
+// src/server-transport.ts
+import { AsyncLocalStorage as AsyncLocalStorage2 } from "async_hooks";
+import { randomUUID as randomUUID5 } from "crypto";
+
+// src/prompt-projection.ts
+var TOOL_PROFILES = {
+  read: {
+    descriptionHash: "e6ecb6c162129bb9af6662e49fe1bf8c717fe73fce0b70231426355f364a0fc8",
+    schemaHash: "c500a4017cacb9c3492b5a9364cab238305498ccdd2fdcd90c79164d024577fb",
+    compact: "Read text, images, PDFs, or directory entries (one per line). Images and PDFs go directly to the model. Text lines have 1-based <line>: prefixes, not part of the file. Page with offset and limit; prefer larger reads and use grep to locate content in large files."
+  },
+  grep: {
+    descriptionHash: "7f673e0439d39f3baf03353a068df91bde20a9c189cc4e1625c18e2fd7c92400",
+    schemaHash: "fd5fe5bd60ca1371a055af4e846f65f772de74adea2210080e98ebe61fca67d5",
+    compact: "Find content using ripgrep regex or literal text. Narrow by path or include; returns matching paths, line numbers, and previews."
+  },
+  edit: {
+    descriptionHash: "2d71b0c3a25dacc15b17d53795cc2dec2ef6bd07031a32765ccfe716a08a3ecd",
+    schemaHash: "0f4a3beb0cd64394d321432093aa6983b3b4dc554586196c8fd611ba7aabff2c",
+    compact: "Replace exact text in an existing file. Preserve indentation and omit read line-number prefixes in both strings. Use \\n to preserve LF/CRLF; strings differing only in \\r edit line endings byte-for-byte. If exact matching fails, retries ignore typographic quote, dash and space variants, then trailing whitespace. A miss fails. oldString must be nonempty and differ from newString. Default replaceAll=false requires one match; add context to disambiguate or set replaceAll=true to replace every occurrence."
+  },
+  write: {
+    descriptionHash: "95008cb3f8ec278237a45d408fc018cab46cc7280bc4b36f58a1ebab0ca78ba8",
+    schemaHash: "7a4a81bfc4c2af017756dd2bb4b99d8813bc4b38424456589af58cb8f3822989",
+    compact: "Create or overwrite a local file, creating missing parent directories. Use edit for targeted changes."
+  },
+  skill: {
+    descriptionHash: "54cd97d5d5285155f2471c4caf1ec1d67dae0abbeb668a2564b979bc21ccb270",
+    schemaHash: "0f797af54d65a932eeb4378c1843d29250ecf5dc5f29797399b0c13c577c9022",
+    compact: "Load a matching skill's instructions and resources by available ID or one explicitly referenced by the user."
+  },
+  todowrite: {
+    descriptionHash: "876a6c6dc59690f6ea7b760252cea0b7051c79846f02f94bd274127996d1d447",
+    schemaHash: "87b265db24b79d90d96ae0f5b56414a1e725489ab086ef65fd7a367afcbb42e9",
+    compact: "Update the session's visible working plan for 3+ steps, multiple user tasks, or an explicit todo request. Skip simple or conversational tasks; use when unsure. Every call replaces the full list. Mark items in_progress at start and completed when done. Call only on changes."
+  }
 };
-var src_default = plugin;
+var SHELL_PROFILES = [
+  {
+    descriptionHash: "ce054c23a2a9e8faa6c48d2e08a3408e487c3bcea9d15cc1656aa7f7143a9554",
+    schemaHash: "07cd332089f46e2f58a314226d8cfbcb66cdf01302bd5c59064a858ddd18c3b4",
+    timeout: "Timeout is optional; background commands have no timeout by default."
+  },
+  {
+    descriptionHash: "290be9940b5b7104fb971c4133d8778959656c788f57f81ce587233a5e01bd6a",
+    schemaHash: "a3205b7c133b0a228a8f575fac1254634a226b2aa8b4408d1292dae97f837d5f",
+    timeout: "Foreground commands still running after timeout move to the background."
+  }
+];
+function attestShell(tool) {
+  const start = "Execute a shell command and return its output. ";
+  if (!tool.description.startsWith(start))
+    return;
+  const rest = tool.description.slice(start.length);
+  const environment = /^Commands run on (?:macOS|Windows|Linux|[a-z]+) using [a-z0-9_.+-]+\. /.exec(rest)?.[0] ?? "";
+  const description = digest(start + rest.slice(environment.length));
+  const match = SHELL_PROFILES.find((profile) => profile.descriptionHash === description);
+  if (!match || match.schemaHash !== digest(JSON.stringify(canonical(tool.input))))
+    return;
+  return `Run a shell command and return its output. ${environment}Quote paths with spaces or special characters; prefer dedicated tools when possible. Large output is saved to a file with a truncated preview; rely on truncation unless filtering helps. ${match.timeout} Background calls return immediately and notify on completion.`;
+}
+var HOST_TOOL_GUIDANCE = [
+  {
+    name: "shell",
+    duplicate: "- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.",
+    unique: "- Do not chain shell commands with separators like `echo \"====\";` or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse."
+  },
+  {
+    name: "write",
+    duplicate: "- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes."
+  },
+  {
+    name: "edit",
+    duplicate: "- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence."
+  }
+];
+var HOST_TEMPLATE_HASHES = new Set([
+  "ab9749036fe5a6b96c74c302900f67a9b249589b4fc4b8a8d18f3c6879dc506d",
+  "82d48b175f4ed1a2924d4adbeea3b51be7ecf25b1b0819467f9590d778af75bb",
+  "bbb87472e9f6e7960819e9e4af6bd0aed10db8fdc219c2e93820df8066cd5da3",
+  "7c105ed2d94347b62bf828f1ccd86d9a73c9ee576aea678eac77cc98b633aab5"
+]);
+function projectHost(event, attested) {
+  const host = event.system[0];
+  if (!host || host.metadata !== undefined)
+    return;
+  const present = HOST_TOOL_GUIDANCE.filter(({ name }) => Object.hasOwn(event.tools, name));
+  if (!present.some(({ name }) => attested.has(name)))
+    return;
+  const lines = present.flatMap((item) => ("unique" in item) ? [item.duplicate, item.unique] : [item.duplicate]);
+  const block = `
+${lines.join(`
+`)}
+`;
+  const index = host.text.indexOf(block);
+  if (index === -1)
+    return;
+  const before = host.text.slice(0, index + 1);
+  const after = host.text.slice(index + block.length - 1);
+  if (!HOST_TEMPLATE_HASHES.has(digest(`${before}\${OPENCODE_TOOL_GUIDANCE}${after}`)))
+    return;
+  const kept = present.flatMap((item) => [
+    ...attested.has(item.name) ? [] : [item.duplicate],
+    ..."unique" in item ? [item.unique] : []
+  ]);
+  event.system[0] = { ...host, text: before + kept.join(`
+`) + after };
+}
+var SKILL_KEY = "core/skill-guidance";
+var CATALOG_START = [
+  "Skills provide specialized instructions and workflows for specific tasks.",
+  "Use the skill tool to load a skill when a task matches its description.",
+  "The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.",
+  "<available_skills>",
+  ""
+].join(`
+`);
+var CATALOG_END = `
+</available_skills>`;
+var SKILL_TAG = /<\/?(?:id|name|description|skill|available_skills)>/;
+function projectCatalog(text) {
+  if (!text.startsWith(CATALOG_START) || !text.endsWith(CATALOG_END))
+    return;
+  const body = text.slice(CATALOG_START.length, -CATALOG_END.length);
+  const entry = /  <skill>\n    <id>([\s\S]*?)<\/id>\n    <name>([\s\S]*?)<\/name>\n    <description>([\s\S]*?)<\/description>\n  <\/skill>/gy;
+  const compact = [];
+  let cursor = 0;
+  while (cursor < body.length) {
+    entry.lastIndex = cursor;
+    const match = entry.exec(body);
+    if (!match)
+      return;
+    const [, id, name, description] = match;
+    if ([id, name, description].some((field) => SKILL_TAG.test(field)))
+      return;
+    compact.push(`<skill><id>${id}</id><name>${name}</name><description>${description}</description></skill>`);
+    cursor = entry.lastIndex;
+    if (cursor === body.length)
+      break;
+    if (body[cursor] !== `
+` || cursor + 1 === body.length)
+      return;
+    cursor += 1;
+  }
+  if (compact.length === 0)
+    return;
+  const guidance = "When a task matches a skill's description, load it with the skill tool. User-invoked skills appear as <skill_content> blocks like tool output and need not be loaded again.";
+  return [guidance, "<available_skills>", ...compact, "</available_skills>"].join(`
+`);
+}
+function projectSkills(event) {
+  for (const [index, part] of event.system.entries()) {
+    const experimental = part.metadata?.experimental;
+    if (!record(experimental) || !Array.isArray(experimental.instructions))
+      continue;
+    const sources = experimental.instructions.filter((source) => record(source) && typeof source.key === "string" && typeof source.text === "string");
+    if (sources.length !== experimental.instructions.length || sources.map((source) => source.text).join(`
+
+`) !== part.text)
+      continue;
+    const [skill, duplicate] = sources.filter((source) => source.key === SKILL_KEY);
+    if (!skill || duplicate)
+      continue;
+    const projected = projectCatalog(skill.text);
+    if (projected === undefined)
+      continue;
+    event.system[index] = {
+      ...part,
+      text: sources.map((source) => source.key === SKILL_KEY ? projected : source.text).join(`
+
+`)
+    };
+  }
+}
+function projectPrompt(event, options) {
+  if (options.compactPrompt || options.compactTools) {
+    const attested = new Set;
+    const seen = new Set;
+    const shared = new Set;
+    for (const tool of Object.values(event.tools)) {
+      if (seen.has(tool))
+        shared.add(tool);
+      else
+        seen.add(tool);
+    }
+    for (const [name, profile] of Object.entries(TOOL_PROFILES)) {
+      const tool = event.tools[name];
+      if (!tool || shared.has(tool))
+        continue;
+      if (digest(tool.description) !== profile.descriptionHash)
+        continue;
+      if (digest(JSON.stringify(canonical(tool.input))) !== profile.schemaHash)
+        continue;
+      attested.add(name);
+      if (options.compactTools)
+        tool.description = profile.compact;
+    }
+    const shell = event.tools.shell;
+    if (shell && !shared.has(shell)) {
+      const compact = attestShell(shell);
+      if (compact !== undefined) {
+        attested.add("shell");
+        if (options.compactTools)
+          shell.description = compact;
+      }
+    }
+    if (options.compactPrompt)
+      projectHost(event, attested);
+  }
+  if (options.compactSkills)
+    projectSkills(event);
+}
+
+// src/server-sdk-stream.ts
+import { AsyncLocalStorage } from "async_hooks";
+import { randomUUID as randomUUID4 } from "crypto";
+var sessionMarker = "x-opencode-kv-guard-sdk-session";
+var userMarker = "x-opencode-kv-guard-current-user";
+var routesKey = Symbol.for("opencode-kv-guard.sdk-routes");
+var shared = globalThis;
+var routes = shared[routesKey] ??= new WeakMap;
+function sdkRoute(app, location) {
+  const key = JSON.stringify([location.directory, location.workspaceID]);
+  const locations = routes.get(app) ?? new Map;
+  routes.set(app, locations);
+  const route = locations.get(key) ?? { marker: randomUUID4(), call: new AsyncLocalStorage };
+  locations.set(key, route);
+  return route;
+}
+function currentUserMarker(route) {
+  return `${userMarker}:${route.marker}`;
+}
+function routedSDKFetch(route, sdk) {
+  return async (input, init) => {
+    const { providerID, bodyOverlay, options, send } = sdk;
+    const active = route.active;
+    const model = route.call.getStore();
+    if (!active?.providers.has(providerID) || model?.providerID !== providerID) {
+      throw new TypeError(`KV guard: ${providerID} has no matching active SDK transport`);
+    }
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    const marker = headers.get(sessionMarker);
+    if (marker !== null && marker !== route.marker)
+      throw new TypeError("KV guard: SDK request does not match its session location");
+    headers.delete(sessionMarker);
+    let body = init?.body;
+    let user;
+    if (model.marksUser) {
+      if (typeof body !== "string")
+        throw new TypeError("KV guard: cannot remove current-user attestation from an opaque SDK body");
+      const value = JSON.parse(body);
+      if (!record(value) || !Array.isArray(value.messages))
+        throw new TypeError("KV guard: cannot attest current user in an opaque SDK body");
+      const indices = [];
+      for (const [index, message] of value.messages.entries()) {
+        if (record(message) && Object.hasOwn(message, userMarker)) {
+          if (message.role === "user" && message[userMarker] === route.marker)
+            indices.push(index);
+          delete message[userMarker];
+        }
+      }
+      if (indices.length === 1)
+        user = { index: indices[0], messages: digest(JSON.stringify(value.messages)) };
+      body = JSON.stringify(value);
+    }
+    if (typeof body === "string" && body.includes(currentUserMarker(route))) {
+      throw new TypeError("KV guard: a prompt rewrite made current-user attestation unsafe to forward");
+    }
+    return active.fetch({ model, bodyOverlay, user, inSession: marker === route.marker, sdkUsage: options.includeUsage !== false, send }, input, { ...init, headers, body });
+  };
+}
+function cancellableSDKStream(language, route, model) {
+  const runCall = (options, operation) => {
+    const attestation = currentUserMarker(route);
+    const marked = options.prompt.flatMap((message) => message.role === "user" ? message.content.filter((part) => part.type === "text" && part.text === attestation) : []);
+    const marksUser = marked.length === 1 && options.headers?.[sessionMarker] === route.marker;
+    const prompt = marked.length === 0 ? options.prompt : options.prompt.map((message) => {
+      if (message.role !== "user" || !message.content.some((part) => marked.includes(part)))
+        return message;
+      const content = message.content.filter((part) => !marked.includes(part));
+      if (!marksUser)
+        return { ...message, content };
+      const tag = { [userMarker]: route.marker };
+      const [part] = content;
+      if (content.length === 1 && part?.type === "text") {
+        return { ...message, content: [{ ...part, providerOptions: {
+          ...part.providerOptions,
+          openaiCompatible: { ...part.providerOptions?.openaiCompatible, ...tag }
+        } }] };
+      }
+      return { ...message, content, providerOptions: {
+        ...message.providerOptions,
+        openaiCompatible: { ...message.providerOptions?.openaiCompatible, ...tag }
+      } };
+    });
+    return route.call.run({ ...model, marksUser, maxOutputTokens: options.maxOutputTokens }, () => operation(prompt === options.prompt ? options : { ...options, prompt }));
+  };
+  return {
+    specificationVersion: language.specificationVersion,
+    provider: language.provider,
+    modelId: language.modelId,
+    get supportedUrls() {
+      return language.supportedUrls;
+    },
+    doGenerate: (options) => runCall(options, (call) => language.doGenerate(call)),
+    async doStream(options) {
+      if (options.abortSignal)
+        return runCall(options, (call) => language.doStream(call));
+      const abort = new AbortController;
+      const run = AsyncLocalStorage.snapshot();
+      let source;
+      let metadata;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          source ??= Promise.resolve(run(() => runCall({ ...options, abortSignal: abort.signal }, (call) => language.doStream(call)))).then(({ stream, request, response }) => {
+            metadata = { request, response };
+            return stream.getReader();
+          });
+          const reader = await source;
+          if (abort.signal.aborted)
+            return;
+          const next = await reader.read();
+          if (abort.signal.aborted)
+            return;
+          if (next.done)
+            controller.close();
+          else
+            controller.enqueue(next.value);
+        },
+        async cancel(reason) {
+          abort.abort(reason);
+          await source?.then((reader) => reader.cancel(reason), () => {
+            return;
+          });
+        }
+      }, { highWaterMark: 0 });
+      return {
+        stream,
+        get request() {
+          return metadata?.request;
+        },
+        get response() {
+          return metadata?.response;
+        }
+      };
+    }
+  };
+}
+function wireBody(body, maxOutputTokens, usage) {
+  const result = { ...body };
+  for (const [camel, wire] of [
+    ["promptCacheKey", "prompt_cache_key"],
+    ["cacheSalt", "cache_salt"],
+    ["chatTemplateKwargs", "chat_template_kwargs"],
+    ["enableThinking", "enable_thinking"],
+    ["preserveThinking", "preserve_thinking"],
+    ["maxTokens", "max_tokens"],
+    ["maxCompletionTokens", "max_completion_tokens"]
+  ]) {
+    if (!Object.hasOwn(result, camel))
+      continue;
+    const alias = result[camel];
+    const standard = result[wire];
+    if ((camel === "maxTokens" || camel === "maxCompletionTokens") && typeof alias === "number" && typeof standard === "number") {
+      result[wire] = Math.min(alias, standard);
+    } else if (!Object.hasOwn(result, wire))
+      result[wire] = alias;
+    delete result[camel];
+  }
+  if (result.stream === true) {
+    if (usage === "request" && (result.stream_options === undefined || record(result.stream_options))) {
+      result.stream_options = { include_usage: true, ...result.stream_options };
+    } else if (usage === "omit" && record(result.stream_options)) {
+      const { include_usage: _includeUsage, ...rest } = result.stream_options;
+      if (Object.keys(rest).length === 0)
+        delete result.stream_options;
+      else
+        result.stream_options = rest;
+    }
+  }
+  if (maxOutputTokens !== undefined) {
+    const legacy = typeof result.max_tokens === "number" ? result.max_tokens : maxOutputTokens;
+    if (typeof result.max_completion_tokens === "number") {
+      result.max_completion_tokens = Math.min(result.max_completion_tokens, legacy, maxOutputTokens);
+      delete result.max_tokens;
+    } else {
+      result.max_tokens = Math.min(legacy, maxOutputTokens);
+    }
+  }
+  return result;
+}
+
+// src/transport.ts
+async function inspectErrorBody(response, limit = 64 * 1024) {
+  if (!response.body)
+    return { response, bytes: new Uint8Array };
+  const reader = response.body.getReader();
+  const chunks = [];
+  const init = { status: response.status, statusText: response.statusText, headers: response.headers };
+  let length = 0;
+  try {
+    for (;; ) {
+      const chunk = await reader.read();
+      if (chunk.done)
+        break;
+      chunks.push(chunk.value);
+      length += chunk.value.byteLength;
+      if (length > limit) {
+        return { response: new Response(new ReadableStream({
+          async pull(controller) {
+            const buffered = chunks.shift();
+            if (buffered) {
+              controller.enqueue(buffered);
+              return;
+            }
+            const next = await reader.read();
+            if (next.done)
+              controller.close();
+            else
+              controller.enqueue(next.value);
+          },
+          cancel: (reason) => reader.cancel(reason)
+        }, { highWaterMark: 0 }), init) };
+      }
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { response: new Response(bytes, init), bytes };
+}
+function cancellableResponse(response, signal, onClose) {
+  if (!response.body) {
+    onClose?.();
+    return response;
+  }
+  let reader;
+  try {
+    reader = response.body.getReader();
+  } catch (error) {
+    onClose?.();
+    throw error;
+  }
+  let finished = false;
+  let completion;
+  let controller;
+  const finish = (cancel = false, reason) => {
+    if (completion)
+      return completion;
+    finished = true;
+    signal.removeEventListener("abort", abort);
+    completion = Promise.resolve().then(async () => {
+      try {
+        if (cancel)
+          await reader.cancel(reason);
+      } finally {
+        onClose?.();
+      }
+    });
+    return completion;
+  };
+  const abort = () => {
+    if (finished)
+      return;
+    finish(true, signal.reason).then(() => controller.error(signal.reason), (error) => controller.error(error));
+  };
+  const body = new ReadableStream({
+    start(value) {
+      controller = value;
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted)
+        abort();
+    },
+    async pull(value) {
+      let item;
+      try {
+        item = await reader.read();
+      } catch (error) {
+        if (finished)
+          return;
+        try {
+          await finish();
+          value.error(error);
+        } catch (closeError) {
+          value.error(closeError);
+        }
+        return;
+      }
+      if (finished)
+        return;
+      if (item.done) {
+        try {
+          await finish();
+          value.close();
+        } catch (error) {
+          value.error(error);
+        }
+      } else {
+        value.enqueue(item.value);
+      }
+    },
+    async cancel(reason) {
+      await finish(true, reason);
+    }
+  }, { highWaterMark: 0 });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+
+// src/server-transport.ts
+var compatible = "@ai-sdk/openai-compatible";
+var isCompatible = (pkg) => pkg === compatible || pkg?.startsWith(`${compatible}@`) === true;
+var isCompatibleModel = (pkg) => pkg?.startsWith("aisdk:") === true && isCompatible(pkg.slice("aisdk:".length));
+var isFetch = (value) => typeof value === "function";
+var isChatEndpoint = (url, method) => (url.protocol === "http:" || url.protocol === "https:") && method.toUpperCase() === "POST" && url.pathname.replace(/\/+$/, "").endsWith("/chat/completions");
+var isChatBody = (value) => record(value) && typeof value.model === "string" && Array.isArray(value.messages) && value.messages.every((message) => record(message) && typeof message.role === "string");
+var positiveLimit = (value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+var providerErrorStatus = (status) => status === 400 || status === 413 || status === 422;
+function modelLimits(limits, body, callOutput) {
+  if (!record(limits))
+    return;
+  const { context, input, output } = limits;
+  if (!positiveLimit(context) || !positiveLimit(output) || input !== undefined && !positiveLimit(input))
+    return;
+  const caps = [body.max_completion_tokens, body.max_tokens].filter((cap) => cap !== undefined);
+  if (caps.length > 1 && caps[0] !== caps[1])
+    return;
+  const wireOutput = caps.length ? caps[0] : callOutput ?? output;
+  if (positiveLimit(wireOutput) && wireOutput < context)
+    return { context, input, output, wireOutput };
+}
+var variableHeaders = new Set([
+  "content-length",
+  "x-opencode-request",
+  "x-opencode-session-id",
+  "x-opencode-parent-session-id",
+  "x-opencode-session",
+  "x-parent-session-id",
+  "x-session-id",
+  "x-session-affinity"
+]);
+function mergeBody(base, overlay) {
+  return Object.fromEntries([...Object.entries(base), ...Object.entries(overlay).map(([key, value]) => {
+    const previous = base[key];
+    return [key, value === undefined ? previous : record(previous) && record(value) ? mergeBody(previous, value) : value];
+  })]);
+}
+async function registerTransport(ctx, options, state = {}) {
+  const providers = new Set(options.providers);
+  const route = sdkRoute(ctx.app, ctx.location);
+  const inFlight = new Set;
+  const lifetime = new AbortController;
+  const dispatch = new AsyncLocalStorage2;
+  const outsideRequest = AsyncLocalStorage2.snapshot();
+  const catalogModel = async (ref) => (await ctx.model.list()).data.find((model) => model.providerID === ref.providerID && model.id === ref.id);
+  const promptOptions = {
+    compactPrompt: options.compactPrompt === true,
+    compactTools: options.compactTools === true,
+    compactSkills: options.compactSkills === true
+  };
+  const editContext = options.compaction || Object.values(promptOptions).some(Boolean);
+  const session = await Promise.all([...providers].flatMap((providerID) => [
+    ...editContext ? [ctx.session.hook("context", async (event) => {
+      projectPrompt(event, promptOptions);
+      if (!options.compaction)
+        return;
+      const history = await ctx.session.context({ sessionID: event.sessionID }).catch(() => {
+        return;
+      });
+      const user = history?.findLast((message) => message.type === "user");
+      if (!user)
+        return;
+      const matching = event.messages.filter((message) => message.id === user.id);
+      const [message] = matching;
+      if (matching.length !== 1 || message?.role !== "user" || !message.content.length)
+        return;
+      event.messages[event.messages.indexOf(message)] = {
+        ...message,
+        content: [...message.content, { type: "text", text: currentUserMarker(route) }]
+      };
+    }, { providerID })] : [],
+    ctx.session.hook("model.request", async (event) => {
+      const model = await catalogModel(event.model);
+      if (!isCompatibleModel(model?.package)) {
+        throw new TypeError(`KV guard: ${providerID}/${event.model.id} must use aisdk:${compatible}`);
+      }
+      event.headers[sessionMarker] = route.marker;
+    }, { providerID }),
+    ctx.session.hook("http.request", async (event) => {
+      const pending = dispatch.getStore();
+      if (pending?.model.providerID !== event.model.providerID || pending.model.id !== event.model.id) {
+        throw new TypeError("KV guard: HTTP request has no matching SDK dispatch");
+      }
+      event.request = await pending.prepare(event.request, {
+        sessionID: event.sessionID,
+        agent: event.agent,
+        kind: event.kind
+      });
+    }, { providerID }),
+    ctx.session.hook("http.response", async (event) => {
+      const pending = dispatch.getStore();
+      try {
+        if (pending?.model.providerID !== event.model.providerID || pending.model.id !== event.model.id) {
+          throw new TypeError("KV guard: HTTP response has no matching SDK dispatch");
+        }
+        pending.verify(event.request);
+      } catch (error) {
+        await event.response.body?.cancel(error);
+        throw error;
+      }
+    }, { providerID })
+  ]));
+  const activation = {
+    providers,
+    async fetch({ model, inSession, bodyOverlay, sdkUsage, user, send }, input, init) {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const method = init.method ?? (input instanceof Request ? input.method : "GET");
+      if (!isChatEndpoint(url, method))
+        throw new TypeError("KV guard: expected an SDK Chat Completions endpoint");
+      const providerID = model.providerID;
+      const abort = new AbortController;
+      inFlight.add(abort);
+      const originalSignal = init.signal ?? (input instanceof Request ? input.signal : undefined);
+      const signal = originalSignal ? AbortSignal.any([originalSignal, abort.signal]) : abort.signal;
+      let mainBinding;
+      let firstBody;
+      const attempt = async (overflow) => {
+        const stop = new AbortController;
+        const attemptSignal = AbortSignal.any([signal, stop.signal]);
+        const guardedInit = { ...init, redirect: "error", signal: attemptSignal };
+        let outgoing;
+        let prepared;
+        let shortCircuit;
+        let entered = false;
+        const localResponse = new Error("KV guard: state supplied an HTTP response without dispatch");
+        const prepare = async (request, owner) => {
+          const endpoint = new URL(request.url);
+          if (!isChatEndpoint(endpoint, request.method))
+            throw new TypeError("KV guard: HTTP hook changed the SDK chat endpoint to a different protocol");
+          if (entered)
+            throw new TypeError("KV guard: duplicate SDK HTTP dispatch");
+          entered = true;
+          const requestSignal = AbortSignal.any([attemptSignal, request.signal]);
+          requestSignal.throwIfAborted();
+          const parsed = await request.json();
+          const merged = !inSession && bodyOverlay && record(parsed) ? mergeBody(parsed, bodyOverlay) : parsed;
+          if (!isChatBody(merged))
+            throw new TypeError("KV guard: expected an OpenAI Chat Completions request");
+          const current = merged.stream === true ? await catalogModel(model) : undefined;
+          const streamUsage = current ? current.compatibility?.streamUsage : model.streamUsage;
+          const usage = streamUsage === false ? "omit" : options.usageAccounting && sdkUsage ? "request" : "preserve";
+          const adjusted = wireBody(merged, options.maxOutputTokens, usage);
+          const sentHeaders = new Headers(request.headers);
+          sentHeaders.delete(sessionMarker);
+          const sessionID = owner?.sessionID ?? sentHeaders.get("x-opencode-session-id") ?? undefined;
+          const endpointID = digest(endpoint.origin + endpoint.pathname.replace(/\/+$/, "") + endpoint.search);
+          const headScope = digest(JSON.stringify([providerID, endpointID, adjusted.model, [...sentHeaders].filter(([name]) => !variableHeaders.has(name))]));
+          const lane = digest(JSON.stringify([headScope, sessionID, owner?.agent, owner?.kind]));
+          sentHeaders.delete("content-length");
+          const currentUser = options.compaction && owner?.kind === "primary" && adjusted.stream === true && user && user.messages === digest(JSON.stringify(adjusted.messages)) ? adjusted.messages[user.index] : undefined;
+          const served = current && (current.modelID ?? current.id) === adjusted.model && isCompatibleModel(current.package) ? current : undefined;
+          const limits = currentUser && served ? modelLimits(served.limit, adjusted, model.maxOutputTokens) : undefined;
+          const reads = currentUser && limits && owner && options.supersedeReads && ctx.location.workspaceID === undefined ? await ctx.session.context({ sessionID: owner.sessionID }).then(readEvidence, () => {
+            return;
+          }) : undefined;
+          const compaction = currentUser?.role === "user" && limits ? (() => {
+            const summarize = async (candidate, signal, retryWithoutTools) => {
+              if (candidate.model !== adjusted.model || candidate.stream !== false || candidate.tools !== undefined && candidate.tool_choice !== "none" || candidate.functions !== undefined || candidate.function_call !== undefined) {
+                throw new TypeError("KV guard: expected a non-streaming summary with tools disabled on the selected model");
+              }
+              const summary = wireBody(candidate, limits.output, "omit");
+              delete summary.stream_options;
+              const submit = async (body) => {
+                signal.throwIfAborted();
+                const response = await outsideRequest(() => send(request.url, {
+                  ...guardedInit,
+                  method: request.method,
+                  headers: sentHeaders,
+                  body: new TextEncoder().encode(JSON.stringify(body)),
+                  signal
+                }));
+                return cancellableResponse(response, signal);
+              };
+              const response = await submit(summary);
+              if (!retryWithoutTools || summary.tool_choice !== "none" || summary.tools === undefined || !providerErrorStatus(response.status) || response.status === 413)
+                return response;
+              const inspected = await inspectErrorBody(response);
+              if (!inspected.bytes)
+                return inspected.response;
+              const failure = await providerError(inspected.response.clone());
+              if (failure?.overflow || !failure || !/\btool[_ ]choice\b/i.test(failure.text) || !/\bnone\b/i.test(failure.text) || !/\b(?:invalid|unsupported|not\s+(?:supported|allowed))\b/i.test(failure.text))
+                return inspected.response;
+              await inspected.response.body?.cancel();
+              const { tools: _tools, tool_choice: _toolChoice, parallel_tool_calls: _parallel, ...withoutTools } = summary;
+              return submit(withoutTools);
+            };
+            return {
+              limits,
+              currentUser,
+              overflow,
+              readEvidence: reads,
+              completeSummary: (candidate, signal) => summarize(candidate, signal ? AbortSignal.any([requestSignal, signal]) : requestSignal, true),
+              backgroundSummary: options.speculativeCompaction ? (candidate, signal) => summarize(candidate, AbortSignal.any([lifetime.signal, signal]), false) : undefined
+            };
+          })() : undefined;
+          if (compaction) {
+            const binding = digest(JSON.stringify([request.url, request.method, lane, [...sentHeaders], adjusted, limits]));
+            if (!overflow)
+              mainBinding = binding;
+            else if (binding !== mainBinding)
+              throw new Error("KV guard: provider overflow recovery changed request binding");
+          } else if (overflow)
+            throw new Error("KV guard: provider overflow recovery lost its compaction authority");
+          const staged = {
+            ...owner,
+            sessionID,
+            id: randomUUID5(),
+            providerID,
+            modelID: served?.id,
+            endpoint: endpointID,
+            lane,
+            headScope,
+            body: adjusted,
+            signal: requestSignal,
+            compaction
+          };
+          requestSignal.throwIfAborted();
+          const result = await state.onRequest?.(staged);
+          if (requestSignal.aborted && result instanceof Response)
+            await result.body?.cancel(requestSignal.reason);
+          requestSignal.throwIfAborted();
+          if (result instanceof Response) {
+            shortCircuit = result;
+            throw localResponse;
+          }
+          const body = result ?? adjusted;
+          const wire = JSON.stringify(body);
+          if (overflow && digest(wire) === firstBody)
+            throw new Error("KV guard: provider overflow recovery made no change");
+          if (!overflow && compaction)
+            firstBody = digest(wire);
+          outgoing = { ...staged, body, compaction: undefined };
+          prepared = new Request(request.url, { method: request.method, headers: sentHeaders, body: wire, signal: requestSignal });
+          return prepared;
+        };
+        try {
+          attemptSignal.throwIfAborted();
+          let response;
+          if (inSession) {
+            response = await dispatch.run({
+              model,
+              prepare,
+              verify(request) {
+                if (request !== prepared)
+                  throw new TypeError("KV guard: a later HTTP hook replaced the prepared SDK request");
+              }
+            }, () => send(input, guardedInit));
+          } else {
+            const request = await prepare(new Request(input, guardedInit));
+            response = await send(request.url, { ...guardedInit, method: request.method, headers: request.headers, body: await request.arrayBuffer() });
+          }
+          if (!outgoing || !prepared || shortCircuit) {
+            await response.body?.cancel();
+            throw new TypeError("KV guard: OpenCode did not run the SDK session HTTP hook");
+          }
+          return { response, outgoing };
+        } catch (error) {
+          if (shortCircuit && !attemptSignal.aborted)
+            return { response: shortCircuit };
+          stop.abort(error);
+          await shortCircuit?.body?.cancel(error).catch(() => {});
+          throw error;
+        }
+      };
+      try {
+        let { response, outgoing: final } = await attempt();
+        if (state.onRequest && final && firstBody !== undefined && providerErrorStatus(response.status)) {
+          const original = await inspectErrorBody(cancellableResponse(response, signal));
+          response = original.response;
+          const failure = original.bytes ? await providerError(response.clone()) : undefined;
+          if (failure?.overflow) {
+            try {
+              const retried = await attempt({ promptTokens: overflowPromptTokens(failure.text) });
+              if (retried.outgoing && retried.response.ok) {
+                await response.body?.cancel();
+                response = retried.response;
+                final = retried.outgoing;
+              } else
+                await retried.response.body?.cancel();
+            } catch {
+              signal.throwIfAborted();
+            }
+          }
+        }
+        const completed = final;
+        if (completed && state.onComplete)
+          response = observeResponse(response, (completion) => {
+            if (!signal.aborted)
+              return state.onComplete?.(completed, completion);
+          });
+        return cancellableResponse(response, signal, () => {
+          inFlight.delete(abort);
+        });
+      } catch (error) {
+        abort.abort(error);
+        inFlight.delete(abort);
+        throw error;
+      }
+    }
+  };
+  const sdk = await ctx.aisdk.hook("sdk", (event) => {
+    const { providerID, body: bodyOverlay } = event.model;
+    if (!providers.has(providerID))
+      return;
+    if (!isCompatible(event.package))
+      throw new TypeError(`KV guard: ${providerID} must use aisdk:${compatible}`);
+    if (event.sdk !== undefined)
+      throw new TypeError(`KV guard: ${providerID} initialized its SDK before transport registration`);
+    const send = event.options.fetch;
+    if (!isFetch(send))
+      throw new TypeError(`KV guard: ${providerID} has no OpenCode SDK fetch`);
+    event.options.fetch = routedSDKFetch(route, { providerID, bodyOverlay, options: event.options, send });
+  });
+  const language = await ctx.aisdk.hook("language", (event) => {
+    if (!providers.has(event.model.providerID) || !isCompatibleModel(event.model.package))
+      return;
+    const language = event.language ?? event.sdk.languageModel(event.model.modelID ?? event.model.id);
+    const { providerID, id, compatibility } = event.model;
+    event.language = cancellableSDKStream(language, route, { providerID, id, streamUsage: compatibility?.streamUsage });
+  });
+  route.active = activation;
+  return async () => {
+    if (route.active === activation)
+      delete route.active;
+    lifetime.abort();
+    for (const request of inFlight)
+      request.abort();
+    await Promise.all([language.dispose(), sdk.dispose(), ...session.map((registration) => registration.dispose())]);
+  };
+}
+
+// src/index.ts
+var src_default = Plugin.define({
+  id: "opencode-kv-guard",
+  async setup(host) {
+    const options = parseOptions(host.options);
+    const cleanup = new AsyncDisposableStack;
+    const state = registerServerState(host, options);
+    cleanup.defer(() => state.dispose());
+    try {
+      cleanup.defer(await registerTransport(host, options, state));
+      const stopTools = await registerTools(host, options);
+      if (stopTools)
+        cleanup.defer(stopTools);
+    } catch (error) {
+      await cleanup.disposeAsync();
+      throw error;
+    }
+    return () => cleanup.disposeAsync();
+  }
+});
 export {
   src_default as default
 };

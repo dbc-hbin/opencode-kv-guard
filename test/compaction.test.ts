@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { RollingCompaction, isCompactionSnapshot, overflowPromptTokens, providerError, type ChatBody, type CompactionContext, type CompactionResult } from "../src/compaction"
-import { Environments, type WireMessage } from "../src/prefix"
+import type { WireMessage } from "../src/prefix"
 
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8")
 function history(turns = 8, size = 450, tag = "history"): ChatBody {
@@ -21,7 +21,10 @@ function context(completeSummary: CompactionContext["completeSummary"], override
 function engine() { return new RollingCompaction({ bytesPerToken: 1, keepRecentTokens: 500 }) }
 function artifacts() {
   const saved = new Map<string, string>()
-  return { saved, path: (text: string) => `/artifacts/tool_kvguard_${new Bun.CryptoHasher("sha256").update(text).digest("hex")}`, save: async (path: string, text: string) => { saved.set(path, text) } }
+  return { saved, path: (text: string) => {
+    const hash = new Bun.CryptoHasher("sha256").update(text).digest("hex")
+    return `/artifacts/tool_${hash.slice(0, 12)}_kvguard_${hash.slice(12)}`
+  }, save: async (path: string, text: string) => { saved.set(path, text) } }
 }
 function forwarded(result: CompactionResult): ChatBody {
   if ("response" in result) throw new Error(`Unexpected upstream status ${result.response.status}`)
@@ -39,8 +42,9 @@ function archived(requests: ChatBody[]): string {
   return requests.map((request) => payload(request).archived_text).join("\n\n")
 }
 function batch(index: number, size = 350, name = "read", path = `file-${index}`): WireMessage[] {
+  const args = name === "skill" ? { id: path } : { path }
   return [
-    { role: "assistant", content: null, tool_calls: [{ id: `call-${index}`, type: "function", function: { name, arguments: JSON.stringify({ path }) } }] },
+    { role: "assistant", content: null, tool_calls: [{ id: `call-${index}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] },
     { role: "tool", tool_call_id: `call-${index}`, content: "t".repeat(size) },
   ]
 }
@@ -204,7 +208,16 @@ describe("handoff then shake then soft", () => {
     await expect(engine().prepare(body, context(async () => success(), { currentUser: current }))).rejects.toThrow("dead-end")
   })
 
-  test.each([["skill", "ignored"], ["read", "skill://programming"], ["read", "artifact://saved"], ["read", "/data/tool_kvguard_" + "a".repeat(64)], ["read", "/data/tool_kvguard_" + "b".repeat(48)], ["read", "/data/opencode/tool-output/tool_native123"]])("rescue protects %s reads of %s", async (name, path) => {
+  test.each([
+    ["skill", "programming"],
+    ["read", "skill://programming"],
+    ["read", "skill://programming/references/typescript/README.md"],
+    ["read", "artifact://saved"],
+    ["read", "/data/tool_kvguard_" + "a".repeat(64)],
+    ["read", "/data/tool_kvguard_" + "b".repeat(48)],
+    ["read", "/data/opencode/tool-output/tool_native123"],
+    ["read", "/v2/artifacts/tool_123456789abc_kvguard_" + "c".repeat(52)],
+  ])("rescue protects %s reads of %s", async (name, path) => {
     const body = history(0)
     body.messages.push(...batch(0, 9000, name, path))
     const store = artifacts()
@@ -289,22 +302,72 @@ describe("shake source reconstruction", () => {
 })
 
 describe("OMP soft cut points and authority adapters", () => {
-  test("tail uses whole protocol groups and preserves real current-user provenance", async () => {
+  test("SDK tool media stays with its result batch and does not replace the real current user", async () => {
     const body = history(0)
     const current = body.messages.at(-1)
     if (!current) throw new Error("Missing current instruction fixture")
-    for (let index = 0; index < 8; index++) body.messages.push(...batch(index, 500))
-    const newest = body.messages.slice(-2)
-    body.messages.push({ role: "user", content: [{ type: "text", text: "tool attachment" }, { type: "image_url", image_url: { url: "data:," } }] })
+    const groups = Array.from({ length: 8 }, (_, index) => [...batch(index, 500), {
+      role: "user",
+      content: [{ type: "text", text: "Attached media from tool result:" }, { type: "image_url", image_url: { url: `data:,${index}` } }],
+    }])
+    body.messages.push(...groups.flat(), { role: "assistant", content: "working" })
     const requests: ChatBody[] = []
-    const result = await engine().prepare(body, context(async (request) => { requests.push(request); return success() }, { currentUser: current }))
-    expect(forwarded(result).messages).toContain(current)
-    for (const message of newest) expect(forwarded(result).messages).toContain(message)
-    for (let index = 0; index < 8; index++) {
-      const retained = forwarded(result).messages.filter((message) => message.tool_call_id === `call-${index}` || Array.isArray(message.tool_calls) && message.tool_calls.some((call: { id: string }) => call.id === `call-${index}`))
-      expect([0, 2]).toContain(retained.length)
+    const result = await engine().prepare(body, context(async (request) => { requests.push(request); return success() }))
+    const messages = forwarded(result).messages
+    expect(messages).toContain(current)
+    for (const message of groups.at(-1) ?? []) expect(messages).toContain(message)
+    expect(messages.includes(groups[0]?.[0] ?? { role: "" })).toBe(false)
+    for (const [index, group] of groups.entries()) {
+      const retained = group.filter((message) => messages.includes(message))
+      expect([0, 3]).toContain(retained.length)
       if (!retained.length) expect(archived(requests)).toContain(`read(path="file-${index}")`)
     }
+  })
+
+  test.each(["string", "text part", "discovered file"])("keeps chronological v2 instruction updates before their own summaries (%s)", async (shape) => {
+    const boot: WireMessage = { role: "system", content: "Stable host environment" }
+    const developer: WireMessage = { role: "developer", content: "Stable developer policy" }
+    const wrapped = "<system-update>\nApply local AGENTS.md &lt;scope&gt;\n</system-update>"
+    const update: WireMessage = { role: "user", content: shape === "discovered file" ? "Instructions from: /workspace/subdir/AGENTS.md\nApply local AGENTS.md" : shape === "string" ? wrapped : [{ type: "text", text: wrapped }] }
+    const older = "pre-update task " + "a".repeat(4500)
+    const newer = "post-update task " + "b".repeat(4500)
+    const current: WireMessage = { role: "user", content: "Continue" }
+    const body: ChatBody = { model: "fixture", messages: [boot, developer,
+      { role: "user", content: older }, { role: "assistant", content: "old response" }, update,
+      { role: "user", content: newer }, { role: "assistant", content: "new response" }, current,
+    ] }
+    const requests: ChatBody[] = []
+    const compaction = new RollingCompaction({ bytesPerToken: 1, keepRecentTokens: 1 })
+    const result = forwarded(await compaction.prepare(body, context(async (request) => {
+      requests.push(request)
+      const { archived_text, previous_summary } = payload(request)
+      return success(archived_text.includes("pre-update task") || previous_summary === "first-summary" ? "first-summary" : "second-summary")
+    })))
+    expect(result.messages[0]).toBe(boot)
+    expect(result.messages[1]).toBe(developer)
+    expect(result.messages[2]?.content).toContain("first-summary")
+    expect(result.messages[3]).toBe(update)
+    expect(result.messages[4]?.content).toContain("second-summary")
+    expect(result.messages[5]).toBe(current)
+    expect(archived(requests)).not.toContain("Apply local AGENTS.md")
+    expect(requests.some((request) => {
+      const { archived_text } = payload(request)
+      return archived_text.includes("pre-update task") && archived_text.includes("post-update task")
+    })).toBe(false)
+    expect(compaction.reconstruct(body, context(async () => success()))).toEqual(result)
+  })
+
+  test("compaction preserves an unknown wire part instead of summarizing or clipping it", async () => {
+    const body = history()
+    const opaque: WireMessage = { role: "assistant", content: [
+      { type: "text", text: "Opaque sibling" }, { type: "provider_state", payload: { reference: "keep wire payload" } },
+    ] }
+    body.messages.splice(3, 0, opaque)
+    const requests: ChatBody[] = []
+    const result = forwarded(await engine().prepare(body, context(async (request) => { requests.push(request); return success() })))
+    expect(result.messages).toContain(opaque)
+    expect(archived(requests)).toContain("history-user-0:")
+    expect(archived(requests)).not.toContain("Opaque sibling")
   })
 
   test("provider-to-estimator correction reduces kept tail instead of changing the trigger", async () => {
@@ -491,14 +554,14 @@ describe("OMP soft cut points and authority adapters", () => {
 
   test("snapshot rejects obsolete clips and archived instructions, partial batches or cross-policy archives", async () => {
     const body = history(5, 600)
-    body.messages.splice(3, 0, { role: "developer", content: "new authority" }, ...batch(0, 300))
+    body.messages.splice(3, 0, { role: "user", content: "<system-update>\nnew authority\n</system-update>" }, ...batch(0, 300))
     const compaction = engine()
     await compaction.prepare(body, context(async () => success()))
     const snapshot = compaction.snapshot("session")
     expect(isCompactionSnapshot(snapshot)).toBe(true)
     const firstLane = snapshot.lanes[0]
     if (!firstLane) throw new Error("Missing checkpoint")
-    for (const segments of [[{ summary: "forged", archived: [0, 1] }], [{ summary: "forged", archived: [1, 4] }], [{ summary: "forged", archived: [4] }]]) {
+    for (const segments of [[{ summary: "forged", archived: [0, 1] }], [{ summary: "forged", archived: [1, 4, 5] }], [{ summary: "forged", archived: [3] }], [{ summary: "forged", archived: [4] }]]) {
       const invalid = structuredClone(snapshot)
       const lane = invalid.lanes[0]
       if (!lane) throw new Error("Missing checkpoint")
@@ -512,17 +575,18 @@ describe("OMP soft cut points and authority adapters", () => {
     expect(isCompactionSnapshot(obsolete)).toBe(false)
   })
 
-  test("generated environment and restored current reasoning remain exact in final fit", async () => {
+  test("stable v2 authority entries and restored current reasoning remain exact in final fit", async () => {
     const body = history(8, 450)
+    const initial = body.messages[0]
     const current = body.messages.at(-1)
     const tools = batch(0, 50)
-    body.messages.push(...tools)
-    new Environments().apply(body.messages, "session", "lane")
-    const environment = body.messages.at(-1)
-    if (!current || !environment) throw new Error("Missing instruction or environment fixture")
+    const developer: WireMessage = { role: "developer", content: "Keep chronological developer instructions in their host position" }
+    body.messages.push(...tools, developer)
+    if (!current || !initial) throw new Error("Missing instruction fixture")
     const result = await engine().prepare(body, context(async () => success(), { currentUser: current, restoreReasoning: (candidate) => ({ ...candidate, messages: candidate.messages.map((message) => message === tools[0] ? { ...message, reasoning_content: "restored" } : message) }) }))
+    expect(forwarded(result).messages[0]).toBe(initial)
     expect(forwarded(result).messages).toContain(current)
-    expect(forwarded(result).messages).toContain(environment)
+    expect(forwarded(result).messages.at(-1)).toBe(developer)
     expect(forwarded(result).messages.find((message) => message.tool_calls === tools[0]?.tool_calls)?.reasoning_content).toBe("restored")
     expect(bytes(forwarded(result))).toBeLessThanOrEqual(3400)
   })
@@ -894,7 +958,9 @@ describe("provider overflow errors", () => {
 
   test.each([
     { status: 400, body: JSON.stringify({ error: { message: "prompt is too long", code: "context_length_exceeded" } }), overflow: true, text: "prompt is too long context_length_exceeded" },
+    { status: 400, body: "Prompt exceeds max length", overflow: true, text: "Prompt exceeds max length" },
     { status: 400, body: JSON.stringify({ message: "rate limit: too many tokens" }), overflow: false, text: "rate limit: too many tokens" },
+    { status: 400, body: "Too many tokens: max_tokens must be less than 4096", overflow: false, text: "Too many tokens: max_tokens must be less than 4096" },
     { status: 400, body: "", overflow: true, text: "" },
     { status: 413, body: "payload", overflow: true, text: "payload" },
     { status: 422, body: JSON.stringify({ error: "prompt is too long" }), overflow: false, text: "prompt is too long" },

@@ -3,31 +3,41 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Stream-lifetime admission control and deterministic tool schemas for OpenCode 1.19.4",
-  "exports": "./src/index.ts",
+  "description": "Request prefix protection, rolling compaction and cache diagnostics for OpenCode 2.3.0",
+  "exports": {
+    "./server": "./dist/opencode-kv-guard.js",
+    "./tui": "./dist/opencode-kv-guard-tui.tsx"
+  },
   "scripts": {
-    "build": "bun build ./src/index.ts --target bun --outfile dist/opencode-kv-guard.js && cp src/tui.tsx dist/opencode-kv-guard-tui.tsx",
+    "build": "bun build ./src/index.ts --target bun --external '@opencode/*' --external effect --external 'gpt-tokenizer/*' --outfile dist/opencode-kv-guard.js && cp src/tui.tsx dist/opencode-kv-guard-tui.tsx",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "smoke": "bun run scripts/smoke.ts",
     "smoke:compaction": "bun run scripts/compaction-smoke.ts",
-    "smoke:manual-compaction": "bun run scripts/manual-compaction-smoke.ts",
-    "smoke:recovery": "bun run scripts/recovery-smoke.ts",
-    "smoke:speculative": "bun run scripts/speculative-compaction-smoke.ts"
+    "smoke:tui": "bun --conditions=browser --preload @opentui/solid/preload scripts/tui-smoke.ts"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "2.3.0",
+    "effect": "^4.1.0"
+  },
+  "dependencies": {
+    "gpt-tokenizer": "4.0.0"
   },
   "devDependencies": {
     "@ai-sdk/openai-compatible": "2.0.41",
-    "@opencode-ai/plugin": "1.19.4",
-    "@opencode-ai/sdk": "1.19.4",
-    "@opentui/core": "0.4.5",
-    "@opentui/keymap": "0.4.5",
-    "@opentui/solid": "0.4.5",
+    "@ai-sdk/provider": "3.0.8",
+    "@opencode/cli": "2.3.0",
+    "@opencode/client": "2.3.0",
+    "@opencode/plugin": "2.3.0",
+    "@opencode/schema": "2.3.0",
+    "@opentui/core": "0.8.4",
+    "@opentui/solid": "0.8.4",
     "@types/bun": "1.4.3",
     "@types/json-schema": "7.0.15",
     "@types/node": "26.6.5",
     "ai": "6.0.168",
-    "opencode-ai": "1.19.4",
-    "solid-js": "1.9.10",
+    "effect": "4.1.0",
+    "solid-js": "1.9.17",
     "typescript": "5.9.3",
     "zod": "4.1.8"
   }

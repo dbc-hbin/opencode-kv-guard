@@ -4,35 +4,40 @@ import { constants, watch, type FSWatcher } from "node:fs"
 import { chmod, lstat, mkdir, open } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { isCompactionSnapshot, type CompactionSnapshot } from "./compaction"
-import { isEnvironmentsSnapshot, isModeRemindersSnapshot, type EnvironmentsSnapshot, type ModeRemindersSnapshot } from "./prefix"
-import { isSessionHeadsSnapshot, isPrefixGuardSnapshot, type SessionHeadsSnapshot, type PrefixGuardSnapshot } from "./heads"
+import { isPrefixGuardSnapshot, type PrefixGuardSnapshot } from "./heads"
 import { busy, digest as hash, record, uuidV4 } from "./shared"
 import { isUsageSnapshot, type UsageSnapshot } from "./usage"
 
-export type CheckpointSnapshot = { modes: ModeRemindersSnapshot; environments: EnvironmentsSnapshot; compaction: CompactionSnapshot; heads?: SessionHeadsSnapshot; prefixGuard?: PrefixGuardSnapshot; usage?: UsageSnapshot }
+export type CheckpointSnapshot = {
+  readonly boundary?: number
+  readonly prefix: PrefixGuardSnapshot
+  readonly usage: UsageSnapshot
+  readonly compaction?: CompactionSnapshot
+}
+export type HistoryBoundary = { readonly sequence: number; readonly deleted: boolean }
 type CheckpointLoad = { revision: string | null; snapshot: CheckpointSnapshot | null; reason?: "malformed" | "version" | "deleted" }
 type Row = { revision: string; version: number; payload: string | null; deleted: number }
-const version = 2
+const version = 3
 
 export function isCheckpointSnapshot(value: unknown, session: string): value is CheckpointSnapshot {
   if (!record(value)) return false
-  return Object.keys(value).every((key) => ["modes", "environments", "compaction", "heads", "prefixGuard", "usage"].includes(key))
-    && isModeRemindersSnapshot(value.modes, session) && isEnvironmentsSnapshot(value.environments) && isCompactionSnapshot(value.compaction)
-    && (value.heads === undefined || isSessionHeadsSnapshot(value.heads, session))
-    && (value.prefixGuard === undefined || isPrefixGuardSnapshot(value.prefixGuard, session))
-    && (value.usage === undefined || isUsageSnapshot(value.usage))
+  return Object.keys(value).every((key) => ["boundary", "prefix", "usage", "compaction"].includes(key))
+    && (value.boundary === undefined || typeof value.boundary === "number" && Number.isSafeInteger(value.boundary) && value.boundary >= 0)
+    && isPrefixGuardSnapshot(value.prefix, session) && isUsageSnapshot(value.usage)
+    && (value.compaction === undefined || isCompactionSnapshot(value.compaction))
 }
 
 export class CheckpointConflictError extends Error {
+  readonly name = "CheckpointConflictError"
+
   constructor() { super("KV guard checkpoint revision conflict; reload the session before preparing another request") }
 }
 
 // One complete session bundle is the CAS unit, including all of its lanes. The
 // caller serializes load -> restore -> prepare -> snapshot -> save locally and
-// awaits save before main dispatch. Cross-process stale saves fail, never merge
-// incompatible mode/environment/summary generations or overwrite another lane.
-// SQLite transactions release OS locks on process death. Ordinary stale saves
-// fail; deletion waits for competing writers so its tombstone is not lost.
+// awaits save before dispatch. Cross-process stale saves fail rather than replacing
+// another request's measured prefix. SQLite transactions release locks on process
+// death. History invalidation waits for competing writers so its fence is not lost.
 // An unreadable database fails closed. A readable but
 // malformed/version-mismatched payload is a cache miss retaining its CAS token.
 export class CheckpointStore {
@@ -76,18 +81,24 @@ export class CheckpointStore {
     return row
   }
 
+  private decode(row: Row | null, session: string): CheckpointLoad {
+    if (!row) return { revision: null, snapshot: null }
+    if (row.deleted) return { revision: row.revision, snapshot: null, reason: "deleted" }
+    if (row.version !== version) return { revision: row.revision, snapshot: null, reason: "version" }
+    let snapshot: unknown
+    try {
+      snapshot = typeof row.payload === "string" ? JSON.parse(row.payload) : null
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error
+      return { revision: row.revision, snapshot: null, reason: "malformed" }
+    }
+    if (!isCheckpointSnapshot(snapshot, session)) return { revision: row.revision, snapshot: null, reason: "malformed" }
+    return { revision: row.revision, snapshot }
+  }
+
   async load(session: string): Promise<CheckpointLoad> {
     const db = await this.database(session)
-    try {
-      const row = this.row(db)
-      if (!row) return { revision: null, snapshot: null }
-      if (row.deleted) return { revision: row.revision, snapshot: null, reason: "deleted" }
-      if (row.version !== version) return { revision: row.revision, snapshot: null, reason: "version" }
-      let snapshot: unknown
-      try { snapshot = typeof row.payload === "string" ? JSON.parse(row.payload) : null } catch { return { revision: row.revision, snapshot: null, reason: "malformed" } }
-      if (!isCheckpointSnapshot(snapshot, session)) return { revision: row.revision, snapshot: null, reason: "malformed" }
-      return { revision: row.revision, snapshot }
-    } finally { db.close() }
+    try { return this.decode(this.row(db), session) } finally { db.close() }
   }
 
   async save(session: string, snapshot: CheckpointSnapshot, expectedRevision: string | null): Promise<string> {
@@ -107,11 +118,25 @@ export class CheckpointStore {
     } finally { db.close() }
   }
 
-  async delete(session: string, onContention?: () => void): Promise<void> {
+  async reset(session: string, boundary: HistoryBoundary, onContention?: () => void): Promise<boolean> {
+    const file = `${hash(session)}.sqlite`
+    try {
+      // load() creates this file before any writer can read its CAS token.
+      // No file means no earlier checkpoint operation can publish old state.
+      await lstat(join(this.directory, file))
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return false
+      throw error
+    }
+    const payload = boundary.deleted ? null : JSON.stringify({
+      boundary: boundary.sequence,
+      prefix: { version: 2, session: hash(session), lanes: [] },
+      usage: { lanes: [] },
+    } satisfies CheckpointSnapshot)
     let notified = false
     for (;;) {
       const changed = Promise.withResolvers<void>()
-      const journal = `${hash(session)}.sqlite-journal`
+      const journal = `${file}-journal`
       let watcher: FSWatcher | undefined
       // Subscribe before attempting the transaction. The fallback covers a
       // reservation released without journal activity or a missing FS event.
@@ -122,17 +147,20 @@ export class CheckpointStore {
             if (filename === journal) changed.resolve()
           })
           watcher.on("error", changed.resolve)
-        } catch {
-          // A not-yet-created directory or unsupported watcher uses the fallback.
+        } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || !["ENOENT", "ENOSYS", "ENOTSUP"].some((code) => code === error.code)) throw error
         }
         const db = await this.database(session)
         try {
           db.transaction(() => {
-            // Keep only an opaque tombstone: stale work, even from an initially
-            // missing checkpoint, cannot resurrect a deleted session's state.
-            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, NULL, 1) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = NULL, deleted = 1").run(randomUUID(), version)
+            const row = this.row(db)
+            if (row?.deleted) return
+            // Multiple instances can observe the same durable event. A duplicate
+            // cannot revoke a request already prepared after the first reset.
+            if (!boundary.deleted && (this.decode(row, session).snapshot?.boundary ?? -1) >= boundary.sequence) return
+            db.query("INSERT INTO checkpoint (id, revision, version, payload, deleted) VALUES (1, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, version = excluded.version, payload = excluded.payload, deleted = excluded.deleted").run(randomUUID(), version, payload, Number(boundary.deleted))
           }).immediate()
-          return
+          return true
         } finally { db.close() }
       } catch (error) {
         if (!busy(error)) throw error

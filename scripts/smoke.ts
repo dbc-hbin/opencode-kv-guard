@@ -1,223 +1,248 @@
 import { strict as assert } from "node:assert"
-import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
-import { pathToFileURL } from "node:url"
-import type { Server, Subprocess } from "bun"
+import { randomUUID } from "node:crypto"
+import { join } from "node:path"
 import { z } from "zod"
-import { fixtureEnv } from "./fixture"
+import { apiKey, FixtureError, maxOutputTokens, providerID, runSmoke, within } from "./fixture"
+import type { Capture, Runtime } from "./fixture"
+import { completion, streamHeaders, textStream, toolStream } from "./openai-fixture"
 
-const requestSchema = z.object({
-  model: z.string(),
-  messages: z.array(z.object({ role: z.string(), content: z.unknown().optional() }).passthrough()),
-  tools: z.array(z.unknown()).optional(),
-  max_tokens: z.number().optional(),
-}).passthrough()
-type Capture = { body: z.infer<typeof requestSchema>; headers: Headers; finish: () => void }
-const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-kv-guard-smoke-")))
-const binary = resolve("node_modules/.bin/opencode")
-const plugin = pathToFileURL(resolve("dist/opencode-kv-guard.js")).href
-const encoder = new TextEncoder()
-const children: Subprocess<"ignore", "pipe", "pipe">[] = []
-const servers: Server<undefined>[] = []
+const successes = "FIXTURE_ANSWER"
+const deniedContent = randomUUID()
+const readContent = randomUUID()
+const declinePrompt = "DECLINE_DIRECT_READ"
+const feedbackPrompt = "CORRECT_DIRECT_READ"
+const feedback = "Use a different file."
+const declinedRequests: Capture[] = []
+const correctedRequests: Capture[] = []
+const transportError = "a rejected loopback completion"
+const codePrompt = "NATIVE_CODE_MODE"
+const directPrompt = "DIRECT_TOOL_ROUND_TRIP"
+type Exchange = {
+  readonly arrived: PromiseWithResolvers<Capture>
+  readonly reply: (call: Capture) => Response
+}
+const exchanges = new Map<string, Exchange>()
+const codeRequests: Capture[] = []
+const directRequests: Capture[] = []
+const fileTools = ["read", "glob", "grep"]
 
-type Scenario = { guarded: boolean; disableTitle?: boolean; codeMode?: boolean; outputStorage?: boolean; subagent?: boolean }
-async function scenario({ guarded, disableTitle = false, codeMode = false, outputStorage = false, subagent = false }: Scenario) {
-  const home = join(root, subagent ? "subagent" : outputStorage ? "output-storage" : codeMode ? "code-mode" : disableTitle ? "no-title" : guarded ? "guarded" : "baseline")
-  await mkdir(home, { recursive: true })
-  const fixture = join(home, "fixture.txt")
-  await Bun.write(fixture, "Fixture content for a real read-tool round trip.\n")
-  const skillDirectory = join(home, ".opencode", "skills", "fixture-skill")
-  await mkdir(skillDirectory, { recursive: true })
-  const skillDescription = "Use when checking the local fixture tool round trip; retain the original instructions."
-  await Bun.write(join(skillDirectory, "SKILL.md"), `---\nname: fixture-skill\ndescription: ${skillDescription}\n---\nRead the local fixture before answering.\n`)
-  const waiting: Array<(capture: Capture) => void> = []
-  const buffered: Capture[] = []
-  const captures: Capture[] = []
-  let active = 0
-  let maxActive = 0
-  let mainCalls = 0
-  let mcpCalls = 0
-  const next = () => {
-    const ready = buffered.shift()
-    if (ready) return Promise.resolve(ready)
-    const { promise, resolve } = Promise.withResolvers<Capture>()
-    waiting.push(resolve)
-    return promise
-  }
-  const server = Bun.serve({
-    hostname: "127.0.0.1", port: 0,
-    async fetch(request) {
-      if (new URL(request.url).pathname === "/mcp") {
-        if (request.method !== "POST") return new Response(null, { status: 405 })
-        const rpc = z.object({
-          id: z.union([z.string(), z.number()]).optional(), method: z.string(),
-          params: z.object({ name: z.string().optional(), arguments: z.object({ value: z.string() }).optional() }).passthrough().optional(),
-        }).parse(await request.json())
-        if (rpc.id === undefined) return new Response(null, { status: 202 })
-        let result: unknown
-        if (rpc.method === "initialize") result = { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "kv-fixture", version: "1" } }
-        else if (rpc.method === "tools/list") result = { tools: [{ name: "echo", description: "Return the supplied fixture value.", inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }] }
-        else if (rpc.method === "tools/call") {
-          assert.equal(rpc.params?.name, "echo")
-          assert.equal(rpc.params.arguments?.value, "CODE_MODE_OK")
-          mcpCalls++
-          result = { content: [{ type: "text", text: "CODE_MODE_OK" }] }
-        } else return Response.json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: "Method not found" } })
-        return Response.json({ jsonrpc: "2.0", id: rpc.id, result })
-      }
-      if (new URL(request.url).pathname !== "/tenant/v1/chat/completions") return new Response("not found", { status: 404 })
-      const body = requestSchema.parse(await request.json())
-      const main = Array.isArray(body.tools) && body.tools.length > 0
-      const call = main ? ++mainCalls : 0
-      active++
-      maxActive = Math.max(maxActive, active)
-      let control: ReadableStreamDefaultController<Uint8Array>
-      const chunk = (delta: unknown, finish_reason: string | null = null) => encoder.encode(`data: ${JSON.stringify({ id: `fixture-${captures.length}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta, finish_reason }] })}\n\n`)
-      const stream = new ReadableStream<Uint8Array>({ start(controller) { control = controller; controller.enqueue(chunk({ role: "assistant" })) } })
-      const capture: Capture = {
-        body, headers: request.headers,
-        finish() {
-          if (main) control.enqueue(chunk({ reasoning_text: `Fixture reasoning for step ${call}.` }))
-          if (main && call === 1) {
-            const name = subagent ? "task" : outputStorage ? "bash" : "read"
-            const args = subagent
-              ? { description: "Check fixture", prompt: "Return KV_GUARD_CHILD_OK without calling tools.", subagent_type: "general" }
-              : outputStorage
-                ? { command: "printf 'OUTPUT_HEAD\\n'; printf 'fixture-line-012345678901234567890123456789012345678901234567890123456789\\n%.0s' {1..500}; printf 'OUTPUT_TAIL\\n'", description: "Emit a bounded output fixture" }
-                : { filePath: fixture }
-            control.enqueue(chunk({ tool_calls: [{ index: 0, id: "fixture-read-call", type: "function", function: { name, arguments: JSON.stringify(args) } }] }))
-            control.enqueue(chunk({}, "tool_calls"))
-          } else if (main && codeMode && call === 2) {
-            control.enqueue(chunk({ tool_calls: [{ index: 0, id: "fixture-mcp-call", type: "function", function: { name: "execute", arguments: JSON.stringify({ code: 'return await tools.fixture.echo({value: "CODE_MODE_OK"})' }) } }] }))
-            control.enqueue(chunk({}, "tool_calls"))
-          } else {
-            control.enqueue(chunk({ content: main ? subagent && request.headers.has("x-opencode-parent-session-id") ? "KV_GUARD_CHILD_OK" : "KV_GUARD_OK" : "Fixture session" }))
-            control.enqueue(chunk({}, "stop"))
-          }
-          control.enqueue(encoder.encode(`data: ${JSON.stringify({ id: `fixture-${captures.length}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices: [], usage: { prompt_tokens: 2048, completion_tokens: 32, total_tokens: 2080, prompt_tokens_details: { cached_tokens: call > 1 ? 1024 : 0 } } })}\n\n`))
-          control.enqueue(encoder.encode("data: [DONE]\n\n"))
-          active--
-          control.close()
-        },
-      }
-      captures.push(capture)
-      const subscriber = waiting.shift()
-      if (subscriber) subscriber(capture)
-      else buffered.push(capture)
-      return new Response(stream, { headers: { "content-type": "text/event-stream" } })
+function exchange(prompt: string, reply: Exchange["reply"]) {
+  const arrived = Promise.withResolvers<Capture>()
+  exchanges.set(prompt, { arrived, reply })
+  return arrived.promise
+}
+
+function heldStream(call: Capture, finish: Promise<void>, onAbort?: () => void) {
+  const reply = completion()
+  const bytes = new TextEncoder()
+  let canceled = false
+  if (onAbort) call.signal.addEventListener("abort", onAbort, { once: true })
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes.encode(reply.delta({ role: "assistant", content: successes })))
+      void finish.then(() => {
+        if (canceled || call.signal.aborted) return
+        controller.enqueue(bytes.encode(reply.end("stop")))
+        controller.close()
+      })
     },
+    cancel() { canceled = true; onAbort?.() },
   })
-  servers.push(server)
-  const config = {
-    model: "fixture/fixture", small_model: "fixture/fixture", enabled_providers: ["fixture"],
-    snapshot: false,
-    ...(codeMode ? { mcp: { fixture: { type: "remote", url: `http://127.0.0.1:${server.port}/mcp`, oauth: false } } } : {}),
-    ...(disableTitle ? { agent: { title: { disable: true } } } : {}),
-    provider: { fixture: { npm: "@ai-sdk/openai-compatible", name: "Local smoke fixture", options: { baseURL: `http://127.0.0.1:${server.port}/\${KV_GUARD_SMOKE_TENANT}/v1`, apiKey: "local-fixture-not-a-secret" }, models: { fixture: { name: "fixture", limit: { context: 32768, output: 1024 } } } } },
-    ...(guarded ? { plugin: [[plugin, { providers: ["fixture"], maxOutputTokens: 128, diagnostics: true, glm: { models: ["fixture"] } }]] } : {}),
-  }
-  const env = { ...fixtureEnv(home, config), KV_GUARD_SMOKE_TENANT: "tenant", OPENCODE_EXPERIMENTAL_CODE_MODE: String(codeMode) }
-  const firstArrival = next()
-  const child = Bun.spawn([binary, "run", "--dir", home, "--format", "json", "--model", "fixture/fixture", `Read ${fixture} then answer.`], { cwd: home, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
-  children.push(child)
-  const stdout = new Response(child.stdout).text()
-  const stderr = new Response(child.stderr).text()
-  const ended = child.exited.then(async (exit) => { throw new Error(`CLI exited before expected request (${exit})\n${await stderr}\n${await stdout}`) })
-  // Every wait is for an exact request/exit event; the overall deadline below
-  // is a failure bound, not a sleep used to make assertions pass.
-  const first = await Promise.race([firstArrival, ended])
-  if (guarded) {
-    first.finish()
-    if (!disableTitle) {
-      const second = await Promise.race([next(), ended])
-      second.finish()
-    }
-  } else {
-    const second = await Promise.race([next(), ended])
-    assert.equal(maxActive, 2, "baseline title and main requests must overlap")
-    first.finish()
-    second.finish()
-  }
-  const third = await Promise.race([next(), ended])
-  third.finish()
-  if (codeMode || subagent) (await Promise.race([next(), ended])).finish()
-  const exit = await child.exited
-  const output = await stdout
-  const errors = await stderr
-  // The rejection branch above is a sentinel for premature exits; consume it
-  // now that this process has finished normally.
-  void ended.catch(() => {})
-  assert.equal(exit, 0, errors)
-  assert.ok(output.includes("KV_GUARD_OK"), `${errors}\n${output}`)
-  assert.equal(captures.length, (disableTitle ? 2 : 3) + Number(codeMode || subagent))
-  const main = captures.filter((capture) => capture.body.tools?.length)
-  assert.equal(main.length, codeMode || subagent ? 3 : 2)
-  if (!outputStorage && !subagent) assert.ok(main[1]!.body.messages.some((message) => message.role === "tool" && JSON.stringify(message.content).includes("Fixture content")), "actual read result must return to the model")
-  if (outputStorage) {
-    const result = main[1]!.body.messages.find((message) => message.role === "tool")
-    const text = JSON.stringify(result?.content)
-    assert.ok(text.includes("OUTPUT_HEAD") && text.includes("OUTPUT_TAIL"), "stored preview must retain both ends")
-    assert.ok(Buffer.byteLength(text) < 18 * 1024, "stored output must stay within the configured preview budget")
-    const artifacts = await Array.fromAsync(new Bun.Glob("tool_*").scan({ cwd: join(home, "data", "opencode", "tool-output"), absolute: true }))
-    const raw = await Promise.all(artifacts.map((path) => Bun.file(path).text()))
-    assert.ok(raw.some((value) => value.startsWith("OUTPUT_HEAD\n") && value.endsWith("OUTPUT_TAIL\n") && value.split("fixture-line-").length === 501), "raw artifact must retain every original output line")
-    assert.ok(artifacts.some((path) => text.includes(path)), "preview must identify its retrievable raw artifact")
-  }
-  if (subagent) {
-    const child = main.find((capture) => capture.headers.has("x-opencode-parent-session-id"))
-    assert.ok(child, "actual task tool must launch a child session")
-    assert.equal(child.headers.get("x-litellm-session-id"), child.headers.get("x-opencode-parent-session-id"))
-    assert.ok(JSON.stringify(main[2]!.body.messages).includes("KV_GUARD_CHILD_OK"), "child result must reach parent")
-  }
-  if (guarded) {
-    assert.equal(maxActive, 1)
-    assert.ok(captures.every((capture) => capture.body.max_tokens === 128))
-    assert.ok(captures.every((capture) => !capture.headers.has("x-opencode-kv-guard-agent")))
-    assert.ok(captures.every((capture) => !capture.headers.has("x-opencode-kv-guard-limits")))
-    assert.ok(captures.every((capture) => !capture.headers.has("x-opencode-kv-guard-user")))
-    assert.ok(captures.every((capture) => !capture.headers.has("x-opencode-kv-guard-system-suffix")))
-    assert.ok(!JSON.stringify(captures.map((capture) => capture.body.messages)).includes("kv-guard-user:"))
-    assert.ok(captures.every((capture) => capture.headers.has("x-litellm-session-id")))
-    assert.ok(!JSON.stringify(main.map((capture) => capture.body.messages)).includes("Today's date:"))
-    const previous = main[0]!.body.messages
-    const followup = main[subagent ? 2 : 1]!
-    assert.deepEqual(followup.body.messages.slice(0, previous.length), previous, "tool round trip must preserve the entire previous request prefix")
-    assert.equal(followup.body.messages.find((message) => message.role === "assistant")?.reasoning_content, "Fixture reasoning for step 1.")
-    const system = main[0]!.body.messages.filter((message) => message.role === "system").map((message) => message.content).join("\n")
-    assert.ok(system.includes(skillDescription), "skill routing description must be preserved")
-    assert.ok(!system.includes(join(skillDirectory, "SKILL.md")), "eager skill path must be removed")
-    assert.ok(captures.every((capture) => capture.body.reasoning_effort === "max"))
-    const toolText = (main[0]!.body.tools as { function: { name: string; description: string } }[]).map((tool) => tool.function)
-    assert.ok(toolText.find((tool) => tool.name === "bash")?.description.startsWith("Runs a command in a persistent"), "builtin bash description must be compacted")
-    assert.ok(toolText.find((tool) => tool.name === "read")?.description.includes("`<line>: <content>`"), "read output contract must remain")
-    assert.ok(!toolText.some((tool) => tool.description.includes("<good-example>") || tool.description.includes("## Examples")), "verbose builtin examples must be removed")
-    if (codeMode) {
-      const tools = main[0]!.body.tools as { function: { name: string } }[]
-      assert.ok(tools.some((tool) => tool.function.name === "execute"))
-      assert.ok(!tools.some((tool) => tool.function.name === "fixture_echo"))
-      assert.equal(mcpCalls, 1)
-      assert.ok(main[2]!.body.messages.some((message) => message.role === "tool" && JSON.stringify(message.content).includes("CODE_MODE_OK")))
-    }
-  } else assert.ok(JSON.stringify(main[0]!.body.messages).includes("Today's date:"))
-  server.stop(true)
-  return { requests: captures.length, maxActive, titleEnabled: !disableTitle, codeMode, outputStorage, subagent, mcpCalls, glmReasoningReplay: guarded, skillCatalogCompacted: guarded, systemChars: main[0]!.body.messages.filter((message) => message.role === "system").reduce((sum, message) => {
-    assert.equal(typeof message.content, "string")
-    return sum + (message.content as string).length
-  }, 0), toolDescriptionChars: (main[0]!.body.tools as { function: { description: string } }[]).reduce((sum, tool) => sum + tool.function.description.length, 0), toolRoundTrip: true, generatedDate: !guarded, stdout: output.trim() }
+  return new Response(stream, { headers: streamHeaders })
 }
 
-const deadline = Promise.withResolvers<never>()
-const timer = setTimeout(() => deadline.reject(new Error("Pinned CLI smoke exceeded 120 seconds")), 120_000)
-try {
-  const results = await Promise.race([(async () => ({ baseline: await scenario({ guarded: false }), guarded: await scenario({ guarded: true }), noTitle: await scenario({ guarded: true, disableTitle: true }), codeMode: await scenario({ guarded: true, disableTitle: true, codeMode: true }), outputStorage: await scenario({ guarded: true, disableTitle: true, outputStorage: true }), subagent: await scenario({ guarded: true, disableTitle: true, subagent: true }) }))(), deadline.promise])
-  assert.ok(results.guarded.systemChars < results.baseline.systemChars)
-  assert.ok(results.guarded.toolDescriptionChars < results.baseline.toolDescriptionChars / 2)
-  console.log(JSON.stringify({ version: "1.19.4", ...results }, null, 2))
-} finally {
-  clearTimeout(timer)
-  for (const child of children) if (child.exitCode === null) child.kill()
-  for (const server of servers) server.stop(true)
-  await Promise.all(children.map((child) => child.exited))
-  await rm(root, { recursive: true, force: true })
+function assertRequest(call: Capture, session: string) {
+  assert.equal(call.headers.get("authorization"), `Bearer ${apiKey}`)
+  assert.equal(call.headers.get("x-opencode-session-id"), session)
+  assert.equal(call.headers.get("x-session-affinity"), session)
+  assert.equal(call.headers.has("x-litellm-session-id"), false)
+  assert.equal(call.body.model, providerID)
+  assert.equal(call.body.stream, true)
+  assert.equal(call.body.max_tokens, maxOutputTokens, "configured output ceiling must reach the actual provider body")
+  assert.equal(call.body.stream_options?.include_usage, true, "request must request streamed usage")
 }
+
+async function observeEvent(runtime: Runtime, session: string, witness: {
+  readonly type: "session.step.first-token" | "permission.asked"
+  readonly seen?: (data: Record<string, unknown>) => Promise<void>
+  readonly act: () => Promise<unknown>
+}) {
+  const { type, act } = witness
+  const response = await runtime.events([type, "session.execution.failed", "session.execution.interrupted", "session.execution.succeeded"])
+  assert.match(response.headers.get("content-type") ?? "", /^text\/event-stream\b/)
+  assert.ok(response.body, "live event feed must have a body")
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+  const envelope = z.object({ type: z.string(), data: z.looseObject({ sessionID: z.string().optional() }) })
+  async function* events() {
+    let pending = ""
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) throw new FixtureError(`Live event feed ended before ${type}`, session)
+      const lines = (pending + value).split("\n")
+      pending = lines.pop() ?? ""
+      for (const line of lines)
+        if (line.startsWith("data: ")) yield envelope.parse(JSON.parse(line.slice(6)))
+    }
+  }
+  const feed = events()
+  try {
+    const connected = await within(`Subscribing to live events for ${session}`, feed.next())
+    assert.equal(connected.done ? undefined : connected.value.type, "server.connected")
+    await Promise.all([
+      within(`Waiting for ${type} in ${session}`, (async () => {
+        for await (const event of feed) {
+          if (event.data.sessionID !== session) continue
+          assert.equal(event.type, type, `Session ${session}: ${JSON.stringify(event)}`)
+          await witness.seen?.(event.data)
+          return
+        }
+      })()),
+      act(),
+    ])
+  } finally {
+    await reader.cancel()
+  }
+}
+
+async function overlapScenario(first: Runtime, second: Runtime) {
+  const owner = await first.create("First overlapping session")
+  const contender = await second.create("Second overlapping session")
+  assert.notEqual(owner, contender, "the overlapping requests must belong to separate sessions")
+  const ownerPrompt = "OVERLAP_FIRST"
+  const contenderPrompt = "OVERLAP_SECOND"
+  const finish = Promise.withResolvers<void>()
+  const left = exchange(ownerPrompt, (call) => heldStream(call, finish.promise))
+  const right = exchange(contenderPrompt, () => textStream(successes))
+  try {
+    await observeEvent(first, owner, { type: "session.step.first-token", act: () => first.prompt(owner, ownerPrompt) })
+    const initial = await within("First session at the provider", left)
+    assertRequest(initial, owner)
+    await second.prompt(contender, contenderPrompt)
+    const next = await within("Second session at the provider before the first response ends", right)
+    assertRequest(next, contender)
+    assert.equal(next.url, initial.url, "the sessions must overlap at the exact same provider URL")
+  } finally {
+    finish.resolve()
+  }
+  const messages = await Promise.all([first.wait(owner, "succeeded"), second.wait(contender, "succeeded")])
+  for (const stored of messages) assert.ok(stored.some((message) => message.content?.some((part) => part.text === successes)))
+}
+
+async function responseLifecycle(runtime: Runtime) {
+  const failed = await runtime.create("Provider HTTP error")
+  const failedPrompt = "PROVIDER_ERROR"
+  const failure = exchange(failedPrompt, () => Response.json({
+    error: { message: transportError, type: "invalid_request_error" },
+  }, { status: 400 }))
+  await runtime.prompt(failed, failedPrompt)
+  assertRequest(await within("Failing session at the provider", failure), failed)
+  assert.ok(JSON.stringify(await runtime.wait(failed, "failed")).includes(transportError))
+
+  const interrupted = await runtime.create("Interrupted provider stream")
+  const interruptedPrompt = "PROVIDER_INTERRUPT"
+  const finish = Promise.withResolvers<void>()
+  const aborted = Promise.withResolvers<void>()
+  const arrival = exchange(interruptedPrompt, (call) => heldStream(call, finish.promise, aborted.resolve))
+  try {
+    await observeEvent(runtime, interrupted, {
+      type: "session.step.first-token", act: () => runtime.prompt(interrupted, interruptedPrompt),
+    })
+    assertRequest(await within("Interrupted session at the provider", arrival), interrupted)
+    await runtime.interrupt(interrupted)
+    await within("Provider observed the interrupted stream", aborted.promise)
+    await runtime.wait(interrupted, "interrupted")
+  } finally {
+    finish.resolve()
+  }
+}
+
+const tools = (call: Capture) => call.body.tools?.flatMap((tool) => tool.function ? [tool.function.name] : []) ?? []
+function toolResult(call: Capture) {
+  const result = call.body.messages.findLast((message) => message.role === "tool")
+  assert.ok(result?.content !== undefined, "model must receive the tool's result before continuing")
+  return JSON.stringify(result.content)
+}
+
+await runSmoke("surface", (call) => {
+  const prompt = call.body.messages.findLast((message) => message.role === "user")?.content
+  assert.ok(typeof prompt === "string", JSON.stringify(call.body.messages))
+  const controlled = exchanges.get(prompt)
+  if (controlled) {
+    assert.equal(exchanges.delete(prompt), true)
+    controlled.arrived.resolve(call)
+    return controlled.reply(call)
+  }
+  if (prompt === directPrompt) {
+    directRequests.push(call)
+    if (directRequests.length === 1) {
+      assert.deepEqual(fileTools.filter((name) => tools(call).includes(name)), fileTools, "stock file tools stay direct")
+      return toolStream("read", { path: "read-target.txt" })
+    }
+    assert.equal(directRequests.length, 2)
+    assert.ok(toolResult(call).includes(readContent), "direct read must return actual file contents")
+    return textStream(successes)
+  }
+  if (prompt === declinePrompt || prompt === feedbackPrompt) {
+    const requests = prompt === declinePrompt ? declinedRequests : correctedRequests
+    requests.push(call)
+    if (requests.length === 1) return toolStream("read", { path: "denied.txt" })
+    assert.equal(prompt, feedbackPrompt, "a plain decline must interrupt before the next inference")
+    assert.equal(requests.length, 2)
+    assert.ok(toolResult(call).includes(feedback), "a rejection with feedback must return that correction")
+    assert.ok(!toolResult(call).includes(deniedContent))
+    return textStream(successes)
+  }
+  assert.equal(prompt, codePrompt, "only declared fixture prompts may reach the provider")
+  codeRequests.push(call)
+  if (codeRequests.length === 1) {
+    assert.ok(tools(call).includes("execute"))
+    return toolStream("execute", { code: 'return await tools.opencode.session_rename({title:"Native Code Mode verified"})' })
+  }
+  assert.equal(codeRequests.length, 2)
+  assert.ok(toolResult(call).includes("Native Code Mode verified"))
+  return textStream(successes)
+}, async ({ launch }) => {
+  const direct = await launch("direct")
+  const code = await launch("native")
+  const [a, b] = await Promise.all([direct.verify(), code.verify()])
+  assert.notEqual(a.pid, b.pid, "test needs independent OpenCode processes")
+  await Bun.write(join(direct.directory, "read-target.txt"), readContent)
+  await Bun.write(join(direct.directory, "denied.txt"), deniedContent)
+  const directSession = await direct.create("Direct file tool fixture")
+  await direct.prompt(directSession, directPrompt)
+  const directMessages = await direct.wait(directSession, "succeeded")
+  assert.equal(directRequests.length, 2)
+  assert.ok(directMessages.some((message) => message.content?.some((part) => part.text === successes)))
+  for (const call of directRequests) assertRequest(call, directSession)
+
+  const codeSession = await code.create("Native Code Mode fixture")
+  await code.prompt(codeSession, codePrompt)
+  const messages = await code.wait(codeSession, "succeeded")
+  assert.equal(codeRequests.length, 2)
+  for (const call of codeRequests) assertRequest(call, codeSession)
+  assert.ok(messages.some((message) => message.content?.some((part) => part.name === "execute" && part.state?.status === "completed")))
+
+  for (const prompt of [declinePrompt, feedbackPrompt]) {
+    const session = await direct.create(prompt, [{ action: "read", resource: "denied.txt", effect: "ask" }])
+    await observeEvent(direct, session, {
+      type: "permission.asked",
+      act: () => direct.prompt(session, prompt),
+      seen: async (data) => {
+        const req = z.object({ id: z.string(), action: z.literal("read"), resources: z.array(z.string()) }).parse(data)
+        assert.ok(req.resources.includes("denied.txt"))
+        await direct.decline(session, req.id, prompt === feedbackPrompt ? feedback : undefined)
+      },
+    })
+    const stored = await direct.wait(session, prompt === declinePrompt ? "interrupted" : "succeeded")
+    assert.ok(!JSON.stringify(stored).includes(deniedContent))
+  }
+  assert.equal(declinedRequests.length, 1)
+  assert.equal(correctedRequests.length, 2)
+
+  await overlapScenario(direct, code)
+  await responseLifecycle(direct)
+  return {
+    serverPIDs: [a.pid, b.pid], directRequests: directRequests.length, codeModeRequests: codeRequests.length,
+    sameEndpointOverlap: true, streamInterrupted: true, providerErrorPreserved: true,
+  }
+})

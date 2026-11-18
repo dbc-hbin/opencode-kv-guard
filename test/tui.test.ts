@@ -1,204 +1,208 @@
 import { describe, expect, test } from "bun:test"
-import type { TuiEventBus } from "@opencode-ai/plugin/tui"
-import { createOpencodeClient, type AssistantMessage, type Event, type Part } from "@opencode-ai/sdk/v2"
-import { responsePerformance, watchSessionUsage } from "../src/tui"
+import { OpenCode, type OpenCodeEvent, type SessionMessageAssistant, type SessionMessageInfo } from "@opencode/client"
+import { watchSessionUsage } from "../src/tui"
 
-function assistant(id: string, input: number, read = 0, write = 0): AssistantMessage {
+function assistant(id: string, input: number, cache = { read: 0, write: 0 }): SessionMessageAssistant {
   return {
-    id, sessionID: "session", role: "assistant", time: { created: 1 }, parentID: "user", modelID: "fixture", providerID: "fixture", mode: "build", agent: "build",
-    path: { cwd: "/fixture", root: "/fixture" }, cost: 0, tokens: { input, output: 0, reasoning: 0, cache: { read, write } },
+    id,
+    type: "assistant",
+    time: { created: 1, completed: 2 },
+    agent: "build",
+    model: { providerID: "fixture", id: "fixture" },
+    content: [],
+    tokens: { input, cache, output: 900, reasoning: 800 },
   }
 }
 
-describe("TUI output throughput", () => {
-  test.each([
-    { output: 60, reasoning: 40, duration: 2000, expected: 50 },
-    { output: 0, reasoning: 100, duration: 2000, expected: 50 },
-    { output: 60, reasoning: 40, duration: 10_000, expected: 10 },
-    { output: 60, reasoning: 40, duration: 100, expected: 1000 },
-    { output: 60, reasoning: 40, duration: 99, expected: undefined },
-    { output: 0, reasoning: 0, duration: 2000, expected: undefined },
-    { output: NaN, reasoning: 0, duration: 2000, expected: undefined },
-    { output: 60, reasoning: 40, duration: Infinity, expected: undefined },
-    { output: 60, reasoning: 40, duration: -1, expected: undefined },
-  ])("uses all reported output over elapsed time: $output + $reasoning / $duration ms", ({ output, reasoning, duration, expected }) => {
-    const message = assistant("reply", 1000, 800)
-    message.tokens.output = output
-    message.tokens.reasoning = reasoning
-    message.time.completed = message.time.created + duration
-    expect(responsePerformance([message], () => []).throughput).toBe(expected)
-  })
-
-  test("uses only the latest assistant and clears an old rate when a new response starts", () => {
-    const completed = assistant("old", 1000)
-    completed.tokens.output = 100
-    completed.time.completed = completed.time.created + 2000
-    const user = { id: "user", sessionID: "session", role: "user", time: { created: 3000 }, agent: "build", model: { providerID: "fixture", modelID: "fixture" } } as const
-    const pending = assistant("new", 0)
-    expect(responsePerformance([], () => []).throughput).toBeUndefined()
-    expect(responsePerformance([user], () => []).throughput).toBeUndefined()
-    expect(responsePerformance([completed, user], () => []).throughput).toBe(50)
-    expect(responsePerformance([completed, user, pending], () => []).throughput).toBeUndefined()
-    pending.tokens.output = 200
-    expect(responsePerformance([completed, user, pending], () => []).throughput).toBeUndefined()
-    pending.time.completed = pending.time.created + 2000
-    expect(responsePerformance([completed, user, pending], () => []).throughput).toBe(100)
-  })
-
-  test("separates first-token latency, generation throughput and end-to-end time using persisted parts", () => {
-    const message = assistant("reply", 1000, 800)
-    message.time = { created: 1000, completed: 6000 }
-    message.tokens.output = 120
-    message.tokens.reasoning = 80
-    const parts: Part[] = [
-      { id: "synthetic", sessionID: "session", messageID: "reply", type: "text", text: "injected", synthetic: true, time: { start: 1000, end: 1000 } },
-      { id: "empty", sessionID: "session", messageID: "reply", type: "text", text: "", time: { start: 1100, end: 1100 } },
-      { id: "reasoning", sessionID: "session", messageID: "reply", type: "reasoning", text: "thinking", time: { start: 2000, end: 3000 } },
-      { id: "answer", sessionID: "session", messageID: "reply", type: "text", text: "answer", time: { start: 4000, end: 5900 } },
-    ]
-    expect(responsePerformance([message], (id) => id === message.id ? parts : [])).toEqual({
-      ttftMs: 1000, throughput: 40, generationThroughput: 50, e2eMs: 5000,
-    })
-    message.time.completed = undefined
-    expect(responsePerformance([message], () => parts)).toEqual({
-      ttftMs: 1000, throughput: undefined, generationThroughput: undefined, e2eMs: undefined,
-    })
-  })
-
-  test("does not invent first-token timing from tools, untimed parts or invalid timestamps", () => {
-    const message = assistant("reply", 1000)
-    message.time = { created: 1000, completed: 6000 }
-    message.tokens.output = 200
-    const text: Part = { id: "text", sessionID: "session", messageID: "reply", type: "text", text: "answer", time: { start: 2000, end: 5900 } }
-    const tool: Part = { id: "tool", sessionID: "session", messageID: "reply", type: "tool", tool: "read", callID: "call", state: { status: "running", input: {}, time: { start: 1500 } } }
-    const candidates: Part[][] = [
-      [], [tool], [tool, text], [{ ...text, time: undefined }],
-      [{ ...text, time: { start: 999 } }], [{ ...text, time: { start: 6001 } }], [{ ...text, time: { start: NaN } }],
-    ]
-    for (const parts of candidates) expect(responsePerformance([message], () => parts)).toEqual({
-      ttftMs: undefined, throughput: 40, generationThroughput: undefined, e2eMs: 5000,
-    })
-    expect(responsePerformance([message], () => [{ ...text, time: { start: 6000 } }])).toEqual({
-      ttftMs: 5000, throughput: 40, generationThroughput: undefined, e2eMs: 5000,
-    })
-  })
-})
-
-function fixture() {
-  const listeners = new Set<(event: Event) => void>()
-  const event: TuiEventBus = {
-    on(type, handler) {
-      const listener = (event: Event) => {
-        if (event.type === type) handler(event as Parameters<typeof handler>[0])
-      }
-      listeners.add(listener)
-      return () => { listeners.delete(listener) }
-    },
-  }
-  const requested = Promise.withResolvers<URL>()
-  const response = Promise.withResolvers<Response>()
-  const requests: URL[] = []
-  const client = createOpencodeClient({
+function fixture(intercept?: (request: Request, response: Response) => Response | Promise<Response>) {
+  const listeners = new Set<(event: { details: OpenCodeEvent }) => void>()
+  const sessions = new Map<string, {
+    readonly messages: readonly SessionMessageInfo[]
+    readonly boundary?: string
+    readonly origin?: string
+  }>()
+  const client = OpenCode.make({
     baseUrl: "http://cache-usage.test",
     fetch: Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(new Request(input, init).url)
-      requests.push(url)
-      requested.resolve(url)
-      return response.promise
-    }, { preconnect: globalThis.fetch.preconnect }),
+      const request = new Request(input, init)
+      const url = new URL(request.url)
+      const [, , , id, endpoint] = url.pathname.split("/")
+      const session = sessions.get(id)
+      if (!session) return new Response(null, { status: 404 })
+      if (!endpoint) {
+        return Response.json({ data: {
+          id,
+          fork: session.origin && { sessionID: session.origin },
+          revert: session.boundary && { messageID: session.boundary },
+        } })
+      }
+      const cursor = url.searchParams.get("cursor")
+      const requestedOrder = url.searchParams.get("order")
+      if (cursor && requestedOrder) return new Response(null, { status: 400 })
+      const [order, offsetText] = cursor?.split(":") ?? [requestedOrder ?? "desc", "0"]
+      const offset = Number(offsetText)
+      const limit = Number(url.searchParams.get("limit") ?? 50)
+      const type = url.searchParams.get("type")
+      const messages = session.messages.filter((message) => !type || message.type === type)
+      const data = (order === "desc" ? messages.toReversed() : messages).slice(offset, offset + limit)
+      const response = Response.json({ data, cursor: { next: data.length ? `${order}:${offset + data.length}` : null } })
+      return intercept?.(request, response) ?? response
+    }, { preconnect: fetch.preconnect }),
   })
-  const emit = (event: Event) => { for (const listener of listeners) listener(event) }
-  const update = (info: AssistantMessage) => emit({ id: `event-${info.id}`, type: "message.updated", properties: { sessionID: info.sessionID, info } })
-  const remove = (messageID: string) => emit({ id: `removed-${messageID}`, type: "message.removed", properties: { sessionID: "session", messageID } })
-  const resolve = (messages: AssistantMessage[]) => response.resolve(Response.json(messages.map((info) => ({ info, parts: [] }))))
-  return { api: { client, event }, requested: requested.promise, requests, listeners, update, remove, resolve }
+  const emit = (details: OpenCodeEvent) => {
+    for (const listen of listeners) listen({ details })
+  }
+  type Rates = NonNullable<Parameters<Parameters<typeof watchSessionUsage>[2]>[0]>
+  const watch = (id: string) => {
+    let next = Promise.withResolvers<Rates>()
+    const observed: Rates[] = []
+    const dispose = watchSessionUsage({
+      client,
+      data: {
+        listen(handler) {
+          listeners.add(handler)
+          return () => { listeners.delete(handler) }
+        },
+      },
+    }, id, (rates) => {
+      if (!rates) return
+      observed.push(rates)
+      next.resolve(rates)
+      next = Promise.withResolvers<Rates>()
+    })
+    return {
+      observed,
+      next: () => next.promise,
+      dispose,
+    }
+  }
+  return { sessions, emit, watch }
 }
 
-describe("TUI session cache usage", () => {
-  test("counts misses older than the latest 100 messages and updates totals without refetching", async () => {
-    const current = fixture()
-    const initial = Promise.withResolvers<{ read: number; prompt: number }>()
-    const updates: { read: number; prompt: number }[] = []
-    const dispose = watchSessionUsage(current.api, "session", (usage) => { updates.push(usage); initial.resolve(usage) })
-    try {
-      const request = await current.requested
-      expect(request.pathname).toBe("/session/session/message")
-      expect(request.searchParams.has("limit")).toBe(false)
-      current.resolve([assistant("old-miss", 100_000), ...Array.from({ length: 100 }, (_, index) => assistant(`hit-${index}`, 0, 1000))])
-      expect(await initial.promise).toEqual({ read: 100_000, prompt: 200_000 })
-      const changed = assistant("hit-99", 100, 400, 500)
-      current.update(changed)
-      current.update(changed)
-      expect(updates.at(-1)).toEqual({ read: 99_400, prompt: 200_000 })
-      current.update({ ...assistant("other", 1000), sessionID: "other-session" })
-      expect(updates.at(-1)).toEqual({ read: 99_400, prompt: 200_000 })
-      current.update(assistant("new-hit", 0, 1000))
-      current.remove("old-miss")
-      expect(updates.at(-1)).toEqual({ read: 100_400, prompt: 101_000 })
-      expect(current.requests).toHaveLength(1)
-    } finally {
-      dispose()
-    }
-    expect(current.listeners.size).toBe(0)
-    const count = updates.length
-    current.update(assistant("after-dispose", 500))
-    expect(updates).toHaveLength(count)
-  }, 2000)
+const durable = (sessionID: string) => ({ aggregateID: sessionID, seq: 1, version: 1 } as const)
 
-  test("keeps updates and removals received while full history is loading", async () => {
-    const current = fixture()
-    const initial = Promise.withResolvers<{ read: number; prompt: number }>()
-    const dispose = watchSessionUsage(current.api, "session", initial.resolve)
-    try {
-      await current.requested
-      current.update(assistant("changed", 50, 50))
-      current.remove("removed")
-      current.update(assistant("new", 0, 100))
-      current.resolve([assistant("changed", 100), assistant("removed", 0, 100)])
-      expect(await initial.promise).toEqual({ read: 150, prompt: 200 })
-    } finally {
-      dispose()
-    }
-  }, 2000)
+function ended(sessionID: string, message: SessionMessageAssistant): OpenCodeEvent {
+  if (!message.tokens) throw new Error("The test step must report usage")
+  return {
+    id: `ended-${message.id}`, created: 2, durable: durable(sessionID), type: "session.step.ended",
+    data: { sessionID, assistantMessageID: message.id, cost: 0, finish: "stop", tokens: message.tokens },
+  }
+}
 
-  test("retries the full history load after it fails, on the next update", async () => {
-    const listeners = new Set<(event: Event) => void>()
-    const event: TuiEventBus = {
-      on(type, handler) {
-        const listener = (event: Event) => { if (event.type === type) handler(event as Parameters<typeof handler>[0]) }
-        listeners.add(listener)
-        return () => { listeners.delete(listener) }
-      },
+describe("TUI input cache rates", () => {
+  test("includes every page and weights reads by all input, including cache writes", async () => {
+    const current = fixture()
+    current.sessions.set("session", { messages: [
+      assistant("old-miss", 1000),
+      ...Array.from({ length: 200 }, (_, index) => assistant(`hit-${index}`, 0, { read: 10, write: 0 })),
+      assistant("last", 10, { read: 30, write: 10 }),
+    ] })
+    const watch = current.watch("session")
+    try {
+      expect(await watch.next()).toEqual({ last: 60, session: 67 })
+    } finally {
+      watch.dispose()
     }
-    const attempts: PromiseWithResolvers<Response>[] = [Promise.withResolvers<Response>(), Promise.withResolvers<Response>()]
-    const requested = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
-    let calls = 0
-    const client = createOpencodeClient({
-      baseUrl: "http://cache-usage-retry.test",
-      fetch: Object.assign(async () => {
-        const index = calls++
-        requested[index]?.resolve()
-        return attempts[index]?.promise ?? Promise.reject(new Error("unexpected extra load"))
-      }, { preconnect: globalThis.fetch.preconnect }),
+  })
+
+  test("merges live completions with a delayed snapshot and ignores other sessions", async () => {
+    const pending = Promise.withResolvers<Response>()
+    const snapshot = Promise.withResolvers<Response>()
+    const current = fixture((request, response) => {
+      if (new URL(request.url).searchParams.has("cursor")) return response
+      snapshot.resolve(response)
+      return pending.promise
     })
-    const emit = (info: AssistantMessage) => { for (const listener of listeners) listener({ id: `event-${info.id}`, type: "message.updated", properties: { sessionID: info.sessionID, info } }) }
-    const updates: { read: number; prompt: number }[] = []
-    const reported = Promise.withResolvers<{ read: number; prompt: number }>()
-    const loadFailed = Promise.withResolvers<unknown>()
-    const dispose = watchSessionUsage({ client, event }, "session", (usage) => { updates.push(usage); reported.resolve(usage) }, loadFailed.resolve)
+    current.sessions.set("session", { messages: [assistant("overlap", 100)] })
+    const watch = current.watch("session")
+    const update = watch.next()
     try {
-      await requested[0]!.promise
-      attempts[0]!.resolve(new Response("unavailable", { status: 503 }))
-      await loadFailed.promise
-      // The failed load reports nothing; the next update for this session retries it.
-      emit(assistant("live", 10, 10))
-      await requested[1]!.promise
-      expect(updates).toEqual([])
-      attempts[1]!.resolve(Response.json([assistant("old", 1000), assistant("live", 10, 10)].map((info) => ({ info, parts: [] }))))
-      expect(await reported.promise).toEqual({ read: 10, prompt: 1020 })
-      expect(calls).toBe(2)
+      const captured = await snapshot.promise
+      current.emit(ended("session", assistant("overlap", 50, { read: 50, write: 0 })))
+      current.emit(ended("session", assistant("live", 0, { read: 100, write: 0 })))
+      current.emit(ended("other", assistant("irrelevant", 500)))
+      expect(watch.observed).toEqual([])
+      pending.resolve(captured)
+      expect(await update).toEqual({ last: 100, session: 75 })
+
+      const next = watch.next()
+      current.emit(ended("session", assistant("next", 100)))
+      expect(await next).toEqual({ last: 0, session: 50 })
+      watch.dispose()
+      current.emit(ended("session", assistant("after-disposal", 100)))
+      expect(watch.observed).toHaveLength(2)
     } finally {
-      dispose()
+      pending.resolve(Response.json({ data: [], cursor: {} }))
+      watch.dispose()
     }
-  }, 2000)
+  })
+
+  test("does not reuse a previous hit rate when the last step reports no input", async () => {
+    const current = fixture()
+    current.sessions.set("session", { messages: [
+      assistant("hit", 0, { read: 100, write: 0 }),
+      assistant("unknown", 0),
+    ] })
+    const watch = current.watch("session")
+    try {
+      expect(await watch.next()).toEqual({ last: undefined, session: 100 })
+    } finally {
+      watch.dispose()
+    }
+  })
+
+  test("a stored terminal failure without usage clears last request but preserves measured session usage", async () => {
+    const current = fixture()
+    current.sessions.set("session", { messages: [
+      assistant("hit", 20, { read: 80, write: 0 }),
+      { ...assistant("failed", 0), tokens: undefined, error: { type: "provider", message: "No usage received" } },
+    ] })
+    const watch = current.watch("session")
+    try {
+      expect(await watch.next()).toEqual({ last: undefined, session: 80 })
+    } finally {
+      watch.dispose()
+    }
+  })
+
+  test("projects the fork's own ordered history through stage, clear, and commit", async () => {
+    const current = fixture()
+    const kept = assistant("fork_2", 50, { read: 50, write: 0 })
+    const boundary = { id: "fork_9", type: "user", time: { created: 3 }, text: "Undo here" } as const
+    const discarded = Array.from({ length: 201 }, (_, index) =>
+      assistant(`fork_${index + 10}`, 0, { read: 100, write: 0 }))
+    const messages = [kept, boundary, ...discarded]
+    current.sessions.set("parent", { messages: [assistant("parent-only", 10_000)] })
+    current.sessions.set("fork", { messages, origin: "parent", boundary: boundary.id })
+    const watch = current.watch("fork")
+    try {
+      expect(await watch.next()).toEqual({ last: 50, session: 50 })
+
+      const cleared = watch.next()
+      current.sessions.set("fork", { messages, origin: "parent" })
+      current.emit({ id: "clear", created: 4, type: "session.revert.cleared", durable: durable("fork"), data: { sessionID: "fork" } })
+      expect(await cleared).toEqual({ last: 100, session: 100 })
+
+      const staged = watch.next()
+      current.sessions.set("fork", { messages, origin: "parent", boundary: boundary.id })
+      current.emit({
+        id: "stage", created: 5, type: "session.revert.staged", durable: durable("fork"),
+        data: { sessionID: "fork", revert: { messageID: boundary.id } },
+      })
+      expect(await staged).toEqual({ last: 50, session: 50 })
+
+      const committed = watch.next()
+      current.sessions.set("fork", { messages: [kept], origin: "parent" })
+      current.emit({
+        id: "commit", created: 6, type: "session.revert.committed", durable: durable("fork"),
+        data: { sessionID: "fork", to: boundary.id },
+      })
+      expect(await committed).toEqual({ last: 50, session: 50 })
+      const updated = watch.next()
+      current.emit(ended("fork", assistant("replacement", 100)))
+      expect(await updated).toEqual({ last: 0, session: 25 })
+    } finally {
+      watch.dispose()
+    }
+  })
 })

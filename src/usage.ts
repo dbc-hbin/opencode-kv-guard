@@ -1,37 +1,15 @@
-import { isDeepStrictEqual } from "node:util"
 import { randomUUID } from "node:crypto"
-import type { ChatBody } from "./compaction"
 import type { WireMessage } from "./prefix"
-import { digest as hash, isSha256, record, uuidV4 } from "./shared"
+import { digest as hash, isSha256, record, uuidV4, type ChatBody } from "./shared"
 
-type UsageRequest = { readonly startedAt: number }
-export type UsageReport = {
-  laneFingerprint: string
-  label?: string
-  status: number
-  format: "sse" | "json" | "other"
-  outcome: "complete" | "incomplete" | "aborted" | "cancelled" | "error"
-  headerMs: number
-  firstOutputMs?: number
-  endMs: number
+type Counts = {
   promptTokens?: number
   completionTokens?: number
   totalTokens?: number
   cachedTokens?: number
-  anchorRecorded: boolean
 }
-export type ObserveResponseOptions = {
-  body: ChatBody
-  lane: string
-  tracker: UsageTracker
-  request?: UsageRequest
-  signal?: AbortSignal
-  label?: string
-  transform?: (value: unknown) => unknown
-  onAnchor?: () => void | Promise<void>
-  onAssistant?: (assistant: WireMessage) => void
-  onReport?: (report: UsageReport) => void | Promise<void>
-}
+
+export type ObservedCompletion = Readonly<Counts & { assistant?: WireMessage; finishReason?: string }>
 
 type Fingerprint = { policy: string; messages: string[] }
 type Anchor = Fingerprint & { promptTokens: number }
@@ -95,7 +73,7 @@ function accountable(message: WireMessage) {
 
 export class UsageTracker {
   private readonly lanes = new Map<string, Lane>()
-  private readonly pending = new WeakMap<UsageRequest, Pending>()
+  private readonly pending = new WeakMap<object, Pending>()
   private sequence = 0
 
   snapshot(lanes: Iterable<string>): UsageSnapshot {
@@ -108,20 +86,11 @@ export class UsageTracker {
     }) }
   }
 
-  prepare(lane: string) {
+  prepare(lane: string, receipt: string = randomUUID()) {
     const state = this.lanes.get(lane) ?? { latest: 0 }
-    state.receipt = randomUUID()
+    state.receipt = receipt
     this.lanes.set(lane, state)
     return state.receipt
-  }
-
-  publish(snapshot: UsageSnapshot, receipt: string) {
-    for (const { lane, anchor } of snapshot.lanes) {
-      const state = this.lanes.get(lane)
-      // The checkpoint reload supplies the latest preparation across processes.
-      // An older completion cannot replace a newer request's measured baseline.
-      if (state?.receipt === receipt && anchor) state.anchor = structuredClone(anchor)
-    }
   }
 
   restore(snapshot: UsageSnapshot, replace: Iterable<string> = []) {
@@ -141,10 +110,10 @@ export class UsageTracker {
     }
   }
 
-  // Call before dispatch/admission, not when response headers arrive. Otherwise
+  // Call before dispatch, not when response headers arrive. Otherwise
   // an older slow request could appear newer than a request already completed.
-  begin(body: ChatBody, lane: string, receipt?: string): UsageRequest {
-    const request = { startedAt: performance.now() }
+  begin(body: ChatBody, lane: string, receipt?: string): object {
+    const request = {}
     let state = this.lanes.get(lane)
     // A request can pause between preparation and dispatch while another
     // preparation reloads this lane. Never borrow that newer request's receipt
@@ -161,7 +130,7 @@ export class UsageTracker {
     return request
   }
 
-  record(request: UsageRequest, body: ChatBody, lane: string, promptTokens: number) {
+  record(request: object, body: ChatBody, lane: string, promptTokens: number) {
     const pending = this.pending.get(request)
     this.pending.delete(request)
     if (!pending || !count(promptTokens) || pending.lane !== lane || this.lanes.get(lane) !== pending.state || pending.sequence !== pending.state.latest || pending.receipt !== pending.state.receipt) return false
@@ -171,7 +140,7 @@ export class UsageTracker {
     return true
   }
 
-  estimate(body: ChatBody, lane: string, fallbackEstimator: (value: unknown) => number): number {
+  estimate(body: ChatBody, lane: string, fallbackEstimator: (value: ChatBody) => number): number {
     const anchor = this.lanes.get(lane)?.anchor
     if (!anchor || !prefix(anchor, fingerprint(body))) return fallbackEstimator(body)
     if (anchor.messages.length === body.messages.length) return anchor.promptTokens
@@ -189,7 +158,6 @@ export class UsageTracker {
   clear() { this.lanes.clear() }
 }
 
-type Counts = Pick<UsageReport, "promptTokens" | "completionTokens" | "totalTokens" | "cachedTokens">
 function usage(value: Record<string, unknown>): Counts {
   const result: Counts = {}
   for (const [source, target] of [["prompt_tokens", "promptTokens"], ["completion_tokens", "completionTokens"], ["total_tokens", "totalTokens"]] as const) {
@@ -206,23 +174,14 @@ function usage(value: Record<string, unknown>): Counts {
   return result
 }
 
-function output(value: unknown) {
-  if (!record(value)) return false
-  if ([value.content, value.reasoning_content, value.reasoning, value.reasoning_text].some((part) => typeof part === "string" && part.length > 0)) return true
-  if (Array.isArray(value.content) && value.content.some((part) => record(part) && part.type === "text" && typeof part.text === "string" && part.text.length > 0)) return true
-  const calls = Array.isArray(value.tool_calls) ? value.tool_calls : record(value.function_call) ? [{ function: value.function_call }] : []
-  return calls.some((call) => record(call) && (typeof call.id === "string" && call.id.length > 0 || record(call.function) && [call.function.name, call.function.arguments].some((part) => typeof part === "string" && part.length > 0)))
-}
-
 // Retain only the unfinished event, never an entire SSE response. Framing is
 // scanned as bytes so untouched UTF-8 (and even invalid bytes) stays exact.
 class Events {
   pending: Uint8Array = new Uint8Array(0)
-  constructor(private readonly event: (frame: Uint8Array) => Uint8Array) {}
+  constructor(private readonly event: (frame: Uint8Array) => void) {}
 
   push(chunk: Uint8Array, eof = false) {
     if (chunk.length) this.pending = Buffer.concat([this.pending, chunk])
-    const frames: Uint8Array[] = []
     let start = 0
     let line = 0
     for (let index = 0; index < this.pending.length;) {
@@ -231,37 +190,33 @@ class Events {
       if (byte === 13 && index + 1 === this.pending.length && !eof) break
       const end = index + (byte === 13 && this.pending[index + 1] === 10 ? 2 : 1)
       if (index === line) {
-        frames.push(this.event(this.pending.subarray(start, end)))
+        this.event(this.pending.subarray(start, end))
         start = end
       }
       line = end
       index = end
     }
     this.pending = this.pending.slice(start)
-    return frames
   }
 }
 
-export function observeResponse(response: Response, options: ObserveResponseOptions): Response {
-  const { body: prompt, lane, tracker, signal, transform } = options
-  const request = options.request ?? tracker.begin(prompt, lane)
-  const headerMs = Math.max(0, performance.now() - request.startedAt)
+export function observeResponse(response: Response, onComplete: (receipt: ObservedCompletion) => void | Promise<void>): Response {
   const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase()
   const format = contentType === "text/event-stream" ? "sse" : contentType === "application/json" || contentType?.endsWith("+json") ? "json" : "other"
+  if (!response.ok || !response.body || format === "other") return response
+  const reader = response.body.getReader()
   const counts: Counts = {}
   const choices = new Set<number>()
   const finishedChoices = new Set<number>()
-  let firstOutputMs: number | undefined
   let terminal = false
   let invalid = false
-  let reported = false
   let stopped = false
   let replayable = true
   let finishReason: unknown
   const assistant: WireMessage = { role: "assistant", content: "" }
   const calls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>()
   const collect = (value: unknown) => {
-    if (!options.onAssistant || !record(value) || !Array.isArray(value.choices)) return
+    if (!record(value) || !Array.isArray(value.choices)) return
     for (const choice of value.choices) {
       if (!record(choice) || choice.index !== undefined && choice.index !== 0 || value.choices.length > 1) { replayable = false; continue }
       if (choice.finish_reason != null) finishReason = choice.finish_reason
@@ -307,7 +262,6 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
     }
   }
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
-  const encoder = new TextEncoder()
   const inspect = (value: unknown) => {
     if (!record(value)) { invalid = true; return }
     if (value.error !== undefined && value.error !== null) invalid = true
@@ -324,66 +278,33 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
         if (choice.finish_reason === "error") invalid = true
         else finishedChoices.add(index)
       }
-      if (firstOutputMs === undefined && (output(choice.delta) || output(choice.message))) firstOutputMs = Math.max(0, performance.now() - request.startedAt)
     }
-  }
-  const normalize = (value: unknown) => {
-    if (!transform) { collect(value); return undefined }
-    const before = JSON.stringify(value)
-    const transformed = transform(value)
-    collect(transformed)
-    const after = JSON.stringify(transformed)
-    if (after === undefined) throw new TypeError("Response transform must return a JSON value")
-    return before === after || isDeepStrictEqual(JSON.parse(before), JSON.parse(after)) ? undefined : after
   }
   const events = new Events((frame) => {
     let text: string
-    try { text = decoder.decode(frame) } catch { invalid = true; return frame }
-    const lines = text.split(/(\r\n|\r|\n)/)
-    const data: number[] = []
+    try { text = decoder.decode(frame) } catch { invalid = true; return }
+    const lines = text.split(/\r\n|\r|\n/)
     const values: string[] = []
-    for (let index = 0; index < lines.length; index += 2) {
-      const line = index === 0 ? lines[index]!.replace(/^\uFEFF/, "") : lines[index]!
+    for (const [index, rawLine] of lines.entries()) {
+      const line = index === 0 ? rawLine.replace(/^\uFEFF/, "") : rawLine
       const colon = line.indexOf(":")
       const field = colon < 0 ? line : line.slice(0, colon)
       const value = colon < 0 ? "" : line.slice(colon + 1).replace(/^ /, "")
       if (field === "event" && value === "error") invalid = true
-      if (field !== "data") continue
-      data.push(index)
-      values.push(value)
+      if (field === "data") values.push(value)
     }
-    if (!data.length) return frame
+    if (!values.length) return
     const raw = values.join("\n")
-    if (raw.trim() === "[DONE]") { terminal = true; return frame }
+    if (raw.trim() === "[DONE]") { terminal = true; return }
     let value: unknown
-    try { value = JSON.parse(raw) } catch { invalid = true; return frame }
+    try { value = JSON.parse(raw) } catch { invalid = true; return }
     inspect(value)
-    const changed = normalize(value)
-    if (changed === undefined) return frame
-    for (let index = 0; index < data.length; index++) {
-      const position = data[index]!
-      const original = lines[position]!
-      const prefix = original.startsWith("\uFEFF") ? "\uFEFF" : ""
-      const space = original.replace(/^\uFEFF/, "").startsWith("data: ") ? " " : ""
-      lines[position] = `${prefix}data:${space}${index === 0 ? changed : ""}`
-    }
-    return encoder.encode(lines.join(""))
+    collect(value)
   })
   const json: Uint8Array[] = []
-  const finish = (outcome: UsageReport["outcome"]) => {
-    if (outcome !== "complete") signal?.removeEventListener("abort", abort)
-    if (reported) return
-    reported = true
-    const anchorRecorded = outcome === "complete" && counts.promptTokens !== undefined && (counts.cachedTokens === undefined || counts.cachedTokens <= counts.promptTokens) && tracker.record(request, prompt, lane, counts.promptTokens)
-    // Durable consumers must commit before EOF, not in the deferred report.
-    const retained = anchorRecorded ? options.onAnchor?.() : undefined
-    const report: UsageReport = {
-      laneFingerprint: hash(lane), ...(options.label === undefined ? {} : { label: options.label }),
-      status: response.status, format, outcome, headerMs,
-      ...(firstOutputMs === undefined ? {} : { firstOutputMs }), endMs: Math.max(0, performance.now() - request.startedAt),
-      ...counts, anchorRecorded,
-    }
-    if (outcome === "complete" && replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
+  const finish = () => {
+    let completedAssistant: WireMessage | undefined
+    if (replayable && choices.size === 1 && ["stop", "tool_calls"].includes(String(finishReason))) {
       const ordered = [...calls].sort(([a], [b]) => a - b)
       if (ordered.every(([index, call], offset) => {
         if (index !== offset || !call.id || !call.function.name) return false
@@ -397,101 +318,61 @@ export function observeResponse(response: Response, options: ObserveResponseOpti
         } catch { return false }
       })) {
         if (ordered.length) assistant.tool_calls = ordered.map(([, call]) => call)
-        options.onAssistant?.(assistant)
+        completedAssistant = assistant
       }
     }
-    // Diagnostics must not delay EOF/cancellation, propagate a rejection into
-    // the response, or extend the admission gate's generation lifetime.
-    if (options.onReport) queueMicrotask(() => {
-      try { void Promise.resolve(options.onReport!(report)).catch(() => {}) } catch {}
+    return onComplete({
+      ...counts,
+      ...(completedAssistant ? { assistant: completedAssistant } : {}),
+      ...(typeof finishReason === "string" ? { finishReason } : {}),
     })
-    return retained
-  }
-  let controller: ReadableStreamDefaultController<Uint8Array>
-  const reader = response.body?.getReader()
-  const abort = () => {
-    if (stopped) return
-    stopped = true
-    // Settle upstream cancellation (which releases admission) before failing
-    // the consumer, so a release failure is reported instead of discarded.
-    void Promise.resolve(reader?.cancel(signal!.reason)).then(
-      () => controller?.error(signal!.reason),
-      (error) => controller?.error(error),
-    )
-    finish("aborted")
-  }
-  if (!reader) {
-    finish(signal?.aborted ? "aborted" : response.ok ? "incomplete" : "error")
-    return response
   }
   const stream = new ReadableStream<Uint8Array>({
-    start(value) {
-      controller = value
-      signal?.addEventListener("abort", abort, { once: true })
-      if (signal?.aborted) abort()
-    },
     async pull(value) {
+      if (stopped) return
       try {
-        while (!stopped) {
-          const item = await reader.read()
-          if (stopped) return
-          if (!item.done) {
-            if (format === "sse") {
-              const frames = events.push(item.value)
-              if (transform) {
-                for (const frame of frames) value.enqueue(frame)
-                if (frames.length) return
-                continue
-              }
-            } else if (format === "json") {
-              json.push(item.value.slice())
-              if (transform) continue
-            }
-            value.enqueue(item.value)
-            return
-          }
-          if (format === "sse") {
-            const frames = events.push(new Uint8Array(0), true)
-            if (transform) for (const frame of frames) value.enqueue(frame)
-            const remaining = events.pending
-            if (/(?:^|[\r\n])(?:\uFEFF)?data(?::|[\r\n]|$)/.test(new TextDecoder().decode(remaining))) invalid = true
-            if (transform && remaining.length) value.enqueue(remaining)
-          } else if (format === "json") {
-            const bytes = Buffer.concat(json)
-            let changed: string | undefined
-            let parsed: unknown
-            try {
-              parsed = JSON.parse(decoder.decode(bytes).replace(/^\uFEFF/, ""))
-            } catch { invalid = true }
-            if (!invalid) {
-              inspect(parsed)
-              terminal = true
-              changed = normalize(parsed)
-            }
-            if (transform) value.enqueue(changed === undefined ? bytes : encoder.encode(changed))
-          }
-          const complete = terminal && !invalid && choices.size > 0 && [...choices].every((index) => finishedChoices.has(index))
-          await finish(!response.ok || invalid ? "error" : complete ? "complete" : "incomplete")
-          signal?.removeEventListener("abort", abort)
-          if (stopped) return
-          stopped = true
-          value.close()
+        const item = await reader.read()
+        if (stopped) return
+        if (!item.done) {
+          if (format === "sse") events.push(item.value)
+          else if (format === "json") json.push(item.value.slice())
+          value.enqueue(item.value)
+          return
         }
+        if (format === "sse") {
+          events.push(new Uint8Array(0), true)
+          const remaining = events.pending
+          if (/(?:^|[\r\n])(?:\uFEFF)?data(?::|[\r\n]|$)/.test(new TextDecoder().decode(remaining))) invalid = true
+        } else if (format === "json") {
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(decoder.decode(Buffer.concat(json)).replace(/^\uFEFF/, ""))
+          } catch { invalid = true }
+          if (!invalid) {
+            inspect(parsed)
+            terminal = true
+            collect(parsed)
+          }
+        }
+        if (terminal && !invalid && choices.size > 0 && [...choices].every((index) => finishedChoices.has(index))) {
+          // Persist the completion before EOF; the next request may use it.
+          await finish()
+        }
+        if (stopped) return
+        stopped = true
+        value.close()
       } catch (error) {
         if (stopped) return
         stopped = true
         value.error(error)
         void reader.cancel(error).catch(() => {})
-        finish(signal?.aborted ? "aborted" : "error")
       }
     },
-    async cancel(reason) {
+    cancel(reason) {
       if (stopped) return
       stopped = true
-      try { await reader.cancel(reason) } finally { finish(signal?.aborted ? "aborted" : "cancelled") }
+      return reader.cancel(reason)
     },
   }, { highWaterMark: 0 })
-  const headers = new Headers(response.headers)
-  if (transform) headers.delete("content-length")
-  return new Response(stream, { status: response.status, statusText: response.statusText, headers })
+  return new Response(stream, { status: response.status, statusText: response.statusText, headers: response.headers })
 }

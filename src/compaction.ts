@@ -1,13 +1,14 @@
 import { basename, isAbsolute } from "node:path"
-import { isGeneratedEnvironment, type WireMessage } from "./prefix"
-import { digest as hash, instruction, isSha256, record } from "./shared"
-import { compactionOptions, policy, protocolGroups, recentCut, type Options } from "./compaction-policy"
-import { applyReductions, hasSignedState, reductionText, shakeRegions, type Reduction } from "./compaction-shake"
+import type { WireMessage } from "./prefix"
+import { digest as hash, isSha256, record, type ChatBody } from "./shared"
+import { authority, compactionOptions, conversationUser, hasOpaqueContent, policy, protocolGroups, recentCut, type Options } from "./compaction-policy"
+import { readRegions, type ReadEvidence } from "./compaction-reads"
+import { applyReductions, contentArtifactName, hasSignedState, readPlaceholder, reductionText, shakeRegions, type Reduction, type ShakeRegion } from "./compaction-shake"
 import { softSummary } from "./compaction-summary"
 import { handoffPrompt, summaryMessage } from "./compaction-prompts"
 import { withFileOperations } from "./compaction-files"
 
-export type ChatBody = { model: string; messages: WireMessage[]; tools?: unknown; [key: string]: unknown }
+export type { ChatBody } from "./shared"
 export type CompactionContext = {
   session: string
   lane: string
@@ -20,7 +21,9 @@ export type CompactionContext = {
   prefixHandoff?: boolean
   restoreReasoning?: (body: ChatBody) => ChatBody
   currentUser?: WireMessage
-  estimate?: (body: ChatBody, fallback: (value: unknown) => number) => number
+  countPrompt?: (body: ChatBody) => number | undefined
+  readEvidence?: ReadEvidence
+  estimate?: (body: ChatBody, fallback: (value: ChatBody) => number) => number
   overflow?: { promptTokens?: number }
   speculate?: boolean
   force?: boolean
@@ -35,6 +38,17 @@ type State = { segments: Segment[]; covered: number; fingerprint: string; signat
 type Speculation = { base: string; abort: AbortController; promise: Promise<void>; staged?: State }
 type Lane = { session: string; tail: Promise<void>; state?: State; speculation?: Speculation }
 export type CompactionSnapshot = { lanes: { key: string; state: State }[] }
+
+function withReadWitnesses(messages: WireMessage[], segments: Segment[], reductions: Reduction[], evidence?: ReadEvidence) {
+  if (!reductions.some((item) => item.kind === "read")) return reductions
+  const verified = new Set(readRegions(messages, {
+    archived: new Set(segments.flatMap((segment) => segment.archived)),
+    reduced: new Set(),
+    witnessExcluded: new Set(reductions.map(({ index }) => index)),
+    count: () => 1, evidence,
+  }).map(({ index }) => index))
+  return reductions.filter((item) => item.kind !== "read" || verified.has(item.index))
+}
 
 export function isCompactionSnapshot(value: unknown): value is CompactionSnapshot {
   if (!record(value) || Object.keys(value).some((key) => key !== "lanes") || !Array.isArray(value.lanes)) return false
@@ -78,8 +92,8 @@ export function isCompactionSnapshot(value: unknown): value is CompactionSnapsho
         seen.add(key)
         return Object.keys(reduction).every((key) => key === "index" || key === "kind")
       }
-      if (reduction.kind !== "shake" && reduction.kind !== "block") return false
-      if (typeof reduction.path !== "string" || !isAbsolute(reduction.path) || !/^tool_kvguard_[a-f0-9]{64}$/.test(basename(reduction.path)) || typeof reduction.tokens !== "number" || !Number.isSafeInteger(reduction.tokens) || reduction.tokens < 1) return false
+      if (reduction.kind !== "shake" && reduction.kind !== "block" && reduction.kind !== "read") return false
+      if (typeof reduction.path !== "string" || !isAbsolute(reduction.path) || !/^tool_[a-f0-9]{12}_kvguard_[a-f0-9]{52}$/.test(basename(reduction.path)) || typeof reduction.tokens !== "number" || !Number.isSafeInteger(reduction.tokens) || reduction.tokens < 1) return false
       if (reduction.kind === "block" && (typeof reduction.part !== "number" || !Number.isSafeInteger(reduction.part) || reduction.part < -1 || typeof reduction.start !== "number" || !Number.isSafeInteger(reduction.start) || reduction.start < 0 || typeof reduction.end !== "number" || !Number.isSafeInteger(reduction.end) || reduction.end <= reduction.start)) return false
       const key = JSON.stringify([reduction.index, reduction.kind, reduction.part, reduction.start])
       if (seen.has(key)) return false
@@ -91,7 +105,7 @@ export function isCompactionSnapshot(value: unknown): value is CompactionSnapsho
 
 function intervals(messages: WireMessage[]) {
   let interval = -1
-  return messages.map((message, index) => { if (instruction(message)) interval = index; return interval })
+  return messages.map((message, index) => { if (authority(message)) interval = index; return interval })
 }
 
 function replayed(body: ChatBody, entries: Replay[] = []): ChatBody {
@@ -155,22 +169,27 @@ export function constrainedOutput(body: ChatBody) {
     || (body.response_format !== undefined && (!record(body.response_format) || body.response_format.type !== "text" || Object.keys(body.response_format).some((key) => key !== "type")))
 }
 
-// OpenCode 1.19.4's own context-overflow classifier (packages/llm/src/
-// provider-error.ts), so the plugin retries exactly what OpenCode would treat
-// as overflow.
+// OpenCode provider context-overflow patterns, constrained below to the
+// compatible wire's request-error statuses.
 const overflowPatterns = [
-  /prompt is too long/i, /request_too_large/i, /input is too long for requested model/i, /exceeds the context window/i,
+  /prompt is too long/i, /request_too_large/i, /input is too long for (?:the )?(?:requested|selected) model/i, /exceeds the context window/i,
+  /too large for the model'?s configured input limit/i, /exceeded this model context window limit/i,
   /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i, /input token count.*exceeds the maximum/i,
+  /number of input tokens exceeds maximum length/i, /requested input length \d+ exceeds maximum input length/i,
   /tokens in request more than max tokens allowed/i, /maximum prompt length is \d+/i, /reduce the length of the messages/i,
   /maximum context length is \d+ tokens/i, /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
-  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i, /exceeds the limit of \d+/i,
+  /input(?: \(\d+ tokens\))? is longer than the model'?s context length/i, /exceeds the limit of \d+/i,
   /exceeds the available context size/i, /greater than the context length/i, /context window exceeds limit/i,
+  /`inputs` tokens \+ `max_new_tokens` must be <= \d+/i, /context window exceeded/i,
   /exceeded model token limit/i, /context[_ ]length[_ ]exceeded/i, /request entity too large/i, /context length is only \d+ tokens/i,
-  /input length.*exceeds.*context length/i, /prompt too long; exceeded (?:max )?context length/i,
+  /input length.*exceeds.*context length/i, /prompt (?:too long|exceeds max length|超长)/i,
   /too large for model with \d+ maximum context length/i, /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
-  /model_context_window_exceeded/i, /too many tokens/i, /token limit exceeded/i,
+  /model_context_window_exceeded/i, /range of input length should be/i, /too many tokens/i, /token limit exceeded/i,
 ]
-const overflowExclusions = [/^(throttling error|service unavailable):/i, /rate limit/i, /too many requests/i]
+const overflowExclusions = [
+  /^(throttling error|service unavailable):/i, /rate limit/i, /too many requests/i,
+  /max[_ ]tokens must be less than/i, /too many tokens(?: per day)?, please wait/i,
+]
 function isContextOverflow(message: string) {
   return !overflowExclusions.some((pattern) => pattern.test(message)) && overflowPatterns.some((pattern) => pattern.test(message))
 }
@@ -247,16 +266,16 @@ export class RollingCompaction {
     return hash(JSON.stringify([context.session, context.lane, body.model]))
   }
 
-  private retained(body: ChatBody, context: Pick<CompactionContext, "session" | "lane" | "currentUser">, candidate?: State) {
+  private retained(body: ChatBody, context: Pick<CompactionContext, "session" | "lane" | "currentUser" | "readEvidence">, candidate?: State) {
     const state = candidate ?? this.lanes.get(this.key(body, context))?.state
-    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message))
+    const lastUser = context.currentUser ? body.messages.indexOf(context.currentUser) : body.messages.findLastIndex(conversationUser)
     let leading = 0
-    while (instruction(body.messages[leading] ?? { role: "" })) leading++
+    while (authority(body.messages[leading] ?? { role: "" })) leading++
     const signature = hash(JSON.stringify({ policy: this.options, model: body.model, tools: body.tools, response_format: body.response_format, chat_template_kwargs: body.chat_template_kwargs, enable_thinking: body.enable_thinking, preserve_thinking: body.preserve_thinking, reasoning_effort: body.reasoning_effort, cache_salt: body.cache_salt, user: body.user, messages: body.messages.slice(0, leading) }))
-    if (!state || state.signature !== signature || body.messages.length < state.covered || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint) return { signature }
+    if (!state || context.currentUser && lastUser < 0 || state.signature !== signature || body.messages.length < state.covered || hash(JSON.stringify(body.messages.slice(0, state.covered))) !== state.fingerprint) return { signature }
     const units = protocolGroups(body.messages)
     const policies = intervals(body.messages)
-    const lastGroup = units.findLast((group) => !isGeneratedEnvironment(body.messages[group.start] ?? { role: "" }))
+    const lastGroup = units.findLast((group) => !authority(body.messages[group.start] ?? { role: "" }))
     const newestTool = units.findLast((group) => group.start > lastUser && Array.isArray(body.messages[group.start]?.tool_calls))
     const archived = new Set(state.segments.flatMap((segment) => segment.archived))
     if (archived.has(lastUser)) return { signature }
@@ -269,19 +288,21 @@ export class RollingCompaction {
       for (const group of units) {
         const count = Array.from({ length: group.end - group.start }, (_, offset) => group.start + offset).filter((index) => indices.has(index)).length
         const message = body.messages[group.start]
-        if (count && (count !== group.end - group.start || group === lastGroup || group === newestTool || !message || instruction(message) || isGeneratedEnvironment(message))) return { signature }
+        if (count && (count !== group.end - group.start || group === lastGroup || group === newestTool || !message || authority(message) || body.messages.slice(group.start, group.end).some(hasOpaqueContent))) return { signature }
       }
     }
-    for (const reduction of state.reductions ?? []) {
+    const reductions = withReadWitnesses(body.messages, state.segments, state.reductions ?? [], context.readEvidence)
+    for (const reduction of reductions) {
       const message = body.messages[reduction.index]
-      if (!message || instruction(message) || isGeneratedEnvironment(message) || hasSignedState(message)) return { signature }
+      if (!message || authority(message) || hasOpaqueContent(message) || hasSignedState(message)) return { signature }
       if (reduction.kind === "media") {
         if (!Array.isArray(message.content)) return { signature }
       } else {
         if (reduction.index === lastUser || reduction.kind === "shake" && message.role !== "tool") return { signature }
         if (reduction.kind === "block" && message.role !== "user" && message.role !== "assistant") return { signature }
         const text = reductionText(message, reduction)
-        if (!text || basename(reduction.path) !== "tool_kvguard_" + hash(text)) return { signature }
+        if (!text || basename(reduction.path) !== contentArtifactName(text)) return { signature }
+        if (reduction.kind === "read") continue
         // Re-derive eligibility with the rescue preset, including skill/artifact protections.
         const eligible = shakeRegions(body.messages, { protectTokens: 0, minSavings: 0, currentUser: lastUser, count: () => 400, archived: new Set(), reductions: [] })
         if (!eligible.some((region) => region.index === reduction.index && region.kind === reduction.kind && (region.kind !== "block" || reduction.kind === "block" && region.part === reduction.part && region.start === reduction.start && region.end === reduction.end))) return { signature }
@@ -293,10 +314,12 @@ export class RollingCompaction {
         || state.segments.some((segment) => segment.archived.includes(entry.index))
         || ["reasoning", "reasoning_content"].some((field) => Object.hasOwn(message, field) && Object.hasOwn(entry, field))) return { signature }
     }
-    return { signature, state }
+    if (!state.segments.length && !reductions.length && !state.replay?.length) return { signature }
+    if (reductions.length === (state.reductions?.length ?? 0)) return { signature, state }
+    return { signature, state: { ...state, reductions: reductions.length ? reductions : undefined } }
   }
 
-  reconstruct(body: ChatBody, context: Pick<CompactionContext, "session" | "lane" | "currentUser">): ChatBody {
+  reconstruct(body: ChatBody, context: Pick<CompactionContext, "session" | "lane" | "currentUser" | "readEvidence">): ChatBody {
     if (this.options === false) return body
     const { state } = this.retained(body, context)
     if (!state) return body
@@ -327,7 +350,11 @@ export class RollingCompaction {
     if (this.options === false) return
     const key = this.key(body, context)
     const lane = this.lanes.get(key)
-    if (!lane || lane.speculation) return
+    if (!lane) return
+    if (lane.speculation) {
+      const existing = lane.speculation
+      return existing.promise.then(() => !!existing.staged)
+    }
     const abort = new AbortController()
     const signal = context.signal ? AbortSignal.any([context.signal, abort.signal]) : abort.signal
     const base = JSON.stringify(lane.state ?? null)
@@ -341,14 +368,14 @@ export class RollingCompaction {
     entry.promise = (async () => {
       try {
         const result = await this.compact(body, { ...context, signal, force: true, speculate: false }, scratch, active)
-        // A discarded upstream error must still be consumed: its body holds
-        // the endpoint admission slot until EOF or cancellation.
+        // Cancel a discarded upstream error so its body does not stay open.
         if ("response" in result) await result.response.body?.cancel().catch(() => {})
         active()
         if ("body" in result && result.report?.compacted && scratch.state && JSON.stringify(lane.state ?? null) === base) entry.staged = scratch.state
       } catch {}
       if (!entry.staged && lane.speculation === entry) lane.speculation = undefined
     })()
+    return entry.promise.then(() => !!entry.staged)
   }
 
   private async compact(source: ChatBody, context: CompactionContext, lane: Lane, active: () => void, adopted = false): Promise<CompactionResult> {
@@ -359,18 +386,24 @@ export class RollingCompaction {
       if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error(`Compaction requires an actual positive integer ${name}; no model limits are guessed`)
     }
     const rawCount = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") / config.bytesPerToken)
-    const measured = (body: ChatBody) => context.estimate?.(body, rawCount) ?? rawCount(body)
+    const promptCount = (body: ChatBody) => context.countPrompt?.(body) ?? rawCount(body)
+    const measured = (body: ChatBody) => {
+      // A measured-prefix delta must use the same estimator on both sides.
+      const calibrated = context.countPrompt?.(body)
+      const fallback = calibrated === undefined ? rawCount : (candidate: ChatBody) => candidate === body ? calibrated : promptCount(candidate)
+      return context.estimate?.(body, fallback) ?? fallback(body)
+    }
     const budget = Math.floor(Math.min(context.inputLimit ?? Infinity, context.contextWindow - context.outputLimit) - config.marginTokens)
     if (budget < 1) throw new Error("Compaction has no input budget after the actual output reserve and margin")
     const resolved = policy(context.contextWindow, config)
     const { trigger, target } = resolved
     const cap = Math.min(context.modelOutputLimit ?? Infinity, resolved.summaryCap)
-    const lastUser = context.currentUser ? source.messages.indexOf(context.currentUser) : source.messages.findLastIndex((message) => message.role === "user" && !isGeneratedEnvironment(message))
+    const lastUser = context.currentUser ? source.messages.indexOf(context.currentUser) : source.messages.findLastIndex(conversationUser)
     if (context.currentUser && lastUser < 0) throw new Error("Cannot compact without the exact current user instruction object in the outgoing history")
     const units = protocolGroups(source.messages)
     const retained = this.retained(source, context, lane.state)
     const state = retained.state
-    if (!state) lane.state = undefined
+    lane.state = state
     let segments = structuredClone(state?.segments ?? [])
     let reductions = structuredClone(state?.reductions ?? [])
     let storageFailed = false
@@ -399,15 +432,18 @@ export class RollingCompaction {
     }
     const initialReductionCount = reductions.length
     let workingSource = replayed(source, lane.state?.replay)
+    const activeReductions = () => withReadWitnesses(source.messages, segments, reductions, context.readEvidence)
+    const projectedMessages = (messages: WireMessage[] = workingSource.messages) => applyReductions(messages, activeReductions())
     const effective = () => {
-      const body = rewritten(reductions.length ? { ...workingSource, messages: applyReductions(workingSource.messages, reductions) } : workingSource, segments)
+      const messages = projectedMessages()
+      const body = rewritten(messages === workingSource.messages ? workingSource : { ...workingSource, messages }, segments)
       return context.restoreReasoning?.(body) ?? body
     }
     const current = effective()
     // Size and summarize proven replayed fields, while checkpoint fingerprints
     // continue to authenticate the untouched source transcript.
     const positions = new Map<number, number>()
-    rewritten({ ...source, messages: applyReductions(source.messages, reductions) }, segments, positions)
+    rewritten({ ...source, messages: projectedMessages(source.messages) }, segments, positions)
     workingSource = { ...source, messages: source.messages.map((message, index) => {
       const position = positions.get(index)
       const restored = position === undefined ? undefined : current.messages[position]
@@ -418,13 +454,13 @@ export class RollingCompaction {
     }) }
     const before = measured(source)
     const observed = measured(current)
-    const correction = Math.max(1, observed / Math.max(1, rawCount(current)))
+    const correction = Math.max(1, observed / Math.max(1, promptCount(current)))
     // OMP prepareCompaction compares provider prompt occupancy to conversation
     // messages, not to tools/system scaffolding, when correcting the kept tail.
-    const tailCorrection = context.estimate ? Math.max(1, observed / Math.max(1, current.messages.filter((message) => !instruction(message)).reduce((sum, message) => sum + rawCount(message), 0))) : 1
+    const tailCorrection = context.estimate ? Math.max(1, observed / Math.max(1, current.messages.filter((message) => !authority(message)).reduce((sum, message) => sum + rawCount(message), 0))) : 1
     let overflow = context.overflow !== undefined
     let overflowScale = overflow ? Math.max(1, Math.max(context.overflow?.promptTokens ?? 0, budget + 1) / Math.max(1, observed)) : 1
-    const estimate = (body: ChatBody) => Math.ceil((body === current ? observed : Math.max(measured(body), rawCount(body) * correction)) * overflowScale)
+    const estimate = (body: ChatBody) => Math.ceil((body === current ? observed : Math.max(measured(body), promptCount(body) * correction)) * overflowScale)
     let calls = 0
     let prefixHandoff = false
     let rescue = false
@@ -433,6 +469,7 @@ export class RollingCompaction {
       summaryRequests: calls, coveredMessages: new Set(segments.flatMap((segment) => segment.archived)).size,
       shakenResults: reductions.filter((reduction) => reduction.kind === "shake").length,
       shakenBlocks: reductions.filter((reduction) => reduction.kind === "block").length,
+      supersededReads: reductions.filter((reduction) => reduction.kind === "read").length,
       droppedMedia: reductions.filter((reduction) => reduction.kind === "media").length,
       prefixHandoff, rescue, ...(storageFailed ? { shakeStorageFailed: true } : {}),
     })
@@ -442,8 +479,9 @@ export class RollingCompaction {
     }
     if (estimate(current) <= trigger && estimate(current) <= budget && !context.force && !context.manual && !overflow) {
       // Pinned OMP speculation-lead.ts.
-      const lead = Math.min(32000, Math.max(8192, Math.floor(trigger * 0.125)))
-      return { body: current, report: { ...report(current, false), ...(context.speculate && estimate(current) >= trigger - lead ? { speculate: true } : {}) } }
+      const threshold = Math.min(trigger, budget)
+      const lead = Math.min(32000, Math.max(8192, Math.floor(threshold * 0.125)), Math.max(1, Math.floor(threshold / 2)))
+      return { body: current, report: { ...report(current, false), ...(context.speculate && estimate(current) >= threshold - lead ? { speculate: true } : {}) } }
     }
     const speculation = lane.speculation
     if (speculation && overflow) {
@@ -467,6 +505,7 @@ export class RollingCompaction {
     const limit = () => overflow || context.manual ? budget : Math.min(target, budget)
     const progressed = (body: ChatBody) => estimate(body) <= limit() && estimate(body) < estimate(current)
     const commit = () => {
+      reductions = activeReductions()
       const body = effective()
       if (estimate(body) > budget) throw new Error(`Compaction cannot fit input budget ${budget}; no summary state was committed`)
       active()
@@ -481,25 +520,25 @@ export class RollingCompaction {
       })
       const covered = Math.max(-1, ...archived, ...reductions.map((reduction) => reduction.index), ...replay.map((entry) => entry.index)) + 1
       if (covered) lane.state = { segments: structuredClone(segments), reductions: reductions.length ? structuredClone(reductions) : undefined, replay: replay.length ? replay : undefined, covered, fingerprint: hash(JSON.stringify(source.messages.slice(0, covered))), signature: retained.signature }
-      return { body, report: { ...report(body, true), shook: reductions.filter((reduction) => reduction.kind === "shake" || reduction.kind === "block").length - (state?.reductions?.filter((reduction) => reduction.kind !== "media").length ?? 0) } }
+      return { body, report: { ...report(body, true), shook: reductions.filter((reduction) => reduction.kind === "shake" || reduction.kind === "block").length - (state?.reductions?.filter((reduction) => reduction.kind === "shake" || reduction.kind === "block").length ?? 0) } }
     }
     const policies = intervals(source.messages)
-    const fixed = { ...source, messages: source.messages.filter(instruction) }
-    if (estimate(fixed) > budget) throw new Error(`Compaction cannot fit input budget ${budget}: fixed system/tools/format exceed the hard limit; no summary state was committed`)
+    const fixed = { ...source, messages: source.messages.filter((message) => authority(message) || hasOpaqueContent(message)) }
+    if (estimate(fixed) > budget) throw new Error(`Compaction cannot fit input budget ${budget}: fixed instructions, tools, format or opaque content exceed the hard limit; no summary state was committed`)
     const preparePlans = () => {
       const archived = new Set(segments.flatMap((segment) => segment.archived))
       const liveUnits = units.filter((group) => !archived.has(group.start))
       const tail = Math.max(1, Math.floor(resolved.keepRecentTokens / tailCorrection / overflowScale))
-      const cut = recentCut(liveUnits, applyReductions(workingSource.messages, reductions), tail, rawCount)
-      const lastGroup = units.findLast((group) => !isGeneratedEnvironment(source.messages[group.start] ?? { role: "" }))
+      const cut = recentCut(liveUnits, projectedMessages(), tail, rawCount)
+      const lastGroup = units.findLast((group) => !authority(source.messages[group.start] ?? { role: "" }))
       const newestTool = units.findLast((group) => group.start > lastUser && Array.isArray(source.messages[group.start]?.tool_calls))
       const splitTurnStart = source.messages[cut]?.role === "assistant"
-        ? source.messages.findLastIndex((message, index) => index < cut && message.role === "user" && !isGeneratedEnvironment(message))
+        ? source.messages.findLastIndex((message, index) => index < cut && conversationUser(message))
         : -1
       const plans = new Map<number | undefined, { previous?: Segment; additions: number[]; splitTurnStart: number }>()
       for (const group of units) {
         const message = source.messages[group.start]
-        if (group.start >= cut || group === lastGroup || group === newestTool || !message || instruction(message) || isGeneratedEnvironment(message) || group.start <= lastUser && group.end > lastUser || archived.has(group.start)) continue
+        if (group.start >= cut || group === lastGroup || group === newestTool || !message || authority(message) || source.messages.slice(group.start, group.end).some(hasOpaqueContent) || group.start <= lastUser && group.end > lastUser || archived.has(group.start)) continue
         const interval = policies[group.start]
         let plan = plans.get(interval)
         if (!plan) { plan = { previous: segments.find((segment) => policies[segment.archived[0] ?? -1] === interval), additions: [], splitTurnStart }; plans.set(interval, plan) }
@@ -519,7 +558,7 @@ export class RollingCompaction {
     if (context.prefixHandoff && !constrainedOutput(current) && !overflow && handoffPlans.length) {
       const prior = structuredClone(segments)
       const positions = new Map<number, number>()
-      rewritten({ ...source, messages: applyReductions(source.messages, reductions) }, segments, positions)
+      rewritten({ ...source, messages: projectedMessages(source.messages) }, segments, positions)
       let failed = false
       for (const plan of handoffPlans) {
         const selected = [...(plan.previous ? [positions.get(plan.previous.archived[0] ?? -1)] : []), ...plan.additions.map((index) => positions.get(index))].filter((index): index is number => index !== undefined).sort((a, b) => a - b)
@@ -557,10 +596,34 @@ export class RollingCompaction {
       segments = prior
       prefixHandoff = false
     }
+    const saveReductions = async (regions: readonly ((Omit<Extract<Reduction, { kind: "read" }>, "path"> & { readonly text: string }) | ShakeRegion)[]) => {
+      if (!context.artifacts) return
+      for (const region of regions) {
+        const path = context.artifacts.path(region.text)
+        if (region.kind === "read" && rawCount(readPlaceholder(path)) >= region.tokens) continue
+        active()
+        try {
+          if (!isAbsolute(path) || basename(path) !== contentArtifactName(region.text)) throw new Error("Artifact path does not match its content")
+          await context.artifacts.save(path, region.text)
+        } catch (error) { active(); storageFailed = true; continue }
+        active()
+        const { text: _, ...reduction } = region
+        reductions.push({ ...reduction, path })
+      }
+    }
+    if (context.readEvidence && context.artifacts) {
+      await saveReductions(readRegions(source.messages, {
+        archived: new Set(segments.flatMap((segment) => segment.archived)),
+        reduced: new Set(reductions.map((reduction) => reduction.index)),
+        count: rawCount, evidence: context.readEvidence,
+      }))
+      if (progressed(effective())) return commit()
+    }
     const shake = async (protectTokens: number, minSavings: number) => {
       if (!context.artifacts) return
       const positions = new Map<number, number>()
-      const projected = rewritten({ ...workingSource, messages: applyReductions(workingSource.messages, reductions) }, segments, positions)
+      reductions = activeReductions()
+      const projected = rewritten({ ...workingSource, messages: projectedMessages() }, segments, positions)
       const restored = context.restoreReasoning?.(projected) ?? projected
       const costs = source.messages.map((_, index) => {
         const position = positions.get(index)
@@ -568,14 +631,7 @@ export class RollingCompaction {
         return message ? rawCount(message) : 0
       })
       const regions = shakeRegions(source.messages, { protectTokens, minSavings, currentUser: lastUser, count: rawCount, costs, archived: new Set(segments.flatMap((segment) => segment.archived)), reductions })
-      for (const region of regions) {
-        const path = context.artifacts.path(region.text)
-        active()
-        try { await context.artifacts.save(path, region.text) } catch (error) { active(); storageFailed = true; continue }
-        active()
-        const { text: _, ...reduction } = region
-        reductions.push({ ...reduction, path })
-      }
+      await saveReductions(regions)
     }
     await shake(16000, 4000)
     if (progressed(effective())) return commit()
@@ -587,13 +643,13 @@ export class RollingCompaction {
       const prefix = plan.splitTurnStart < 0 ? [] : plan.additions.filter((index) => index >= plan.splitTurnStart)
       let summary = plan.previous?.summary ?? ""
       if (history.length) {
-        const result = await softSummary({ body: { ...workingSource, messages: applyReductions(workingSource.messages, reductions) }, context, additions: history, previous: plan.previous?.summary, cap, margin: config.marginTokens, count: rawCount, active, onRequest: () => { calls++ } })
+        const result = await softSummary({ body: { ...workingSource, messages: projectedMessages() }, context, additions: history, previous: plan.previous?.summary, cap, margin: config.marginTokens, count: rawCount, promptCount, active, onRequest: () => { calls++ } })
         if ("response" in result) return result
         summary = result.summary
       }
       if (prefix.length) {
         const prefixCap = Math.max(1, Math.min(Math.floor(0.5 * resolved.summaryReserve), 16384, context.modelOutputLimit ?? Infinity, config.summaryOutputTokens ?? Infinity))
-        const result = await softSummary({ body: { ...workingSource, messages: applyReductions(workingSource.messages, reductions) }, context, additions: prefix, turnPrefix: true, cap: prefixCap, margin: config.marginTokens, count: rawCount, active, onRequest: () => { calls++ } })
+        const result = await softSummary({ body: { ...workingSource, messages: projectedMessages() }, context, additions: prefix, turnPrefix: true, cap: prefixCap, margin: config.marginTokens, count: rawCount, promptCount, active, onRequest: () => { calls++ } })
         if ("response" in result) return result
         summary = summary ? `${summary}\n\n---\n\n**Turn Context (split turn):**\n\n${result.summary}` : result.summary
       }
@@ -605,7 +661,7 @@ export class RollingCompaction {
     await shake(0, 0)
     if (progressed(effective())) return commit()
     source.messages.forEach((message, index) => {
-      if (instruction(message) || isGeneratedEnvironment(message) || hasSignedState(message) || !Array.isArray(message.content) || reductions.some((reduction) => reduction.index === index && reduction.kind === "media")) return
+      if (authority(message) || hasOpaqueContent(message) || hasSignedState(message) || !Array.isArray(message.content) || reductions.some((reduction) => reduction.index === index && reduction.kind === "media")) return
       if (message.content.some((part) => record(part) && ["image_url", "image", "input_image"].includes(String(part.type)))) reductions.push({ index, kind: "media" })
     })
     if (progressed(effective())) return commit()

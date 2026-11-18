@@ -1,30 +1,27 @@
 import { describe, expect, test } from "bun:test"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { jsonSchema, stepCountIs, streamText } from "ai"
-import type { ChatBody } from "../src/compaction"
+import type { ChatBody } from "../src/shared"
 import type { WireMessage } from "../src/prefix"
-import { observeResponse, UsageTracker, type ObserveResponseOptions, type UsageReport } from "../src/usage"
-import { createGLMChunkAdapter, parseGLMOptions } from "../src/glm"
-import { admittedFetch, type AdmissionGate } from "../src/transport"
+import { observeResponse, UsageTracker, type ObservedCompletion } from "../src/usage"
+import { cancellableResponse } from "../src/transport"
 
 const encoder = new TextEncoder()
 
-test("response replay records transformed fragments only after a complete successful stream", async () => {
+test("response replay records reasoning and tool fragments only after a complete successful stream without changing SSE bytes", async () => {
   const values = [
-    { choices: [{ index: 0, delta: { role: "assistant", reasoning_text: "Think " }, finish_reason: null }] },
-    { choices: [{ index: 0, delta: { reasoning_text: "carefully", tool_calls: [{ index: 0, id: "call", type: "function", function: { name: "read", arguments: '{"file' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { role: "assistant", reasoning_content: "Think " }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { reasoning_content: "carefully", tool_calls: [{ index: 0, id: "call", type: "function", function: { name: "read", arguments: '{"file' } }] }, finish_reason: null }] },
     { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: 'Path":"a"}' } }] }, finish_reason: "tool_calls" }] },
   ]
   for (const done of [false, true]) {
     const recorded: unknown[] = []
     const source = values.map((value) => event(value)).join("") + (done ? "data: [DONE]\n\n" : "")
-    const response = observeResponse(stream([encoder.encode(source)]), {
-      body: body(), lane, tracker: new UsageTracker(),
-      transform: createGLMChunkAdapter("fixture", parseGLMOptions({ models: ["fixture"] })),
-      onAssistant: (assistant) => { recorded.push(assistant) },
+    const response = observeResponse(stream([encoder.encode(source)]), ({ assistant }) => {
+      if (assistant) recorded.push(assistant)
     })
     expect(recorded).toEqual([])
-    await response.text()
+    expect(await response.text()).toBe(source)
     expect(recorded).toEqual(done ? [{
       role: "assistant", content: "", reasoning_content: "Think carefully",
       tool_calls: [{ id: "call", type: "function", function: { name: "read", arguments: '{"filePath":"a"}' } }],
@@ -38,8 +35,8 @@ test("repeated tool-call id and name deltas are recorded once, like the SDK", as
     { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "read", arguments: 'Path":"a"}' } }] }, finish_reason: "tool_calls" }] },
   ]
   const recorded: unknown[] = []
-  const response = observeResponse(stream([encoder.encode(values.map((value) => event(value)).join("") + "data: [DONE]\n\n")]), {
-    body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { recorded.push(assistant) },
+  const response = observeResponse(stream([encoder.encode(values.map((value) => event(value)).join("") + "data: [DONE]\n\n")]), ({ assistant }) => {
+    if (assistant) recorded.push(assistant)
   })
   await response.text()
   expect(recorded).toEqual([{ role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"filePath":"a"}' } }] }])
@@ -47,8 +44,8 @@ test("repeated tool-call id and name deltas are recorded once, like the SDK", as
   const conflicting = structuredClone(values)
   conflicting[1]!.choices[0]!.delta.tool_calls![0]!.id = "call_2"
   const rejected: unknown[] = []
-  await observeResponse(stream([encoder.encode(conflicting.map((value) => event(value)).join("") + "data: [DONE]\n\n")]), {
-    body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { rejected.push(assistant) },
+  await observeResponse(stream([encoder.encode(conflicting.map((value) => event(value)).join("") + "data: [DONE]\n\n")]), ({ assistant }) => {
+    if (assistant) rejected.push(assistant)
   }).text()
   expect(rejected).toEqual([])
 })
@@ -77,8 +74,8 @@ test("tool replay arguments match the SDK round trip without changing response b
       fetch: Object.assign(async (url: RequestInfo | URL, init?: RequestInit) => {
         requests.push(await new Request(url, init).json() as ChatBody)
         if (requests.length > 1) return stream([encoder.encode(event({ choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n")])
-        const response = observeResponse(stream([encoder.encode(source)]), {
-          body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { recorded.push(assistant) },
+        const response = observeResponse(stream([encoder.encode(source)]), ({ assistant }) => {
+          if (assistant) recorded.push(assistant)
         })
         expect(await response.clone().text()).toBe(source)
         return response
@@ -99,8 +96,8 @@ test("tool replay arguments match the SDK round trip without changing response b
 
     const jsonRecorded: WireMessage[] = []
     const json = JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "", tool_calls: [{ id: "call", type: "function", function: { name: "read", arguments: input } }] }, finish_reason: "tool_calls" }] })
-    const response = observeResponse(new Response(json, { headers: { "content-type": "application/json" } }), {
-      body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { jsonRecorded.push(assistant) },
+    const response = observeResponse(new Response(json, { headers: { "content-type": "application/json" } }), ({ assistant }) => {
+      if (assistant) jsonRecorded.push(assistant)
     })
     expect(await response.text()).toBe(json)
     expect(jsonRecorded).toEqual(recorded)
@@ -114,8 +111,8 @@ test("truncated, opaque and multi-choice completions cannot become replay record
     [0, 1].map((index) => ({ index, message: { role: "assistant", content: "ok" }, finish_reason: "stop" })),
   ]) {
     const recorded: unknown[] = []
-    const response = observeResponse(Response.json({ choices }), {
-      body: body(), lane, tracker: new UsageTracker(), onAssistant: (assistant) => { recorded.push(assistant) },
+    const response = observeResponse(Response.json({ choices }), ({ assistant }) => {
+      if (assistant) recorded.push(assistant)
     })
     await response.text()
     expect(recorded).toEqual([])
@@ -142,23 +139,20 @@ function stream(chunks: Uint8Array[], headers: HeadersInit = { "content-type": "
     },
   }, { highWaterMark: 0 }), { headers })
 }
-function watch(response: Response, options: Omit<ObserveResponseOptions, "onReport">) {
-  const report = Promise.withResolvers<UsageReport>()
-  return { response: observeResponse(response, { ...options, onReport: report.resolve }), report: report.promise }
+function watch(upstream: Response) {
+  const receipts: ObservedCompletion[] = []
+  const response = observeResponse(upstream, (receipt) => { receipts.push(receipt) })
+  return { response, receipts }
 }
-async function anchor(tracker: UsageTracker, prompt = body(), key = lane, tokens = 100, receipt?: string) {
-  const observed = watch(Response.json(final({ prompt_tokens: tokens })), { body: prompt, lane: key, tracker, request: tracker.begin(prompt, key, receipt) })
-  await observed.response.text()
-  expect((await observed.report).anchorRecorded).toBe(true)
+function anchor(tracker: UsageTracker, prompt = body(), key = lane, tokens = 100, receipt?: string) {
+  expect(tracker.record(tracker.begin(prompt, key, receipt), prompt, key, tokens)).toBe(true)
 }
 
 describe("provider usage anchors", () => {
-  test("uses raw prompt tokens once, plus only the estimated appended message delta", async () => {
+  test("uses raw prompt tokens once, plus only the estimated appended message delta", () => {
     const tracker = new UsageTracker()
     const prompt = body()
-    const observed = watch(Response.json(final({ prompt_tokens: 1_000, completion_tokens: 20, total_tokens: 1_020, prompt_tokens_details: { cached_tokens: 800 } })), { body: prompt, lane, tracker })
-    await observed.response.text()
-    expect(await observed.report).toMatchObject({ promptTokens: 1_000, cachedTokens: 800, completionTokens: 20, totalTokens: 1_020, anchorRecorded: true })
+    anchor(tracker, prompt, lane, 1_000)
     expect(tracker.estimate(prompt, lane, fallback)).toBe(1_000)
     const appended = body([{ role: "assistant", content: "Answer" }, { role: "user", content: "Next" }])
     expect(tracker.estimate(appended, lane, fallback)).toBe(1_000 + fallback(appended) - fallback(prompt))
@@ -169,10 +163,10 @@ describe("provider usage anchors", () => {
     expect(tracker.estimate(tools, lane, fallback)).toBe(1_000 + fallback(tools) - fallback(prompt))
   })
 
-  test.each([false, true])("requires exact model, template, tools, nonmessage policy, history, tenant and lane (restored=%s)", async (restored) => {
+  test.each([false, true])("requires exact model, template, tools, nonmessage policy, history, tenant and lane (restored=%s)", (restored) => {
     let tracker = new UsageTracker()
     const prompt = body()
-    await anchor(tracker, prompt)
+    anchor(tracker, prompt)
     if (restored) {
       const snapshot = tracker.snapshot([lane])
       tracker = new UsageTracker()
@@ -195,9 +189,9 @@ describe("provider usage anchors", () => {
     expect(tracker.estimate(prompt, lane, fallback)).toBe(100)
   })
 
-  test("does not infer changed policy overhead or appended media and signed fields", async () => {
+  test("does not infer changed policy overhead or appended media and signed fields", () => {
     const tracker = new UsageTracker()
-    await anchor(tracker)
+    anchor(tracker)
     for (const message of [
       { role: "user", content: [{ type: "image_url", image_url: { url: "image" } }] },
       { role: "assistant", content: "text", signature: "signed" },
@@ -211,7 +205,7 @@ describe("provider usage anchors", () => {
     expect(tracker.estimate(appended, lane, (value) => value === appended ? 1 : 2)).toBe(1)
   })
 
-  test("newer dispatch wins even if the older response reaches headers last", async () => {
+  test("newer dispatch wins even if the older response arrives last", () => {
     const tracker = new UsageTracker()
     const first = body()
     const next = body([{ role: "assistant", content: "Answer" }, { role: "user", content: "Next" }])
@@ -220,29 +214,22 @@ describe("provider usage anchors", () => {
     // A checkpoint reload while requests are in flight must not reset their
     // dispatch ordering or replace the lane identity attached to the tickets.
     tracker.restore({ lanes: [] }, [lane])
-    const newer = watch(Response.json(final({ prompt_tokens: 200 })), { body: next, lane, tracker, request: newerRequest })
-    await newer.response.text()
-    expect((await newer.report).anchorRecorded).toBe(true)
-    const older = watch(Response.json(final({ prompt_tokens: 50 })), { body: first, lane, tracker, request: olderRequest })
-    await older.response.text()
-    expect((await older.report).anchorRecorded).toBe(false)
+    expect(tracker.record(newerRequest, next, lane, 200)).toBe(true)
+    expect(tracker.record(olderRequest, first, lane, 50)).toBe(false)
     expect(tracker.estimate(next, lane, fallback)).toBe(200)
     expect(tracker.estimate(first, lane, fallback)).toBe(fallback(first))
   })
 
-  test("history replacement invalidates the prior anchor even if the replacement fails", async () => {
+  test("history replacement invalidates the prior anchor even if the replacement is not recorded", () => {
     const tracker = new UsageTracker()
-    await anchor(tracker)
+    anchor(tracker)
     const edited = body()
     edited.messages[1]!.content = "Replacement"
-    const request = tracker.begin(edited, lane)
-    const observed = watch(new Response("failure", { status: 503 }), { body: edited, lane, tracker, request })
-    expect(await observed.response.text()).toBe("failure")
-    expect((await observed.report).anchorRecorded).toBe(false)
+    tracker.begin(edited, lane)
     expect(tracker.estimate(body(), lane, fallback)).toBe(fallback(body()))
   })
 
-  test.each([false, true])("checkpoint reload rejects old measurements before live mutation (delayedDispatch=%s)", async (delayedDispatch) => {
+  test.each([false, true])("checkpoint reload rejects old measurements before live mutation (delayedDispatch=%s)", (delayedDispatch) => {
     const first = new UsageTracker()
     const receipt = first.prepare(lane)
     const oldBody = body()
@@ -251,7 +238,7 @@ describe("provider usage anchors", () => {
     newer.restore(first.snapshot([lane]))
     const newerReceipt = newer.prepare(lane)
     const newBody = body([{ role: "assistant", content: "Answer" }, { role: "user", content: "새로운 기록" }])
-    await anchor(newer, newBody, lane, 16_500, newerReceipt)
+    anchor(newer, newBody, lane, 16_500, newerReceipt)
     // A preparation reloads another process's checkpoint while the old
     // response in this instance is still in flight and has no newer dispatch.
     first.restore(newer.snapshot([lane]), [lane])
@@ -262,35 +249,27 @@ describe("provider usage anchors", () => {
     expect(first.estimate(newBody, lane, fallback)).toBe(16_500)
   })
 
-  test("delete and clear invalidate in-flight tickets without affecting other lanes", async () => {
+  test("delete and clear invalidate in-flight tickets without affecting other lanes", () => {
     const tracker = new UsageTracker()
-    await anchor(tracker, body(), "other", 300)
+    anchor(tracker, body(), "other", 300)
     const request = tracker.begin(body(), lane)
     tracker.delete(lane)
-    const observed = watch(Response.json(final()), { body: body(), lane, tracker, request })
-    await observed.response.text()
-    expect((await observed.report).anchorRecorded).toBe(false)
+    expect(tracker.record(request, body(), lane, 100)).toBe(false)
     expect(tracker.estimate(body(), "other", fallback)).toBe(300)
     const clearing = tracker.begin(body(), "other")
     tracker.clear()
-    const afterClear = watch(Response.json(final()), { body: body(), lane: "other", tracker, request: clearing })
-    await afterClear.response.text()
-    expect((await afterClear.report).anchorRecorded).toBe(false)
+    expect(tracker.record(clearing, body(), "other", 100)).toBe(false)
     expect(tracker.estimate(body(), "other", fallback)).toBe(fallback(body()))
   })
 
-  test("mismatched body or lane cannot commit another request's tokens", async () => {
+  test("mismatched body or lane cannot commit another request's tokens", () => {
     const tracker = new UsageTracker()
     const prompt = body()
     const request = tracker.begin(prompt, lane)
-    const wrong = watch(Response.json(final()), { body: prompt, lane: "different", tracker, request })
-    await wrong.response.text()
-    expect((await wrong.report).anchorRecorded).toBe(false)
+    expect(tracker.record(request, prompt, "different", 100)).toBe(false)
     const changedRequest = tracker.begin(prompt, lane)
     prompt.messages[1]!.content = "Mutated after dispatch"
-    const changed = watch(Response.json(final()), { body: prompt, lane, tracker, request: changedRequest })
-    await changed.response.text()
-    expect((await changed.report).anchorRecorded).toBe(false)
+    expect(tracker.record(changedRequest, prompt, lane, 100)).toBe(false)
   })
 })
 
@@ -299,16 +278,12 @@ describe("streaming usage observation", () => {
     const source = ": ping\r\nid: 1\r\n" + event({ choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }, "\r\n") + event({ choices: [{ index: 0, delta: { content: "한😀" }, finish_reason: null }] }, "\r\n") + event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }, "\r\n") + "data: [DONE]\r\n\r\n" + event({ choices: [], usage: { prompt_tokens: 321, completion_tokens: 9, total_tokens: 330, prompt_tokens_details: { cached_tokens: 250 } } }, "\r\n")
     const bytes = encoder.encode(source)
     const chunks = [...bytes].map((byte) => new Uint8Array([byte]))
-    const tracker = new UsageTracker()
-    const observed = watch(stream(chunks), { body: body(), lane, tracker, label: "main" })
+    const observed = watch(stream(chunks))
     expect(new Uint8Array(await observed.response.arrayBuffer())).toEqual(bytes)
-    const report = await observed.report
-    expect(report).toMatchObject({ label: "main", format: "sse", outcome: "complete", status: 200, promptTokens: 321, completionTokens: 9, totalTokens: 330, cachedTokens: 250, anchorRecorded: true })
-    expect(report.firstOutputMs).toBeGreaterThanOrEqual(report.headerMs)
-    expect(report.endMs).toBeGreaterThanOrEqual(report.firstOutputMs!)
-    expect(report.laneFingerprint).toMatch(/^[a-f0-9]{64}$/)
-    expect(JSON.stringify(report)).not.toContain("Policy")
-    expect(tracker.estimate(body(), lane, fallback)).toBe(321)
+    expect(observed.receipts).toEqual([{
+      promptTokens: 321, completionTokens: 9, totalTokens: 330, cachedTokens: 250,
+      finishReason: "stop", assistant: { role: "assistant", content: "한😀" },
+    }])
   })
 
   test("does not read ahead without downstream demand or stop at finish_reason", async () => {
@@ -321,88 +296,67 @@ describe("streaming usage observation", () => {
         else controller.enqueue(encoder.encode(chunk))
       },
     }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } })
-    const observed = watch(upstream, { body: body(), lane, tracker: new UsageTracker() })
+    const observed = watch(upstream)
     expect(pulls).toBe(0)
     const reader = observed.response.body!.getReader()
     expect(new TextDecoder().decode((await reader.read()).value)).toBe(chunks[0])
     expect(pulls).toBe(1)
     for (let index = 1; index < chunks.length; index++) expect(new TextDecoder().decode((await reader.read()).value)).toBe(chunks[index])
     expect((await reader.read()).done).toBe(true)
-    expect((await observed.report).promptTokens).toBe(400)
+    expect(observed.receipts).toMatchObject([{ promptTokens: 400 }])
   })
 
-  test("metadata-only chunks do not count as first generated output", async () => {
+  test("accepts zero prompt tokens in a complete response without replayable content", async () => {
     const source = event({ choices: [{ index: 0, delta: { role: "assistant", content: "", tool_calls: [{ index: 0 }] }, finish_reason: null }] }) + event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0 } }) + "data: [DONE]\n\n"
-    const observed = watch(stream([encoder.encode(source)]), { body: body(), lane, tracker: new UsageTracker(), label: "summary" })
+    const observed = watch(stream([encoder.encode(source)]))
     await observed.response.text()
-    const report = await observed.report
-    expect(report).toMatchObject({ label: "summary", promptTokens: 0, anchorRecorded: true, outcome: "complete" })
-    expect(report).not.toHaveProperty("firstOutputMs")
+    expect(observed.receipts).toEqual([{ promptTokens: 0, finishReason: "stop" }])
   })
-
-  for (const delta of [{ content: "text" }, { reasoning_content: "reason" }, { reasoning: "reason" }, { tool_calls: [{ index: 0, id: "call", type: "function", function: { name: "read", arguments: "" } }] }]) {
-    test(`recognizes actual output ${JSON.stringify(delta)}`, async () => {
-      const source = event({ choices: [{ index: 0, delta, finish_reason: null }] }) + event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) + "data: [DONE]\n\n"
-      const observed = watch(stream([encoder.encode(source)]), { body: body(), lane, tracker: new UsageTracker() })
-      await observed.response.text()
-      expect((await observed.report).firstOutputMs).toBeGreaterThanOrEqual(0)
-    })
-  }
 
   for (const alias of ["cached_tokens", "prompt_cache_hit_tokens", "cachedContentTokenCount", "cache_read_input_tokens", "cache_hit_tokens"]) {
     test(`accepts numeric ${alias} without adding it to raw prompt_tokens`, async () => {
-      const tracker = new UsageTracker()
       const source = event({ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 200, [alias]: 150 } }) + event({ choices: [], usage: { prompt_tokens: 200, [alias]: 150 } }) + "data: [DONE]\n\n"
-      const observed = watch(stream([encoder.encode(source)]), { body: body(), lane, tracker })
+      const observed = watch(stream([encoder.encode(source)]))
       await observed.response.text()
-      expect(await observed.report).toMatchObject({ promptTokens: 200, cachedTokens: 150, anchorRecorded: true })
-      expect(tracker.estimate(body(), lane, fallback)).toBe(200)
+      expect(observed.receipts).toMatchObject([{ promptTokens: 200, cachedTokens: 150 }])
     })
   }
 
   test("nested cached tokens take priority and missing or invalid counters stay absent", async () => {
-    const observed = watch(Response.json(final({ prompt_tokens: 100, cached_tokens: 80, prompt_tokens_details: { cached_tokens: 0 } })), { body: body(), lane, tracker: new UsageTracker() })
+    const observed = watch(Response.json(final({ prompt_tokens: 100, cached_tokens: 80, prompt_tokens_details: { cached_tokens: 0 } })))
     await observed.response.text()
-    expect((await observed.report).cachedTokens).toBe(0)
-    const missing = watch(Response.json(final({ prompt_tokens: "100", cached_tokens: "80", completion_tokens: -1, total_tokens: Number.MAX_SAFE_INTEGER + 1 })), { body: body(), lane, tracker: new UsageTracker() })
+    expect(observed.receipts).toMatchObject([{ cachedTokens: 0 }])
+    const missing = watch(Response.json(final({ prompt_tokens: "100", cached_tokens: "80", completion_tokens: -1, total_tokens: Number.MAX_SAFE_INTEGER + 1 })))
     await missing.response.text()
-    const report = await missing.report
-    for (const key of ["promptTokens", "completionTokens", "totalTokens", "cachedTokens"]) expect(report).not.toHaveProperty(key)
-    expect(report.anchorRecorded).toBe(false)
+    expect(missing.receipts).toEqual([{ finishReason: "stop", assistant: { role: "assistant", content: "ok" } }])
   })
 
-  test("accepts single-choice usage and refuses an inconsistent cached count as an anchor", async () => {
+  test("accepts usage reported on a single choice", async () => {
     const source = event({ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop", usage: { prompt_tokens: 100, prompt_cache_hit_tokens: 40 } }] }) + "data: [DONE]\n\n"
-    const observed = watch(stream([encoder.encode(source)]), { body: body(), lane, tracker: new UsageTracker() })
+    const observed = watch(stream([encoder.encode(source)]))
     await observed.response.text()
-    expect(await observed.report).toMatchObject({ promptTokens: 100, cachedTokens: 40, anchorRecorded: true })
-    const inconsistent = watch(Response.json(final({ prompt_tokens: 100, cached_tokens: 101 })), { body: body(), lane, tracker: new UsageTracker() })
-    await inconsistent.response.text()
-    expect(await inconsistent.report).toMatchObject({ outcome: "complete", promptTokens: 100, cachedTokens: 101, anchorRecorded: false })
+    expect(observed.receipts).toMatchObject([{ promptTokens: 100, cachedTokens: 40 }])
   })
 
   test("requires successful HTTP status, all final choices, DONE and clean EOF", async () => {
-    const tracker = new UsageTracker()
     const cases = [
-      { response: new Response(JSON.stringify(final()), { status: 429, statusText: "Rate Limited", headers: { "content-type": "application/json", "x-fixture": "kept" } }), outcome: "error" },
-      { response: stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100 } }))]), outcome: "incomplete" },
-      { response: stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: null }], usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\n")]), outcome: "incomplete" },
-      { response: stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }, { index: 1, delta: { content: "unfinished" }, finish_reason: null }], usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\n")]), outcome: "incomplete" },
-      { response: stream([encoder.encode(event({ error: { message: "provider failure" }, usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\n")]), outcome: "error" },
-      { response: stream([encoder.encode("event: error\ndata: {}\n\n")]), outcome: "error" },
-      { response: stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\ndata: {\"truncated\":" )]), outcome: "error" },
-      { response: new Response("{incomplete", { headers: { "content-type": "application/json" } }), outcome: "error" },
+      new Response(JSON.stringify(final()), { status: 429, statusText: "Rate Limited", headers: { "content-type": "application/json", "x-fixture": "kept" } }),
+      stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100 } }))]),
+      stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: null }], usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\n")]),
+      stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }, { index: 1, delta: { content: "unfinished" }, finish_reason: null }], usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\n")]),
+      stream([encoder.encode(event({ error: { message: "provider failure" }, usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\n")]),
+      stream([encoder.encode("event: error\ndata: {}\n\n")]),
+      stream([encoder.encode(event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\ndata: {\"truncated\":")]),
+      new Response("{incomplete", { headers: { "content-type": "application/json" } }),
     ]
-    for (const entry of cases) {
-      const status = entry.response.status
-      const statusText = entry.response.statusText
-      const observed = watch(entry.response, { body: body(), lane, tracker })
+    for (const source of cases) {
+      const { status, statusText } = source
+      const observed = watch(source)
       expect(observed.response.status).toBe(status)
       expect(observed.response.statusText).toBe(statusText)
       if (status === 429) expect(observed.response.headers.get("x-fixture")).toBe("kept")
       await observed.response.text()
-      expect(await observed.report).toMatchObject({ outcome: entry.outcome, anchorRecorded: false })
-      expect(tracker.estimate(body(), lane, fallback)).toBe(fallback(body()))
+      expect(observed.receipts).toEqual([])
     }
   })
 
@@ -418,15 +372,13 @@ describe("streaming usage observation", () => {
       },
       cancel(reason) { cancelled.resolve(reason) },
     }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } })
-    const tracker = new UsageTracker()
-    const observed = watch(upstream, { body: body(), lane, tracker })
+    const observed = watch(upstream)
     const reader = observed.response.body!.getReader()
     await reader.read()
     const reason = new Error("consumer stopped")
     await reader.cancel(reason)
     expect(await cancelled.promise).toBe(reason)
-    expect(await observed.report).toMatchObject({ outcome: "cancelled", anchorRecorded: false })
-    expect(tracker.estimate(body(), lane, fallback)).toBe(fallback(body()))
+    expect(observed.receipts).toEqual([])
   })
 
   test("abort interrupts a pending read and forwards cancellation to upstream", async () => {
@@ -437,37 +389,16 @@ describe("streaming usage observation", () => {
       pull() { started.resolve() },
       cancel(reason) { cancelled.resolve(reason) },
     }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } })
-    const observed = watch(upstream, { body: body(), lane, tracker: new UsageTracker(), signal: signal.signal })
-    const pending = observed.response.body!.getReader().read()
+    const observed = watch(upstream)
+    const response = cancellableResponse(observed.response, signal.signal)
+    if (!response.body) throw new Error("Missing response stream")
+    const pending = response.body.getReader().read()
     await started.promise
     const reason = new Error("aborted")
     signal.abort(reason)
     await expect(pending).rejects.toBe(reason)
     expect(await cancelled.promise).toBe(reason)
-    expect(await observed.report).toMatchObject({ outcome: "aborted", anchorRecorded: false })
-  })
-
-  test("abort waits for upstream release and surfaces its failure", async () => {
-    const releasing = Promise.withResolvers<void>()
-    const permission = Promise.withResolvers<void>()
-    const gate: AdmissionGate = {
-      async acquire() {
-        return async () => {
-          releasing.resolve()
-          await permission.promise
-          throw new Error("release-failed")
-        }
-      },
-    }
-    const signal = new AbortController()
-    const admitted = await admittedFetch(async () => new Response(new ReadableStream(), { headers: { "content-type": "text/event-stream" } }), gate, "http://endpoint.test")
-    const observed = watch(admitted, { body: body(), lane, tracker: new UsageTracker(), signal: signal.signal })
-    const pending = observed.response.text()
-    signal.abort(new Error("aborted"))
-    await releasing.promise
-    permission.resolve()
-    await expect(pending).rejects.toThrow("release-failed")
-    expect((await observed.report).outcome).toBe("aborted")
+    expect(observed.receipts).toEqual([])
   })
 
   test("already-aborted signals cancel immediately, and stream errors remain errors", async () => {
@@ -475,20 +406,19 @@ describe("streaming usage observation", () => {
     const signal = new AbortController()
     const reason = new Error("already aborted")
     signal.abort(reason)
-    const observed = watch(new Response(new ReadableStream({ cancel(value) { cancelled.resolve(value) } })), { body: body(), lane, tracker: new UsageTracker(), signal: signal.signal })
-    await expect(observed.response.text()).rejects.toBe(reason)
+    const observed = watch(new Response(new ReadableStream({ cancel(value) { cancelled.resolve(value) } }), { headers: { "content-type": "text/event-stream" } }))
+    await expect(cancellableResponse(observed.response, signal.signal).text()).rejects.toBe(reason)
     expect(await cancelled.promise).toBe(reason)
-    expect((await observed.report).outcome).toBe("aborted")
+    expect(observed.receipts).toEqual([])
     const failure = new Error("upstream broke")
-    const broken = watch(new Response(new ReadableStream({ pull(controller) { controller.error(failure) } }), { headers: { "content-type": "text/event-stream" } }), { body: body(), lane, tracker: new UsageTracker() })
+    const broken = watch(new Response(new ReadableStream({ pull(controller) { controller.error(failure) } }), { headers: { "content-type": "text/event-stream" } }))
     await expect(broken.response.text()).rejects.toBe(failure)
-    expect(await broken.report).toMatchObject({ outcome: "error", anchorRecorded: false })
+    expect(broken.receipts).toEqual([])
   })
 
-  test("an error after final usage and DONE still cannot create an anchor", async () => {
+  test("an error after final usage and DONE still cannot publish a receipt", async () => {
     const failure = new Error("connection failed after terminal event")
     let sent = false
-    const tracker = new UsageTracker()
     const source = event({ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 100 } }) + "data: [DONE]\n\n"
     const upstream = new Response(new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -496,41 +426,27 @@ describe("streaming usage observation", () => {
         else { sent = true; controller.enqueue(encoder.encode(source)) }
       },
     }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } })
-    const observed = watch(upstream, { body: body(), lane, tracker })
+    const observed = watch(upstream)
     await expect(observed.response.text()).rejects.toBe(failure)
-    expect(await observed.report).toMatchObject({ promptTokens: 100, outcome: "error", anchorRecorded: false })
-    expect(tracker.estimate(body(), lane, fallback)).toBe(fallback(body()))
+    expect(observed.receipts).toEqual([])
   })
 
-  test("diagnostic throws, rejections and unresolved logging do not hold response EOF", async () => {
-    const logged = Promise.withResolvers<void>()
-    for (const onReport of [() => { throw new Error("logging failed") }, () => Promise.reject(new Error("logging rejected")), () => { logged.resolve(); return new Promise<void>(() => {}) }]) {
-      const observed = observeResponse(Response.json(final()), { body: body(), lane, tracker: new UsageTracker(), onReport })
-      expect(await observed.json()).toEqual(final())
-    }
-    await logged.promise
-  })
-
-  test("abort during usage persistence rejects the reader after admission is released", async () => {
+  test("abort during usage persistence rejects the reader before the write finishes", async () => {
     const entered = Promise.withResolvers<void>()
     const commit = Promise.withResolvers<void>()
     const saved = Promise.withResolvers<void>()
     const signal = new AbortController()
-    let released = false
-    const admitted = await admittedFetch(async () => Response.json(final()), {
-      async acquire() { return () => { released = true } },
-    }, "http://endpoint.test")
-    const observed = observeResponse(admitted, {
-      body: body(), lane, tracker: new UsageTracker(), signal: signal.signal,
-      async onAnchor() { entered.resolve(); await commit.promise; saved.resolve() },
+    const observed = observeResponse(Response.json(final()), async () => {
+      entered.resolve()
+      await commit.promise
+      saved.resolve()
     })
-    const pending = observed.text()
+    const pending = cancellableResponse(observed, signal.signal).text()
     const deadline = Promise.withResolvers<never>()
     const timer = setTimeout(() => deadline.reject(new Error("Abort did not reach the pending reader")), 1000)
     const failure = new Error("request aborted during persistence")
     try {
       await entered.promise
-      expect(released).toBe(true)
       signal.abort(failure)
       await expect(Promise.race([pending, deadline.promise])).rejects.toBe(failure)
     } finally {
@@ -542,65 +458,28 @@ describe("streaming usage observation", () => {
   })
 })
 
-describe("response event normalization", () => {
-  test("identity and equal transforms preserve exact SSE/JSON bytes", async () => {
-    const source = ": keep\r\nid: 9\r\ndata:  { \"choices\" : [{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}], \"usage\": {\"prompt_tokens\":100} }\r\n\r\ndata: [DONE]\r\n\r\n"
-    const json = ` \n ${JSON.stringify(final())} \t`
-    for (const transform of [(value: unknown) => value, (value: unknown) => structuredClone(value), (value: unknown) => Object.fromEntries(Object.entries(value as Record<string, unknown>).reverse())]) {
-      const observed = watch(stream([...encoder.encode(source)].map((byte) => new Uint8Array([byte]))), { body: body(), lane, tracker: new UsageTracker(), transform })
-      expect(await observed.response.text()).toBe(source)
-      expect((await observed.report).anchorRecorded).toBe(true)
-      const document = watch(stream([encoder.encode(json.slice(0, 5)), encoder.encode(json.slice(5))], { "content-type": "application/json" }), { body: body(), lane, tracker: new UsageTracker(), transform })
-      expect(await document.response.text()).toBe(json)
-      expect((await document.report).anchorRecorded).toBe(true)
-    }
-  })
-
-  test("rewrites only changed event JSON and preserves comment/id/event/data framing", async () => {
-    const original = { choices: [{ index: 0, delta: { reasoning: "think" }, finish_reason: null }] }
-    const normalized = { choices: [{ index: 0, delta: { reasoning_content: "think" }, finish_reason: null }] }
+describe("response observation preserves wire data", () => {
+  test("multiline SSE preserves CRLF, comments, IDs and data split across chunks", async () => {
     const prefix = ": comment\r\nid: 7\r\nevent: message\r\n"
     const frame = prefix + 'data: {"choices":[\r\ndata: {"index":0,"delta":{"reasoning":"think"},"finish_reason":null}]}\r\n\r\n'
-    const unchanged = event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100 } }, "\r\n") + "data: [DONE]\r\n\r\n"
-    let events = 0
-    const observed = watch(stream([...encoder.encode(frame + unchanged)].map((byte) => new Uint8Array([byte]))), {
-      body: body(), lane, tracker: new UsageTracker(), transform(value) {
-        events++
-        return JSON.stringify(value) === JSON.stringify(original) ? normalized : value
-      },
-    })
-    expect(await observed.response.text()).toBe(prefix + `data: ${JSON.stringify(normalized)}\r\ndata: \r\n\r\n` + unchanged)
-    expect(events).toBe(2)
-    expect(await observed.report).toMatchObject({ promptTokens: 100, anchorRecorded: true })
+    const source = frame + event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100 } }, "\r\n") + "data: [DONE]\r\n\r\n"
+    const observed = watch(stream([...encoder.encode(source)].map((byte) => new Uint8Array([byte]))))
+    expect(await observed.response.text()).toBe(source)
+    expect(observed.receipts).toMatchObject([{ promptTokens: 100 }])
   })
 
-  test("detects in-place JSON changes and observes usage before normalization", async () => {
-    const observed = watch(new Response(JSON.stringify(final()), { status: 201, statusText: "Created", headers: { "content-type": "application/json", "content-length": "1", "x-fixture": "kept" } }), {
-      body: body(), lane, tracker: new UsageTracker(), transform(value) {
-        const document = value as Final
-        document.choices[0]!.message.content = "normalized"
-        document.usage.prompt_tokens = 999
-        return document
-      },
+  test("JSON observation preserves the original status, headers and chunked body", async () => {
+    const bodyText = ` \n ${JSON.stringify(final())} \t`
+    const source = new Response(stream([encoder.encode(bodyText.slice(0, 5)), encoder.encode(bodyText.slice(5))]).body, {
+      status: 201, statusText: "Created",
+      headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(bodyText)), "x-fixture": "kept" },
     })
+    const observed = watch(source)
     expect(observed.response.status).toBe(201)
     expect(observed.response.statusText).toBe("Created")
-    expect(observed.response.headers.get("content-length")).toBeNull()
+    expect(observed.response.headers.get("content-length")).toBe(source.headers.get("content-length"))
     expect(observed.response.headers.get("x-fixture")).toBe("kept")
-    expect((await observed.response.json() as Final).choices[0]!.message.content).toBe("normalized")
-    expect(await observed.report).toMatchObject({ promptTokens: 100, anchorRecorded: true })
-  })
-
-  test("transform failures cancel upstream and remain visible to consumers", async () => {
-    const cancelled = Promise.withResolvers<unknown>()
-    const failure = new Error("normalizer failed")
-    const upstream = new Response(new ReadableStream<Uint8Array>({
-      pull(controller) { controller.enqueue(encoder.encode(event({ choices: [{ index: 0, delta: { content: "text" }, finish_reason: null }] }))) },
-      cancel(reason) { cancelled.resolve(reason) },
-    }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } })
-    const observed = watch(upstream, { body: body(), lane, tracker: new UsageTracker(), transform() { throw failure } })
-    await expect(observed.response.text()).rejects.toBe(failure)
-    expect(await cancelled.promise).toBe(failure)
-    expect(await observed.report).toMatchObject({ outcome: "error", anchorRecorded: false })
+    expect(await observed.response.text()).toBe(bodyText)
+    expect(observed.receipts).toMatchObject([{ promptTokens: 100 }])
   })
 })
